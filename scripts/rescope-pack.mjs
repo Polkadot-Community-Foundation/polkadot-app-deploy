@@ -34,12 +34,14 @@ const pkgJsonPath = join(stage, "package", "package.json");
 const pkg = JSON.parse(readFileSync(pkgJsonPath, "utf8"));
 const upstreamName = pkg.name;
 pkg.name = PUBLISHED_NAME;
+// The extracted package already ships a built dist/. Strip `prepare` (= `npm run build`) so the
+// repack below doesn't try to rebuild in a dir with no node_modules ("tsup: not found"); npm pack
+// runs `prepare` even with --ignore-scripts. Consumers never run `prepare` on a published tarball.
+if (pkg.scripts) delete pkg.scripts.prepare;
 writeFileSync(pkgJsonPath, JSON.stringify(pkg, null, 2) + "\n");
 
 if (existsSync(OUT_DIR)) rmSync(OUT_DIR, { recursive: true });
 mkdirSync(OUT_DIR, { recursive: true });
-// --ignore-scripts: the extracted package already ships a built dist/; without it the repack
-// runs `prepare` -> `npm run build` -> `tsup` in a dir with no node_modules ("tsup: not found").
 run(`npm pack --ignore-scripts --pack-destination ${OUT_DIR}`, join(stage, "package"));
 rmSync(stage, { recursive: true, force: true });
 
