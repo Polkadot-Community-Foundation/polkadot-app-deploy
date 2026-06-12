@@ -103,8 +103,11 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   const storageProvider = opts.mnemonic
     ? await getDirectProvider(opts.mnemonic, opts.derivationPath ?? "")
     : undefined;
+  // ss58 is load-bearing: storeChunkedContent's authorization preflight keys
+  // TransactionStorage.Authorizations by it — omitting it encodes an undefined
+  // AccountId and surfaces as "Incompatible runtime entry".
   const storageOpts = storageProvider
-    ? { client: storageProvider.client, unsafeApi: storageProvider.unsafeApi, signer: storageProvider.signer }
+    ? { client: storageProvider.client, unsafeApi: storageProvider.unsafeApi, signer: storageProvider.signer, ss58: storageProvider.ss58 }
     : {};
 
   let iconCid: string;
