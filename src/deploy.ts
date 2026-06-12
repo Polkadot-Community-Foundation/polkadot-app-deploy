@@ -343,7 +343,7 @@ async function getProvider(): Promise<ProviderResult> {
   }
 }
 
-async function getDirectProvider(mnemonic: string, derivationPath: string = ""): Promise<ProviderResult> {
+export async function getDirectProvider(mnemonic: string, derivationPath: string = ""): Promise<ProviderResult> {
   const primary = BULLETIN_ENDPOINTS[0];
   console.log(`   Connecting to Bulletin: ${primary}`);
   const client = createPolkadotClient(getWsProvider(
