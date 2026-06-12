@@ -45,31 +45,39 @@ jobs:
             echo "npm_tag=" >> "$GITHUB_OUTPUT"      # stable → @latest
           fi
 
-      - name: Pack @parity/polkadot-app-deploy
-        run: npm pack
+      # PCF publishes its build under @polkadot-community-foundation. Keep the
+      # @parity/polkadot-app-deploy name in-tree (merge-clean with upstream) and rescope-at-pack:
+      # the script stages a @polkadot-community-foundation/polkadot-app-deploy tarball into
+      # pack-output/. Same pattern as browse-sdk + cdm-env.
+      - name: Stage @polkadot-community-foundation/polkadot-app-deploy tarball (rescope-at-pack)
+        run: node scripts/rescope-pack.mjs
 
       - uses: actions/upload-artifact@v7
         with:
           name: polkadot-app-deploy
-          path: "*.tgz"
+          path: pack-output/*.tgz
 
-      # Was octokit/request-action@v2.x — that action has no Node-24 release and
-      # would break after GitHub forces JS actions onto Node 24 (June 16 2026).
-      # `gh api` runs natively on the runner (Node-version-agnostic) and sends
-      # the identical dispatch body: ref=main + the nested `inputs` object. jq
-      # builds the JSON from env vars so values can't break out of the literal.
-      - name: Dispatch to npm_publish_automation
+      # Publish via PCF's own npm-publish-automation (holds the @polkadot-community-foundation
+      # npm token), NOT paritytech's. Dispatch is inlined (public create-github-app-token + a
+      # gh api call) rather than the automation's composite action, because sharing a PRIVATE
+      # repo's actions cross-repo is plan-gated. npm_tag carries the rc/latest dist-tag.
+      - name: Mint App token (dispatch scope)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.PUBLISH_APP_ID }}
+          private-key: ${{ secrets.PUBLISH_APP_PRIVATE_KEY }}
+          owner: Polkadot-Community-Foundation
+          repositories: npm-publish-automation
+
+      - name: Dispatch PCF npm-publish-automation
         env:
-          GH_TOKEN: ${{ secrets.NPM_PUBLISH_AUTOMATION_TOKEN }}
-          REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           NPM_TAG: ${{ steps.tag.outputs.npm_tag }}
         run: |
-          jq -nc \
-            --arg repo "$REPO" \
-            --arg run_id "$RUN_ID" \
-            --arg npm_tag "$NPM_TAG" \
-            '{ref: "main", inputs: {repo: $repo, run_id: $run_id, npm_tag: $npm_tag, artifact_name: "polkadot-app-deploy"}}' \
-            | gh api --method POST \
-                /repos/paritytech/npm_publish_automation/actions/workflows/publish.yml/dispatches \
-                --input -
+          set -euo pipefail
+          printf '{"ref":"main","inputs":{"repo":"%s","run_id":"%s","artifact_name":"polkadot-app-deploy","npm_tag":"%s"}}' \
+            "${{ github.repository }}" "${{ github.run_id }}" "$NPM_TAG" \
+          | gh api -X POST \
+              /repos/Polkadot-Community-Foundation/npm-publish-automation/actions/workflows/publish.yml/dispatches \
+              --input -
