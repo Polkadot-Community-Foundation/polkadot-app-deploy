@@ -30,3 +30,6 @@ tools/.*.mjs
 opencode.json
 
 # Lockfile policy: package-lock.json IS committed (npm ci reproducibility)
+
+# PCF rescope-at-pack staging output
+pack-output/
