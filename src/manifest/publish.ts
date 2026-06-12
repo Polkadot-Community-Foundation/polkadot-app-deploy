@@ -15,6 +15,7 @@ import * as path from "node:path";
 import {
   BLAKE2B_256_MULTIHASH_CODE,
   encodeContenthash,
+  getDirectProvider,
   storeDirectory,
   storeFile,
   resolveDotnsConnectOptions,
@@ -93,22 +94,41 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   const iconBytes = await readFileOrThrow(iconAbs, "icon");
   console.log(`\nManifest publish — ${config.domain}`);
   console.log(`  Loaded config: ${sourcePath}`);
-  console.log(`  Uploading icon (${iconBytes.length} B)…`);
-  const iconCid = await storeFile(iconBytes, { hashCode: BLAKE2B_256_MULTIHASH_CODE });
-  console.log(`  Icon CID: ${iconCid}`);
+  // Bulletin storage uploads (icon + executables) must sign with the SAME account
+  // the operator passed (`--mnemonic` → direct signer), not the dev-phrase pool that
+  // storeFile/storeDirectory fall back to when no provider is supplied. Pool accounts
+  // are derived at `//pool/i` paths and are never the (single) authorized deployer, so
+  // a one-authorized-account setup (Summit) gets `pool account N is not authorized`.
+  // Build one direct provider and reuse it for every upload.
+  const storageProvider = opts.mnemonic
+    ? await getDirectProvider(opts.mnemonic, opts.derivationPath ?? "")
+    : undefined;
+  const storageOpts = storageProvider
+    ? { client: storageProvider.client, unsafeApi: storageProvider.unsafeApi, signer: storageProvider.signer }
+    : {};
 
+  let iconCid: string;
   const executableCids: Record<string, string> = {};
-  for (const exec of config.executables) {
-    const execAbs = path.resolve(configDir, exec.path);
-    if (opts.buildDirCid && path.resolve(opts.buildDirCid.absPath) === execAbs) {
-      console.log(`  Executable [${exec.kind}] reused build-dir CID: ${opts.buildDirCid.cid}`);
-      executableCids[exec.kind] = opts.buildDirCid.cid;
-      continue;
+  try {
+    console.log(`  Uploading icon (${iconBytes.length} B)…`);
+    iconCid = await storeFile(iconBytes, { ...storageOpts, hashCode: BLAKE2B_256_MULTIHASH_CODE });
+    console.log(`  Icon CID: ${iconCid}`);
+
+    for (const exec of config.executables) {
+      const execAbs = path.resolve(configDir, exec.path);
+      if (opts.buildDirCid && path.resolve(opts.buildDirCid.absPath) === execAbs) {
+        console.log(`  Executable [${exec.kind}] reused build-dir CID: ${opts.buildDirCid.cid}`);
+        executableCids[exec.kind] = opts.buildDirCid.cid;
+        continue;
+      }
+      console.log(`  Uploading executable [${exec.kind}] from ${execAbs}…`);
+      const { storageCid } = await storeDirectory(execAbs, storageOpts, undefined, true);
+      console.log(`  Executable [${exec.kind}] CID: ${storageCid}`);
+      executableCids[exec.kind] = storageCid;
     }
-    console.log(`  Uploading executable [${exec.kind}] from ${execAbs}…`);
-    const { storageCid } = await storeDirectory(execAbs, {}, undefined, true);
-    console.log(`  Executable [${exec.kind}] CID: ${storageCid}`);
-    executableCids[exec.kind] = storageCid;
+  } finally {
+    // storeFile/storeDirectory don't destroy a caller-supplied client, so close ours.
+    storageProvider?.client?.destroy?.();
   }
 
   const dotns = await connectDotNS(opts);
