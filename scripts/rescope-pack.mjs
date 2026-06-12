@@ -38,7 +38,9 @@ writeFileSync(pkgJsonPath, JSON.stringify(pkg, null, 2) + "\n");
 
 if (existsSync(OUT_DIR)) rmSync(OUT_DIR, { recursive: true });
 mkdirSync(OUT_DIR, { recursive: true });
-run(`npm pack --pack-destination ${OUT_DIR}`, join(stage, "package"));
+// --ignore-scripts: the extracted package already ships a built dist/; without it the repack
+// runs `prepare` -> `npm run build` -> `tsup` in a dir with no node_modules ("tsup: not found").
+run(`npm pack --ignore-scripts --pack-destination ${OUT_DIR}`, join(stage, "package"));
 rmSync(stage, { recursive: true, force: true });
 
 const outTgz = readdirSync(OUT_DIR).find((f) => f.endsWith(".tgz"));
