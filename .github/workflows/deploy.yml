@@ -57,9 +57,13 @@ on:
         type: string
         default: ''
       polkadot-app-deploy-ref:
-        description: 'Git ref (branch/tag/SHA) of paritytech/polkadot-app-deploy to build from source. When set, takes precedence over polkadot-app-deploy-version — useful for testing a commit before it ships to npm. The polkadot-app-deploy nightly uses this to source-build main HEAD.'
+        description: 'Git ref (branch/tag/SHA) of polkadot-app-deploy to build from source. When set, takes precedence over polkadot-app-deploy-version — useful for testing a commit before it ships to npm. The polkadot-app-deploy nightly uses this to source-build main HEAD.'
         type: string
         default: ''
+      polkadot-app-deploy-repo:
+        description: 'GitHub repository (owner/name) the source build checks out when polkadot-app-deploy-ref is set. Default: paritytech/polkadot-app-deploy. Point at a fork to consume fixes that have not shipped to npm yet.'
+        type: string
+        default: 'paritytech/polkadot-app-deploy'
       tag:
         description: 'Free-form label attached to the deploy span as deploy.tag (e.g. "e2e-ci-pr", "load-test"). Lets Sentry dashboards filter test/benchmark traffic out of real-user views. Empty = no tag.'
         type: string
@@ -187,7 +191,7 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true' && inputs.polkadot-app-deploy-ref != ''
         uses: actions/checkout@v6
         with:
-          repository: paritytech/polkadot-app-deploy
+          repository: ${{ inputs.polkadot-app-deploy-repo }}
           ref: ${{ inputs.polkadot-app-deploy-ref }}
           path: polkadot-app-deploy-src
 
