@@ -1,6 +1,5 @@
 import crypto from "crypto";
 import { createReadStream } from "fs";
-import * as readline from "readline";
 import { createClient, Enum } from "polkadot-api";
 import { getPolkadotSigner } from "polkadot-api/signer";
 import { getWsProvider } from "polkadot-api/ws";
@@ -32,6 +31,9 @@ import type { PopSelfServeConfig } from "./environments.js";
 import { NonRetryableError } from "./errors.js";
 import type { PolkadotSigner } from "polkadot-api";
 
+/** One step in the phone-signature plan fired at preflight. */
+export type PhoneSignatureStep = "Commitment" | "Register" | "Link content" | "Publish to registry";
+
 // ---------------------------------------------------------------------------
 // Exported constants and types
 // ---------------------------------------------------------------------------
@@ -60,6 +62,23 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
    * is active; pool/mnemonic paths leave this unset.
    */
   onPhoneSigningRequired?: (label: string) => void;
+  /**
+   * Human-ready gate. Awaited immediately BEFORE each phone signature request
+   * is sent. Resolve when the human is at their phone and ready; reject/throw
+   * to abort. The per-signature operation timeout starts only AFTER this
+   * resolves. `attempt` >= 2 means a re-sign (principle 4).
+   */
+  confirmPhoneReady?: (ctx: { label: string; attempt: number; total: number }) => Promise<void>;
+  /**
+   * True when the injected signer is a real phone/session signer that needs the
+   * human-ready gate (`_awaitPhoneReady`). False (default) for local workers used
+   * in transfer mode and mnemonic signers — those sign in-process with no phone.
+   *
+   * Fixes #50: `_usesExternalSigner` is true for the local transfer-worker too,
+   * so it cannot distinguish phone-backed from in-process. This flag is the
+   * transfer-aware predicate that `isPhoneSignerActive` in deploy.ts already uses.
+   */
+  phoneSigner?: boolean;
 }
 export interface OwnershipResult { owned: boolean; owner: string | null; }
 
@@ -246,6 +265,10 @@ export const WS_HEARTBEAT_TIMEOUT_MS: number = 300_000;
 // concurrent jobs off the same retry tick), NOT more attempts: the old loop retried
 // back-to-back with zero delay, so the burst re-collided on the same nonce each time.
 export const DOTNS_TX_MAX_ATTEMPTS: number = 3;
+// Chain-time budget for verifyEffect polling loops. 60s gives a phone-signed tx
+// more patience before declaring "not observable" — reducing spurious retries
+// that would demand an extra phone tap (#38). Non-phone paths benefit too.
+export const VERIFY_EFFECT_CHAIN_SECONDS: number = 60;
 
 /**
  * Thrown by signAndSubmitExtrinsic when the transaction watcher goes silent
@@ -308,10 +331,27 @@ export function shouldRetryTxAttempt(
   return decision === "retry" && attempt < maxAttempts;
 }
 
+/**
+ * Whether to pause for the human-ready gate before a retry RE-SIGN (#39).
+ * Only a phone/session signer re-sign needs another tap, so the re-gate fires
+ * only on attempt ≥ 2 (a re-sign, not the first sign) AND when the signer is a
+ * phone signer. Local/dev workers re-sign locally and must NOT pause. Pure so
+ * the decision is unit-testable without driving a real retry.
+ */
+export function shouldRegateBeforeResign(attempt: number, isPhoneSigner: boolean | undefined): boolean {
+  return attempt >= 2 && isPhoneSigner === true;
+}
+
 /** Wraps `sink` so that "failed" status events are buffered and only forwarded
  *  when `flush()` is called (i.e. on final abort). All other statuses pass
  *  through immediately. Call `reset()` at the top of each retry attempt to
  *  discard a buffered "failed" from the previous attempt.
+ *
+ *  Also deduplicates "included": papi's txBestBlocksState subscription can fire
+ *  with found=true multiple times (tx can appear/reappear across best-block
+ *  updates), so without dedup the status line prints twice (#891). "included" is
+ *  passed through only once per attempt; reset() clears the seen flag so the
+ *  next attempt can emit it again if it succeeds through a different path.
  *
  *  Closes two leak paths (issue #704):
  *  1. Retry-recovered: attempt N emits "failed" before throwing; a later attempt
@@ -327,13 +367,18 @@ export function makeRetryStatusFilter(sink: (status: string) => void): {
   reset: () => void;
 } {
   let buffered = false;
+  let includedSeen = false;
   return {
     callback: (status: string) => {
       if (status === "failed") { buffered = true; return; }
+      if (status === "included") {
+        if (includedSeen) return; // deduplicate: txBestBlocksState can fire multiple times
+        includedSeen = true;
+      }
       sink(status);
     },
     flush: () => { if (buffered) sink("failed"); },
-    reset: () => { buffered = false; },
+    reset: () => { buffered = false; includedSeen = false; },
   };
 }
 
@@ -1110,11 +1155,18 @@ class ReviveClientWrapper {
     });
   }
 
-  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean } = {}): Promise<TxResolution> {
+  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: (attempt: number) => Promise<void> } = {}): Promise<TxResolution> {
     const filter = makeRetryStatusFilter(statusCallback);
     let lastError: unknown;
     for (let attempt = 1; attempt <= DOTNS_TX_MAX_ATTEMPTS; attempt++) {
       filter.reset(); // discard any buffered "failed" from the previous attempt
+      // Re-gate before each retry re-sign: a phone signer needs the human-ready
+      // gate on EVERY sign, not just the first. Without this, a verifyEffect
+      // false-negative triggers a silent re-sign — unexpected extra phone tap
+      // with no "check your phone" reminder (#39).
+      if (shouldRegateBeforeResign(attempt, opts.isPhoneSigner)) {
+        await opts.onResign?.(attempt);
+      }
       try {
         // Rebuilt + re-signed each attempt → papi reads a fresh on-chain nonce
         // (retries never reuse the stale one).
@@ -1124,33 +1176,13 @@ class ReviveClientWrapper {
 
         // Phone-signer / no-event case: the watcher went silent before any
         // blockchain event arrived — the user never approved on their phone.
-        // Instead of retrying (which wastes ~3×90s), pause and let them catch up.
-        // SAFETY: gated on isTTY FIRST, before any readline is constructed.
-        // Non-TTY (CI, E2E, piped) must fail fast and never block.
+        // Fail fast; the confirmPhoneReady gate in contractTransaction is the
+        // right place to handle re-sign prompts.
         if (e instanceof WatcherSilentNoEventError && opts.isPhoneSigner === true) {
-          if (!(process.stdin.isTTY && process.stdout.isTTY)) {
-            // Non-interactive environment (CI / E2E / piped). Fail immediately with
-            // a clear message; do NOT prompt or wait.
-            filter.flush();
-            throw new NonRetryableError(
-              "No signature received from the phone — re-run when you can approve on your phone.",
-            );
-          }
-          // Interactive TTY: pause and let the user approve, then re-attempt.
-          console.log(`\n   Waiting until you're back — approve on your phone, then press Y to continue (Ctrl-C to abort).`);
-          let approved = false;
-          while (!approved) {
-            const answer = await new Promise<string>((resolve) => {
-              const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-              rl.question("   > ", (line: string) => { rl.close(); resolve(line.trim()); });
-            });
-            if (answer.toLowerCase() === "y" || answer === "") {
-              approved = true;
-            }
-          }
-          // Re-attempt from the top of the loop; don't count this as a retry.
-          filter.reset();
-          continue;
+          filter.flush();
+          throw new NonRetryableError(
+            "No signature received from the phone — re-run when you can approve on your phone.",
+          );
         }
 
         const decision = classifyTxRetryDecision(e);
@@ -1215,7 +1247,7 @@ class ReviveClientWrapper {
     signerSubstrateAddress: string,
     signer: PolkadotSigner,
     statusCallback: (status: string) => void,
-    { rpcs, useNoncePolling, functionName, args, contracts, verifyEffect, feeAsset, isPhoneSigner }: { rpcs: string[]; useNoncePolling?: boolean; functionName?: string; args?: unknown[]; contracts?: Record<string, string>; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean },
+    { rpcs, useNoncePolling, functionName, args, contracts, verifyEffect, feeAsset, isPhoneSigner, onResign }: { rpcs: string[]; useNoncePolling?: boolean; functionName?: string; args?: unknown[]; contracts?: Record<string, string>; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: (attempt: number) => Promise<void> },
   ): Promise<TxResolution> {
     await this.ensureAccountMapped(signerSubstrateAddress, signer);
     // For register specifically, re-check mapping immediately before the dry-run.
@@ -1252,7 +1284,7 @@ class ReviveClientWrapper {
       "chain.tx.submit",
       `sign+submit ${functionName ?? "Revive.call"}`,
       { "chain.function_name": functionName ?? "Revive.call", "chain.use_nonce_polling": Boolean(useNoncePolling) },
-      () => this.signAndSubmitWithRetry(buildExtrinsic, signer, statusCallback, "Revive.call", { nonceFallback, verifyEffect, feeAsset, isPhoneSigner }),
+      () => this.signAndSubmitWithRetry(buildExtrinsic, signer, statusCallback, "Revive.call", { nonceFallback, verifyEffect, feeAsset, isPhoneSigner, onResign }),
     );
   }
 
@@ -1499,6 +1531,8 @@ export class DotNS {
   assetHubEndpoints: string[];
 
   private _usesExternalSigner = false;
+  /** True only when the signer is a real phone/session signer that needs `_awaitPhoneReady`. */
+  private _isPhoneSigner = false;
   private _localMnemonic: string | null = null;
   private _contracts: typeof CONTRACTS & { PUBLISHER?: string } = CONTRACTS;
   private _nativeToEthRatio: bigint = NATIVE_TO_ETH_RATIO;
@@ -1506,6 +1540,11 @@ export class DotNS {
   private _popSelfServe: PopSelfServeConfig | null = null;
   private _registerStorageDeposit: bigint = MINIMUM_REGISTER_STORAGE_DEPOSIT;
   private _onPhoneSigningRequired: ((label: string) => void) | undefined = undefined;
+  private _confirmPhoneReady: ((ctx: { label: string; attempt: number; total: number }) => Promise<void>) | undefined = undefined;
+  /** Total phone-signature count for this DotNS session (drives the `total` field passed to confirmPhoneReady). */
+  private _phoneSignatureTotal = 0;
+  /** Running attempt counter per label for re-sign detection. Reset at connect/disconnect. */
+  private _phoneSignatureAttempts: Map<string, number> = new Map();
   // Test-only seam: consumed once by classifyAliasAccountState() then cleared.
   // Mirrors the __setDeployRootSpanForTest / __setSentryForTest pattern.
   private _classifyOverrideForTest: AliasAccountClassification | null = null;
@@ -1556,9 +1595,13 @@ export class DotNS {
     if (options.onPhoneSigningRequired !== undefined) {
       this._onPhoneSigningRequired = options.onPhoneSigningRequired;
     }
+    if (options.confirmPhoneReady !== undefined) {
+      this._confirmPhoneReady = options.confirmPhoneReady;
+    }
     const rpc = options.rpc || process.env.DOTNS_RPC || this.assetHubEndpoints[0];
     this.rpc = rpc;
     this._usesExternalSigner = Boolean(options.signer && options.signerAddress);
+    this._isPhoneSigner = options.phoneSigner ?? false;
 
     if (this._usesExternalSigner) {
       this.signer = options.signer!;
@@ -2039,13 +2082,28 @@ export class DotNS {
     return decodeFunctionResult({ abi: contractAbi, functionName, data: rawData as `0x${string}` });
   }
 
-  async contractTransaction(contractAddress: string, value: bigint, contractAbi: readonly any[], functionName: string, args: any[] = [], statusCallback: (status: string) => void = () => {}, { useNoncePolling, verifyEffect, feeAsset }: { useNoncePolling?: boolean; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas" } = {}): Promise<TxResolution> {
+  async contractTransaction(contractAddress: string, value: bigint, contractAbi: readonly any[], functionName: string, args: any[] = [], statusCallback: (status: string) => void = () => {}, { useNoncePolling, verifyEffect, feeAsset, phoneLabel }: { useNoncePolling?: boolean; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; phoneLabel?: string } = {}): Promise<TxResolution> {
     this.ensureConnected();
     if (!this.clientWrapper) throw new Error("contractTransaction: polkadot-api client not available");
     const encodedCallData = encodeFunctionData({ abi: contractAbi, functionName, args });
     const rpcs = this.rpc ? [this.rpc, ...this.assetHubEndpoints.filter((ep) => ep !== this.rpc)] : this.assetHubEndpoints;
+    // Split timeout (#969): await the human-ready gate OUTSIDE withTimeout so
+    // the human wait is never counted against the machine budget. The chain
+    // timeout starts only after the user confirms (or immediately for non-phone signers).
+    if (phoneLabel !== undefined) {
+      await this._awaitPhoneReady(phoneLabel);
+    }
     return await withTimeout(
-      this.clientWrapper.submitTransaction(contractAddress, value, encodedCallData, this.substrateAddress!, this.signer!, statusCallback, { rpcs, useNoncePolling, functionName, args, contracts: this._contracts, verifyEffect, feeAsset, isPhoneSigner: this._usesExternalSigner }),
+      this.clientWrapper.submitTransaction(contractAddress, value, encodedCallData, this.substrateAddress!, this.signer!, statusCallback, {
+        rpcs, useNoncePolling, functionName, args, contracts: this._contracts, verifyEffect, feeAsset,
+        // Re-gate phone-signer retries (#39): a verifyEffect false-negative
+        // makes signAndSubmitWithRetry re-sign; for a phone signer that needs
+        // another tap, so pause via _awaitPhoneReady ("Re-sign needed … Check
+        // your phone / Press Y") before re-signing. Both _awaitPhoneReady and the
+        // retry-loop guard no-op for non-phone signers (local/dev workers).
+        isPhoneSigner: this._isPhoneSigner,
+        onResign: phoneLabel !== undefined ? () => this._awaitPhoneReady(phoneLabel) : undefined,
+      }),
       OPERATION_TIMEOUT_MS,
       functionName,
     );
@@ -2160,7 +2218,7 @@ export class DotNS {
       // _authorised → NotAuthorised, 0x1648fd01). Polls checkSubdomainOwnership
       // until the subnode is queryable, using the same chain-time budget as
       // setContenthash. See setContenthash (line ~1937) for the pattern this mirrors.
-      const MAX_VERIFY_CHAIN_SECONDS = 30;
+      const MAX_VERIFY_CHAIN_SECONDS = VERIFY_EFFECT_CHAIN_SECONDS;
       const POLL_INTERVAL_MS = 2_000;
       const verifyEffect = async (): Promise<boolean> => {
         // Capture clientWrapper once; bail if session torn down (same guard as
@@ -2329,7 +2387,7 @@ export class DotNS {
       }
       setDeployAttribute("deploy.dotns.contenthash_unchanged", "false");
 
-      const MAX_VERIFY_CHAIN_SECONDS = 30;
+      const MAX_VERIFY_CHAIN_SECONDS = VERIFY_EFFECT_CHAIN_SECONDS;
       const POLL_INTERVAL_MS = 2_000;
       const verifyEffect = async (): Promise<boolean> => {
         // verifyEffect is awaited from a recursive-setTimeout poller in
@@ -2372,8 +2430,7 @@ export class DotNS {
       };
 
       console.log(`\n   Linking content...`);
-      this._onPhoneSigningRequired?.("Link content");
-      const txRes = await this.contractTransaction(this._contracts.DOTNS_CONTENT_RESOLVER, 0n, DOTNS_CONTENT_RESOLVER_ABI, "setContenthash", [node, contenthashHex], (s) => console.log(`      ${s}`), { useNoncePolling: true, verifyEffect, feeAsset: opts.feeAsset });
+      const txRes = await this.contractTransaction(this._contracts.DOTNS_CONTENT_RESOLVER, 0n, DOTNS_CONTENT_RESOLVER_ABI, "setContenthash", [node, contenthashHex], (s) => console.log(`      ${s}`), { useNoncePolling: true, verifyEffect, feeAsset: opts.feeAsset, phoneLabel: "Link content" });
 
       // Final read-back catches a rare post-finality reorg.
       const finalOnChain = ((await this.getContenthash(domainName)) || "0x").toLowerCase();
@@ -2460,7 +2517,7 @@ export class DotNS {
       // Without this, a sibling parallel job consuming Alice's expected nonce
       // caused the nonce-advance path to declare success; the 90s post-hoc poll
       // below then threw "Post-set verification failed" with no retry attempted.
-      const MAX_VERIFY_CHAIN_SECONDS = 30;
+      const MAX_VERIFY_CHAIN_SECONDS = VERIFY_EFFECT_CHAIN_SECONDS;
       const TEXT_POLL_INTERVAL_MS = 2_000;
       const verifyEffect = async (): Promise<boolean> => {
         // Capture wrapper once; bail if session torn down (same guard as
@@ -2613,7 +2670,7 @@ export class DotNS {
         return { status: "already-published" as const };
       }
 
-      const MAX_VERIFY_CHAIN_SECONDS = 30;
+      const MAX_VERIFY_CHAIN_SECONDS = VERIFY_EFFECT_CHAIN_SECONDS;
       const PUBLISH_POLL_INTERVAL_MS = 2_000;
       const verifyEffect = async (): Promise<boolean> => {
         // Capture wrapper once; bail if session torn down (same guard as
@@ -2642,8 +2699,7 @@ export class DotNS {
       };
 
       try {
-        this._onPhoneSigningRequired?.("Publish to registry");
-        const txRes = await this.contractTransaction(publisher, 0n, PUBLISHER_ABI, "publish", [label], (s) => console.log(`      ${s}`), { useNoncePolling: true, verifyEffect });
+        const txRes = await this.contractTransaction(publisher, 0n, PUBLISHER_ABI, "publish", [label], (s) => console.log(`      ${s}`), { useNoncePolling: true, verifyEffect, phoneLabel: "Publish to registry" });
         // Final read-back catches a rare post-finality reorg or nonce-advance false-positive.
         const finalPublished = await withTimeout(
           this.contractCall(publisher, PUBLISHER_ABI, "isPublished", [labelhash]),
@@ -2694,7 +2750,7 @@ export class DotNS {
         return { status: "already-unpublished" as const };
       }
 
-      const MAX_VERIFY_CHAIN_SECONDS = 30;
+      const MAX_VERIFY_CHAIN_SECONDS = VERIFY_EFFECT_CHAIN_SECONDS;
       const UNPUBLISH_POLL_INTERVAL_MS = 2_000;
       const verifyEffect = async (): Promise<boolean> => {
         // Capture wrapper once; bail if session torn down (same guard as
@@ -2797,8 +2853,7 @@ export class DotNS {
   async submitCommitment(commitment: any): Promise<void> {
     this.ensureConnected();
     console.log(`\n   Submitting commitment...`);
-    this._onPhoneSigningRequired?.("Commitment");
-    const commitTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, 0n, DOTNS_REGISTRAR_CONTROLLER_ABI, "commit", [commitment], (s) => console.log(`      ${s}`));
+    const commitTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, 0n, DOTNS_REGISTRAR_CONTROLLER_ABI, "commit", [commitment], (s) => console.log(`      ${s}`), { phoneLabel: "Commitment" });
     logTxResolution(commitTxRes);
     console.log(`   Committed at: ${new Date().toISOString()}`);
   }
@@ -2909,8 +2964,7 @@ export class DotNS {
     setDeployAttribute("deploy.payment_wei", priceWei.toString());
     console.log(`   Oracle price: ${formatEther(priceWei)} PAS`);
     console.log(`   Paying: ${formatEther(bufferedPaymentWei)} PAS`);
-    this._onPhoneSigningRequired?.("Register");
-    const registerTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, bufferedPaymentNative, DOTNS_REGISTRAR_CONTROLLER_ABI, "register", [registration], (s) => console.log(`      ${s}`));
+    const registerTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, bufferedPaymentNative, DOTNS_REGISTRAR_CONTROLLER_ABI, "register", [registration], (s) => console.log(`      ${s}`), { phoneLabel: "Register" });
     logTxResolution(registerTxRes);
     if (registerTxRes.kind === TX_KIND_HASH) {
       setDeployAttribute("deploy.register.tx", registerTxRes.hash);
@@ -3354,10 +3408,51 @@ export class DotNS {
     return runBootstrap({ mnemonic, environmentId: envId });
   }
 
+  /**
+   * Set the expected total number of phone signatures for this DotNS session.
+   * Called from deploy() at preflight after computePhoneSigningSteps so that
+   * confirmPhoneReady receives the correct `total`.
+   */
+  setPhoneSignatureTotal(total: number): void {
+    this._phoneSignatureTotal = total;
+  }
+
+  /**
+   * Internal: await the human-ready gate then fire the "check your phone"
+   * notification. Must be called OUTSIDE any withTimeout — the human wait is
+   * unbounded and must never be inside the machine timeout.
+   *
+   * Behaviour:
+   * - confirmPhoneReady provided → await it (counts re-signs via attempt map).
+   * - not provided → proceed without a gate (opt-in only; an in-process
+   *   external signer, e.g. injected PolkadotSigner or mnemonic, needs no
+   *   phone gate — _usesExternalSigner alone cannot distinguish phone from
+   *   in-process).
+   * After the gate resolves, fires onPhoneSigningRequired (the "check your
+   * phone" notification) so the user knows the request is now being sent.
+   */
+  private async _awaitPhoneReady(label: string): Promise<void> {
+    if (!this._isPhoneSigner) return; // only phone/session signers need the gate; local workers (transfer mode) do not
+    const attempt = (this._phoneSignatureAttempts.get(label) ?? 0) + 1;
+    this._phoneSignatureAttempts.set(label, attempt);
+    if (this._confirmPhoneReady) {
+      await this._confirmPhoneReady({ label, attempt, total: this._phoneSignatureTotal });
+    }
+    // No hook → proceed; in-process external signers (injected PolkadotSigner,
+    // mnemonic) need no human gate. Phone signers must supply confirmPhoneReady.
+    // Fire "check your phone" notification AFTER gate resolves, immediately
+    // before the chain request goes out.
+    this._onPhoneSigningRequired?.(label);
+  }
+
   disconnect(): void {
     if (this.client) { this.client.destroy(); this.client = null; this.clientWrapper = null; this.connected = false; }
     this._usesExternalSigner = false;
+    this._isPhoneSigner = false;
     this._onPhoneSigningRequired = undefined;
+    this._confirmPhoneReady = undefined;
+    this._phoneSignatureTotal = 0;
+    this._phoneSignatureAttempts.clear();
   }
 }
 
