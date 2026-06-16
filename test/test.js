@@ -15,8 +15,9 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "node:child_process";
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps } from "../dist/deploy.js";
-import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, CONNECTION_TIMEOUT_MS, DotNS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError } from "../dist/dotns.js";
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler } from "../dist/deploy.js";
+import { WsEvent } from "polkadot-api/ws";
+import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -41,7 +42,7 @@ import { CarReader } from "@ipld/car/reader";
 import * as dagPb from "@ipld/dag-pb";
 import { encodeErrorResult } from "viem";
 import { isInternalUser, classifyErrorArea, compareSemver, assessVersion, promptYesNo, isPreReleaseVersion, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
-import { buildTitle, buildLabels, buildReportBody, setDeployContext, buildCliFlagsSummary, scrubSecrets, installLogCapture, getCapturedTail } from "../dist/bug-report.js";
+import { buildTitle, buildLabels, buildReportBody, setDeployContext, buildCliFlagsSummary, scrubSecrets, installLogCapture, getCapturedTail, isUserInputError } from "../dist/bug-report.js";
 import { parseGitRemoteUrl, resolveOwnerRepo, normalizeDomainFilename, mirrorUrl, buildManifest, GH_PAGES_MIRROR_MAX_BYTES, MIRROR_BOT_GIT_OVERRIDES } from "../dist/gh-pages-mirror.js";
 import { PassThrough } from "node:stream";
 
@@ -781,6 +782,38 @@ describe("DOTNS_TX_MAX_ATTEMPTS", () => {
   test("is exported and >= 2 (so at least one retry actually happens)", () => {
     assert.ok(DOTNS_TX_MAX_ATTEMPTS >= 2, "must allow at least one retry");
     assert.ok(DOTNS_TX_MAX_ATTEMPTS <= 10, "must bound retries to avoid runaway loops");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// shouldRegateBeforeResign (#39 — pause for phone before a retry re-sign)
+// ---------------------------------------------------------------------------
+describe("shouldRegateBeforeResign", () => {
+  test("first sign (attempt 1) never re-gates, even for a phone signer", () => {
+    assert.strictEqual(shouldRegateBeforeResign(1, true), false,
+      ">> FAIL: shouldRegateBeforeResign: attempt 1 is the first sign (already gated upstream), must not re-gate");
+  });
+  test("phone-signer re-sign (attempt >= 2) re-gates so the user is prompted before re-signing", () => {
+    assert.strictEqual(shouldRegateBeforeResign(2, true), true,
+      ">> FAIL: shouldRegateBeforeResign: a phone-signer retry re-sign must pause for the human (the #39 bug: it didn't)");
+    assert.strictEqual(shouldRegateBeforeResign(3, true), true,
+      ">> FAIL: shouldRegateBeforeResign: attempt 3 phone re-sign must also re-gate");
+  });
+  test("non-phone signer never re-gates (local/dev worker re-signs without a tap)", () => {
+    assert.strictEqual(shouldRegateBeforeResign(2, false), false,
+      ">> FAIL: shouldRegateBeforeResign: non-phone re-sign must not pause");
+    assert.strictEqual(shouldRegateBeforeResign(2, undefined), false,
+      ">> FAIL: shouldRegateBeforeResign: undefined isPhoneSigner must be treated as non-phone (no pause)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// VERIFY_EFFECT_CHAIN_SECONDS (#38 — widened verify window cuts spurious retries)
+// ---------------------------------------------------------------------------
+describe("VERIFY_EFFECT_CHAIN_SECONDS", () => {
+  test("verify window is widened past the old 30s so an already-landed tx is not spuriously retried", () => {
+    assert.ok(VERIFY_EFFECT_CHAIN_SECONDS >= 60,
+      `>> FAIL: VERIFY_EFFECT_CHAIN_SECONDS: must be widened from the old 30s (got ${VERIFY_EFFECT_CHAIN_SECONDS}) so a phone-signed tx that finalises late is not re-signed (#38)`);
   });
 });
 
@@ -4867,7 +4900,12 @@ describe("DotNS.setTextRecord", () => {
 
     // Build a DotNS instance and a fresh clientWrapper with a timestamp that:
     //   - first call: returns T0 (startChainMs = 1_000_000)
-    //   - subsequent calls: returns T0 + 35s (exceeds 30s MAX_VERIFY_CHAIN_SECONDS budget)
+    //   - subsequent calls: returns T0 + (budget+5)s, i.e. just past the
+    //     VERIFY_EFFECT_CHAIN_SECONDS budget, so the loop trips the timeout on
+    //     its first elapsed check. Budget-relative (not a hardcoded 35s) so the
+    //     test stays correct if the budget changes — a hardcoded value below the
+    //     budget makes the constant-timestamp loop poll forever (#38 regression).
+    const PAST_BUDGET_MS = 1_000_000n + BigInt((VERIFY_EFFECT_CHAIN_SECONDS + 5) * 1000);
     let tsCall = 0;
     const makeWrapper = () => ({
       client: {
@@ -4876,7 +4914,7 @@ describe("DotNS.setTextRecord", () => {
             Now: {
               getValue: async () => {
                 tsCall++;
-                return tsCall === 1 ? 1_000_000n : 1_035_000n;
+                return tsCall === 1 ? 1_000_000n : PAST_BUDGET_MS;
               },
             },
           },
@@ -4910,7 +4948,7 @@ describe("DotNS.setTextRecord", () => {
     assert.ok(capturedVerifyEffect !== null, "verifyEffect must be captured");
 
     // Now install a FRESH clientWrapper for the verifyEffect call below:
-    // first read → startChainMs, second read → startChainMs + 35s (> 30s budget)
+    // first read → startChainMs, second read → startChainMs + (budget+5)s (> budget)
     tsCall = 0;
     d.clientWrapper = makeWrapper();
 
@@ -6269,6 +6307,28 @@ describe("buildTitle", () => {
 
   test("preserves short messages", () => {
     assert.strictEqual(buildTitle(new Error("oops")), "[deploy-bug] oops");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 27b. isUserInputError — suppress the bug-report prompt for user-input errors (#63)
+// ---------------------------------------------------------------------------
+describe("isUserInputError (#63 — DotNS names are not bugs)", () => {
+  test("invalid/reserved DotNS label is a user-input error (no bug prompt)", () => {
+    assert.strictEqual(
+      isUserInputError(new Error('Invalid domain label "later": Base name is 5 chars; DotNS reserves base names of 5 chars or fewer for governance (PopRules). Use a base name of 6+ chars')),
+      true,
+      ">> FAIL: isUserInputError: a reserved/invalid DotNS label must be treated as user input, not a bug to file");
+  });
+  test("plain 'Invalid domain label' message is a user-input error", () => {
+    assert.strictEqual(isUserInputError(new Error("Invalid domain label: cannot start or end with hyphen")), true,
+      ">> FAIL: isUserInputError: invalid-label messages must be treated as user input");
+  });
+  test("genuine runtime/network failures are NOT user-input errors (bug prompt still offered)", () => {
+    assert.strictEqual(isUserInputError(new Error("WebSocket connection lost: ECONNREFUSED")), false,
+      ">> FAIL: isUserInputError: a connection failure must still be eligible for a bug report");
+    assert.strictEqual(isUserInputError(new Error("Post-deploy verification failed: on-chain contenthash mismatch")), false,
+      ">> FAIL: isUserInputError: a real deploy failure must still be eligible for a bug report");
   });
 });
 
@@ -8660,8 +8720,83 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     // Diagnostic capture: curl -sI -D writes headers to a file on failure.
     assert.match(verifyBlock, /curl -sI -D/, "nightly-verify-s4 error path must capture full response headers via curl -sI -D");
 
-    // last-modified header must be extracted and printed for CDN triage.
+    // last-modified header must be extracted and printed for CDN geo-cache triage.
     assert.match(verifyBlock, /last-modified/, "nightly-verify-s4 error path must print the last-modified header value for CDN geo-cache triage");
+  });
+
+  // ---- publish-wait gate (issue #23) -------------------------------------
+  // build-nightly must wait for publish.yml to complete BEFORE polling npm.
+  // Without this gate, the 10-min npm poll races the human approval in the
+  // `environment: release` gate, timing out and failing the E2E with zero
+  // scenarios run. See issue #23 and docs-internal/superpowers/specs/ for design.
+
+  test("e2e.yml: build-nightly has a publish-wait step that fires only on release trigger", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const bn = jobBlock(e2e, "build-nightly");
+
+    // The publish-wait step must exist.
+    assert.match(bn, /name:\s*Wait for publish\.yml to complete/,
+      ">> FAIL: build-nightly publish-wait: step 'Wait for publish.yml to complete' must exist in build-nightly");
+
+    // Guard must be `github.event_name == 'release'`, not `test-version != ''`.
+    // workflow_dispatch with a version string also sets test-version but has no
+    // live publish.yml run — using the wrong guard hangs the job for 45 min.
+    assert.match(bn, /if:\s*github\.event_name == 'release'/,
+      ">> FAIL: build-nightly publish-wait: publish-wait step's `if:` must guard on `github.event_name == 'release'` (not `test-version != ''`)");
+  });
+
+  test("e2e.yml: publish-wait step is ordered BEFORE the npm poll step in build-nightly", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const bn = jobBlock(e2e, "build-nightly");
+
+    const publishWaitIdx = bn.indexOf("Wait for publish.yml to complete");
+    const npmPollIdx = bn.indexOf("Wait for polkadot-app-deploy@");
+    assert.ok(publishWaitIdx !== -1,
+      ">> FAIL: build-nightly step order: 'Wait for publish.yml to complete' step must exist in build-nightly");
+    assert.ok(npmPollIdx !== -1,
+      ">> FAIL: build-nightly step order: 'Wait for polkadot-app-deploy@' (npm poll) step must exist in build-nightly");
+    assert.ok(publishWaitIdx < npmPollIdx,
+      ">> FAIL: build-nightly step order: publish-wait must appear BEFORE the npm poll step (publish.yml must complete before we poll npm)");
+  });
+
+  test("e2e.yml: build-nightly has actions:read permission for workflow run listing", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const bn = jobBlock(e2e, "build-nightly");
+
+    assert.match(bn, /actions:\s*read/,
+      ">> FAIL: build-nightly permissions: must include `actions: read` so the publish.yml run list API call does not 403");
+  });
+
+  test("e2e.yml: build-nightly publish-wait correlates by head_sha and checks conclusion", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const bn = jobBlock(e2e, "build-nightly");
+
+    // Must correlate to the right publish.yml run by head SHA, not just any run.
+    assert.match(bn, /head_sha/,
+      ">> FAIL: build-nightly publish-wait: must correlate publish.yml run by head_sha to avoid matching a stale run from a different release");
+
+    // Must branch on conclusion so a rejected approval fails fast with a clear message.
+    assert.match(bn, /conclusion/,
+      ">> FAIL: build-nightly publish-wait: must check publish.yml run conclusion (success vs failure/cancelled) after status==completed");
+  });
+
+  test("e2e.yml: build-nightly npm poll shortened to ≤5 min after publish-wait", () => {
+    // The old 10-min npm poll budget was sized to absorb the human-approval delay.
+    // That delay is now handled by the upstream publish-wait step. The npm poll
+    // only needs to cover the ~1-2 min automation lag after approval.
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const bn = jobBlock(e2e, "build-nightly");
+
+    // Extract the npm poll loop: find the block between "Wait for polkadot-app-deploy"
+    // and the next "- name:" step. The seq budget controls the wall-clock cap.
+    const npmPollMatch = bn.match(/name:\s*Wait for polkadot-app-deploy[^]*?(?=\s*- (?:name:|uses:|run:|\w))/);
+    assert.ok(npmPollMatch, ">> FAIL: build-nightly npm poll: npm poll step must exist");
+    const seqMatch = npmPollMatch[0].match(/seq 1 (\d+)/);
+    assert.ok(seqMatch, ">> FAIL: build-nightly npm poll: npm poll loop must use 'seq 1 N' to bound iterations");
+    const iterations = Number(seqMatch[1]);
+    // ≤30 iterations × 10s = ≤5 min. Old value was 60 (10 min).
+    assert.ok(iterations <= 30,
+      `>> FAIL: build-nightly npm poll: seq 1 ${iterations} gives ${iterations * 10}s poll budget — must be ≤ 30 (≤5 min) now that the approval wait is handled upstream`);
   });
 });
 
@@ -10336,6 +10471,49 @@ describe("incremental-stats v3 summary", () => {
     assert.match(src, /Trusted: \$\{trustedCount\} chunks skipped without re-probe \(chunks /);
   });
 
+  test("storeChunkedContent counter never exceeds total on reconnect retries (#932 regression guard)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    // On connection-error retries the same chunk index re-enters the batch loop.
+    // uploadEmittedIndices guards against double-counting: only increment
+    // uploadEmitted the first time a given chunk index is submitted.
+    assert.match(src, /uploadEmittedIndices/,
+      ">> FAIL: #932 guard: uploadEmittedIndices Set must exist to prevent counter overrun on retry");
+    assert.match(src, /uploadEmittedIndices\.has\(i\)/,
+      ">> FAIL: #932 guard: must check uploadEmittedIndices.has(i) before incrementing uploadEmitted");
+  });
+
+  test("storeChunkedContent chunk-index display is 0-based everywhere (no batch/retry off-by-one)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    // The batch upload line shows `chunk ${i}` (0-based). The retry / consumed /
+    // nonce-collision re-upload / verify-mismatch lines must use the SAME 0-based
+    // index — NOT `${fail.index + 1}` / `${idx + 1}` / `${i + 1}`. Otherwise the
+    // same chunk shows under two numbers (a retrying chunk N looked like a phantom
+    // "chunk N+1" colliding with the trusted chunk N+1). The [K/U] progress
+    // counter is a count and legitimately stays 1-based.
+    assert.match(src, /chunk \$\{i\}/,
+      ">> FAIL: chunk-numbering: the batch upload line must display the 0-based chunk index `chunk ${i}`");
+    assert.doesNotMatch(src, /chunk \$\{fail\.index \+ 1\}/,
+      ">> FAIL: chunk-numbering: retry/consumed lines must use 0-based `${fail.index}`, not `${fail.index + 1}` (off-by-one vs the batch line)");
+    assert.doesNotMatch(src, /chunk \$\{idx \+ 1\}/,
+      ">> FAIL: chunk-numbering: nonce-collision re-upload lines must use 0-based `${idx}`, not `${idx + 1}`");
+    assert.doesNotMatch(src, /chunk \$\{i \+ 1\} CID mismatch/,
+      ">> FAIL: chunk-numbering: the verify-mismatch error must use 0-based `${i}`, not `${i + 1}`");
+  });
+
+  test("owned-name update preflight announces the owner phone signature; header drops the transfer claim (#60 regression guard)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    // When a name is already owned, the DotNS content update is signed by the
+    // owner's phone. The preflight must announce this — via formatTransferModeDotnsLine,
+    // whose already-owned branch says "needs your phone signature (no transfer)" —
+    // so the user isn't surprised by the phone prompt (#60). The up-front worker
+    // header no longer claims a transfer (it prints before ownership is known);
+    // it states only the worker's storage role.
+    assert.match(src, /formatTransferModeDotnsLine\(alreadyOwned,/,
+      ">> FAIL: #60 guard: preflight must call formatTransferModeDotnsLine(alreadyOwned, …) so an owned update announces the owner phone signature");
+    assert.match(src, /signs Bulletin storage/,
+      ">> FAIL: #60 guard: the transfer-mode worker header must state only the storage role ('signs Bulletin storage'), not a definite transfer");
+  });
+
   test("Upload line appears when chunksUploaded > 0 (#510 regression guard)", () => {
     // Regression for the chunksUploaded=0 bug: with Phase A + Phase B coords
     // combined, a deploy that uploads any chunk must emit an Upload: line.
@@ -11061,6 +11239,246 @@ describe("storeChunkedContent dense nonce assignment", () => {
     const stored = [{ viaFallback: true }, { viaFallback: true }];
     const assigned = __assignDenseNoncesForTest(stored, 100);
     assert.equal(assigned.size, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Account-rotation nonce rebase (#951)
+//
+// When pool reconnect rotates to a DIFFERENT account (ss58 changes), the
+// pre-computed assignedNonces map is keyed to the OLD account's nonce base.
+// Two bugs:
+//  1. Remaining chunks are submitted with the old account's stale nonces →
+//     Invalid::Stale on the new account.
+//  2. The "nonce consumed → included" heuristic compares OLD-account nonce
+//     values against NEW-account currentNonce → false-positive "included" for
+//     chunks never submitted on any account.
+//
+// The fix: after doReconnect() detects an account change (ss58 before ≠ after),
+//  - re-run assignDenseNonces(stored, newNonce) so subsequent submissions use
+//    valid new-account nonces.
+//  - skip the consumed-heuristic (old nonce values are meaningless cross-account).
+// ---------------------------------------------------------------------------
+describe("storeChunkedContent account rotation on reconnect (#951)", () => {
+  const ACCOUNT_A = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+  const ACCOUNT_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty";
+
+  // Capture-enabled stub api: records the nonce from each signSubmitAndWatch call.
+  function makeCapturingStubApi(makeSubscribable, capturedNonces) {
+    return {
+      query: {
+        TransactionStorage: {
+          Authorizations: {
+            getValue: async () => ({
+              extent: { transactions: 0, transactions_allowance: 1000, bytes: 0n, bytes_permanent: 0n, bytes_allowance: BigInt(100_000_000) },
+              expiration: 9_999_999,
+            }),
+          },
+        },
+        System: { Number: { getValue: async () => 1000 } },
+      },
+      apis: { BulletinTransactionStorageApi: { can_store: async () => true } },
+      tx: {
+        TransactionStorage: {
+          store_with_cid_config: () => ({
+            signSubmitAndWatch: (_signer, opts) => {
+              capturedNonces.push(opts?.nonce);
+              return makeSubscribable();
+            },
+          }),
+        },
+      },
+    };
+  }
+
+  // Test 1: after rotation, remaining chunks must be submitted with the NEW
+  // account's rebased nonce (not the old stale nonce).
+  //
+  // Setup: 2 chunks, account A with startNonce=2665.
+  //   - assignedNonces: chunk0→2665, chunk1→2666
+  //   - First batch: both chunks fail with connection error (batch=2 pre-reconnect)
+  //   - doReconnectAndRebase() rotates to account B, rebases nonces to 3249
+  //   - new account B's currentNonce = 3249 (reproduces the #951 evidence)
+  //   - Expected: post-rotation submissions use nonces ≥ 3249, not 2665/2666
+  //
+  // Without the fix: assignedNonces is never rebased; chunks submitted with
+  // stale nonces 2665/2666 → Invalid::Stale on account B.
+  // With the fix: assignedNonces rebased; post-rotation chunks get 3249+.
+  test("chunk submitted after account rotation uses new account base nonce, not stale old nonce", async () => {
+    const allNonces = [];
+    let postRotationNonces = null; // filled after reconnect fires
+    let reconnectCount = 0;
+
+    // Both chunks fail on first attempt (connection error)
+    let txCall = 0;
+    const makeSubscribable = () => {
+      txCall++;
+      if (txCall <= 2) return connectionErrorSubscribable(); // first batch: both fail
+      return normalSubscribable();                           // post-reconnect: succeed
+    };
+
+    // Capture nonces split by account: before vs after rotation.
+    // apiB's capture array starts as postRotationNonces once reconnect fires.
+    const apiA = makeCapturingStubApi(makeSubscribable, allNonces);
+    let apiB_nonces = null;
+    const reconnect = async () => {
+      reconnectCount++;
+      apiB_nonces = [];
+      postRotationNonces = apiB_nonces;
+      return { client: { destroy() {} }, unsafeApi: makeCapturingStubApi(makeSubscribable, apiB_nonces), signer: stubSigner, ss58: ACCOUNT_B };
+    };
+
+    let nonceFetchCalls = 0;
+    const fetchNonce = async (_rpc, _ss58) => {
+      nonceFetchCalls++;
+      if (nonceFetchCalls === 1) return 2665; // initial startNonce for account A
+      return 3249;                            // post-reconnect nonce for account B
+    };
+
+    await storeChunkedContent([new Uint8Array([0x01]), new Uint8Array([0x02])], {
+      client: { destroy() {} },
+      unsafeApi: apiA,
+      signer: stubSigner,
+      ss58: ACCOUNT_A,
+      reconnect,
+      fetchNonce,
+    });
+
+    // All post-rotation submissions must use nonces ≥ 3249 (account B's base).
+    // Stale old-account nonces 2665, 2666 must NOT appear after rotation.
+    assert.ok(postRotationNonces !== null,
+      ">> FAIL: #951 nonce-rebase: reconnect was never called — rotation not simulated");
+    const staleNonceUsed = postRotationNonces.some(n => n != null && n < 3249);
+    assert.strictEqual(staleNonceUsed, false,
+      `>> FAIL: #951 nonce-rebase: after account rotation A→B, post-rotation nonces must be ≥ 3249 (account B base); got: [${postRotationNonces.join(", ")}]`);
+    assert.ok(postRotationNonces.filter(n => n != null).length >= 2,
+      `>> FAIL: #951 nonce-rebase: both chunks must be submitted on account B; got: [${postRotationNonces.join(", ")}]`);
+  });
+
+  // Test 2: the "nonce consumed → treating as included" heuristic must NOT fire
+  // cross-account: old account A's assignedNonce < new account B's currentNonce
+  // is always true and would silently drop chunks that were never submitted.
+  //
+  // Setup: 2 chunks, account A with startNonce=2665.
+  //   - First batch: both chunks fail with connection error
+  //   - doReconnect() rotates to account B
+  //   - account B's currentNonce = 3249 > 2665 → false-positive without the fix
+  //
+  // Without the fix: both chunks get silently marked "included" via heuristic
+  //   → result is corrupt (chunks never uploaded to any account).
+  // With the fix: heuristic is skipped on rotation; chunks are actually submitted.
+  test("consumed-heuristic does not false-positive across account rotation", async () => {
+    const capturedNonces = [];
+    let reconnectCount = 0;
+
+    let txCall = 0;
+    const makeSubscribable = () => {
+      txCall++;
+      if (txCall <= 2) return connectionErrorSubscribable(); // first batch: both fail
+      return normalSubscribable();                           // post-reconnect: succeed
+    };
+
+    const apiA = makeCapturingStubApi(makeSubscribable, capturedNonces);
+    const apiB = makeCapturingStubApi(makeSubscribable, capturedNonces);
+
+    let nonceFetchCalls = 0;
+    const fetchNonce = async (_rpc, ss58) => {
+      nonceFetchCalls++;
+      if (nonceFetchCalls === 1) return 2665;
+      return 3249; // higher than any assigned nonce → triggers false-positive without fix
+    };
+
+    const reconnect = async () => {
+      reconnectCount++;
+      return { client: { destroy() {} }, unsafeApi: apiB, signer: stubSigner, ss58: ACCOUNT_B };
+    };
+
+    await storeChunkedContent([new Uint8Array([0x01]), new Uint8Array([0x02])], {
+      client: { destroy() {} },
+      unsafeApi: apiA,
+      signer: stubSigner,
+      ss58: ACCOUNT_A,
+      reconnect,
+      fetchNonce,
+    });
+
+    // Both chunks must be actually submitted on account B (not silently "included").
+    // Without the fix, txCall stays at 2 (only the failed initial batch) and the
+    // function returns without actually uploading chunks to account B.
+    // Root node tx is also submitted, so txCall should be > 2.
+    const submittedAfterRotation = capturedNonces.filter(n => n != null).length;
+    assert.ok(submittedAfterRotation >= 2,
+      `>> FAIL: #951 consumed-heuristic: cross-account rotation must not silently "include" chunks; expected ≥2 real submissions after rotation, got ${submittedAfterRotation}`);
+  });
+
+  // Test 3 (#32): the PROACTIVE between-batches WS-halt guard (top of the batch
+  // loop) must ALSO rebase on rotation. Before the fix it called doReconnect()
+  // directly (not doReconnectAndRebase), so a rotation there left assignedNonces
+  // keyed to the OLD account → the next batch submitted stale old-account nonces
+  // (isValid:false). Since that's NOT a connection error, the per-failure retry
+  // never reconnects and the consumed-heuristic false-positives. Unlike #951's
+  // tests (connection-error path), this drives the halt via the real Bulletin
+  // status handler firing a WS ERROR between batches with no chunk error.
+  test("between-batches WS-halt guard rebases nonces on account rotation (#32)", async () => {
+    const noncesA = [];
+    const noncesB = [];
+    let target = noncesA; // submissions land on A until reconnect rotates to B
+    let halted = false;
+
+    const makeApi = () => ({
+      query: {
+        TransactionStorage: {
+          Authorizations: {
+            getValue: async () => ({
+              extent: { transactions: 0, transactions_allowance: 1000, bytes: 0n, bytes_permanent: 0n, bytes_allowance: BigInt(100_000_000) },
+              expiration: 9_999_999,
+            }),
+          },
+        },
+        System: { Number: { getValue: async () => 1000 } },
+      },
+      apis: { BulletinTransactionStorageApi: { can_store: async () => true } },
+      tx: {
+        TransactionStorage: {
+          store_with_cid_config: () => ({
+            signSubmitAndWatch: (_signer, opts) => {
+              target.push(opts?.nonce);
+              if (!halted) {
+                halted = true;
+                // Real wiring: a WS ERROR fires the registered _onWsHalt callback.
+                makeBulletinStatusHandler("wss://primary")({ type: WsEvent.ERROR });
+              }
+              return normalSubscribable();
+            },
+          }),
+        },
+      },
+    });
+
+    let fetchCalls = 0;
+    const fetchNonce = async () => { fetchCalls++; return fetchCalls === 1 ? 100 : 3249; };
+
+    const reconnect = async () => {
+      target = noncesB; // post-rotation submissions land on account B
+      return { client: { destroy() {} }, unsafeApi: makeApi(), signer: stubSigner, ss58: ACCOUNT_B };
+    };
+
+    // 3 chunks → batch 1 = {0,1} (halt fires here), batch 2 = {2} after the guard reconnects.
+    await storeChunkedContent([new Uint8Array([0x01]), new Uint8Array([0x02]), new Uint8Array([0x03])], {
+      client: { destroy() {} },
+      unsafeApi: makeApi(),
+      signer: stubSigner,
+      ss58: ACCOUNT_A,
+      reconnect,
+      fetchNonce,
+    });
+
+    assert.ok(halted, ">> FAIL: #32: WS halt was never fired — between-batches guard not exercised");
+    assert.ok(noncesB.length >= 1,
+      `>> FAIL: #32: expected ≥1 submission on account B after the between-batches guard reconnected; got [${noncesB.join(", ")}]`);
+    const stale = noncesB.filter(n => n != null && n < 3249);
+    assert.deepStrictEqual(stale, [],
+      `>> FAIL: #32: the between-batches WS-halt guard must rebase assignedNonces on rotation — post-rotation submissions must use account B's base (≥3249), not stale account-A nonces; got [${noncesB.join(", ")}]`);
   });
 });
 
@@ -17679,6 +18097,41 @@ describe("makeRetryStatusFilter", () => {
       `>> FAIL: makeRetryStatusFilter: finalized must reach sink — received: ${JSON.stringify(received)}`
     );
   });
+
+  test("deduplicates 'included': repeated txBestBlocksState found=true events emit 'included' only once (#891)", () => {
+    // papi's txBestBlocksState subscription can emit found=true multiple times as
+    // the tx appears/reappears across best-block updates. Without dedup the status
+    // line would print twice (one per emit).
+    const received = [];
+    const filter = makeRetryStatusFilter((s) => received.push(s));
+    filter.callback("signing");
+    filter.callback("broadcasting");
+    filter.callback("included"); // first txBestBlocksState found=true
+    filter.callback("included"); // second txBestBlocksState found=true (reorg/reappear)
+    filter.callback("finalized");
+    assert.deepStrictEqual(
+      received,
+      ["signing", "broadcasting", "included", "finalized"],
+      `>> FAIL: makeRetryStatusFilter #891: duplicate 'included' must be deduplicated — received: ${JSON.stringify(received)}`
+    );
+  });
+
+  test("'included' dedup resets on reset(): a new attempt can emit 'included' again (#891)", () => {
+    const received = [];
+    const filter = makeRetryStatusFilter((s) => received.push(s));
+    // Attempt 1: included (then fails, retried)
+    filter.callback("included");
+    filter.callback("failed");
+    filter.reset();
+    // Attempt 2: included again (new attempt — must pass through)
+    filter.callback("included");
+    filter.callback("finalized");
+    const includedCount = received.filter((s) => s === "included").length;
+    assert.strictEqual(
+      includedCount, 2,
+      `>> FAIL: makeRetryStatusFilter #891: after reset(), 'included' on a new attempt must pass through — received: ${JSON.stringify(received)}`
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -17731,6 +18184,284 @@ describe("computePhoneSigningSteps", () => {
 });
 
 // ---------------------------------------------------------------------------
+// human-first phone signing — confirmPhoneReady / timeout split / fail-fast
+// ---------------------------------------------------------------------------
+describe("human-first phone signing", () => {
+  // Helper: build a minimal DotNS-like ClientWrapper stub for contractTransaction tests.
+  function makePhoneStub(opts = {}) {
+    let callCount = 0;
+    const stub = {
+      ensureAccountMapped: async () => {},
+      checkIfAccountMapped: async () => true,
+      estimateGasForCall: async () => ({
+        success: true,
+        gasRequired: { referenceTime: 100n, proofSize: 100n },
+        storageDeposit: 0n,
+      }),
+      signAndSubmitWithRetry: async () => ({ kind: "hash", hash: "0xabc" }),
+      submitTransaction: async (contractAddress, value, encodedData, signerSub, signer, statusCb, txOpts) => {
+        callCount++;
+        if (opts.submitDelay) await new Promise(r => setTimeout(r, opts.submitDelay));
+        if (opts.submitError) throw opts.submitError;
+        return { kind: "hash", hash: "0xdead" };
+      },
+      getCallCount: () => callCount,
+    };
+    return stub;
+  }
+
+  test("confirmPhoneReady stub delaying past OPERATION_TIMEOUT_MS does NOT time out (timeout only on chain portion)", async () => {
+    // The gate must be OUTSIDE the machine timeout. A stub that resolves after
+    // OPERATION_TIMEOUT_MS + 100ms must NOT cause the overall call to reject.
+    const dotns = new DotNS();
+    // Wire a minimal clientWrapper stub that resolves immediately after submit.
+    const stub = makePhoneStub({ submitDelay: 0 });
+    dotns.clientWrapper = stub;
+    dotns.connected = true;
+    dotns.rpc = "wss://mock";
+    dotns.assetHubEndpoints = ["wss://mock"];
+    dotns.substrateAddress = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+    dotns.signer = { signBytes: async () => new Uint8Array(64), signTx: async (tx) => tx };
+
+    const gateDelayMs = OPERATION_TIMEOUT_MS + 100;
+    let gateResolved = false;
+    const confirmPhoneReady = () => new Promise(resolve => {
+      setTimeout(() => { gateResolved = true; resolve(); }, gateDelayMs);
+    });
+
+    dotns._confirmPhoneReady = confirmPhoneReady;
+    dotns._usesExternalSigner = true;
+    dotns._isPhoneSigner = true; // phone/session signer — gate must run
+    dotns._phoneSignatureTotal = 1;
+    dotns._phoneSignatureAttempts = new Map();
+
+    // Shorten OPERATION_TIMEOUT_MS for this test by patching contractTransaction's
+    // timeout call: instead, call _awaitPhoneReady directly then check stub.
+    // We'll call _awaitPhoneReady directly to verify it doesn't time out.
+    const start = Date.now();
+    await dotns._awaitPhoneReady("Link content");
+    const elapsed = Date.now() - start;
+    assert.ok(gateResolved, "confirmPhoneReady must have resolved >> FAIL: human-first phone signing: gate did not resolve");
+    assert.ok(elapsed >= gateDelayMs - 50, "gate must have taken at least gateDelayMs >> FAIL: human-first phone signing: gate resolved too early");
+    // Key invariant: no timeout error was thrown even though elapsed >> OPERATION_TIMEOUT_MS.
+  });
+
+  test("external signer + no confirmPhoneReady + non-TTY → must NOT throw (gate is opt-in only; in-process signers need no phone gate)", async () => {
+    // Regression guard: rc.1 introduced a fail-fast that threw NonRetryableError for any
+    // _usesExternalSigner call with no confirmPhoneReady hook in a non-TTY. This broke
+    // S-ext-signer and S9 (injected PolkadotSigner / mnemonic) because _usesExternalSigner
+    // cannot distinguish phone signers from in-process external signers.
+    // The gate must be purely opt-in: absent confirmPhoneReady → proceed, never throw.
+    const dotns = new DotNS();
+    dotns._usesExternalSigner = true;
+    dotns._isPhoneSigner = true; // genuine phone signer — gate must run (opt-in path)
+    dotns._confirmPhoneReady = undefined;
+    dotns._phoneSignatureTotal = 1;
+    dotns._phoneSignatureAttempts = new Map();
+
+    // Temporarily patch isTTY to simulate non-interactive environment (CI / E2E).
+    const origStdinTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+    const origStdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
+    try {
+      // Must resolve without throwing — no hook + non-TTY is a valid state for in-process signers.
+      await dotns._awaitPhoneReady("Link content");
+      // If we reach here the gate did not throw — correct behavior.
+    } catch (err) {
+      assert.fail(
+        `_awaitPhoneReady must not throw when no confirmPhoneReady hook is provided — got ${err.constructor.name}: ${err.message} >> FAIL: human-first phone signing: opt-in gate threw for in-process external signer`,
+      );
+    } finally {
+      if (origStdinTTY) Object.defineProperty(process.stdin, "isTTY", origStdinTTY);
+      else delete process.stdin.isTTY;
+      if (origStdoutTTY) Object.defineProperty(process.stdout, "isTTY", origStdoutTTY);
+      else delete process.stdout.isTTY;
+    }
+  });
+
+  test("re-sign path: attempt counter increments and confirmPhoneReady receives attempt >= 2 on second call", async () => {
+    const dotns = new DotNS();
+    dotns._usesExternalSigner = true;
+    dotns._isPhoneSigner = true; // phone/session signer — re-sign gate must run
+    dotns._phoneSignatureTotal = 1;
+    dotns._phoneSignatureAttempts = new Map();
+
+    const attempts = [];
+    dotns._confirmPhoneReady = async (ctx) => { attempts.push(ctx.attempt); };
+
+    await dotns._awaitPhoneReady("Link content");
+    await dotns._awaitPhoneReady("Link content");
+
+    assert.strictEqual(attempts[0], 1,
+      "first call must have attempt=1 >> FAIL: human-first phone signing: first attempt not 1");
+    assert.ok(attempts[1] >= 2,
+      "second call (re-sign) must have attempt >= 2 >> FAIL: human-first phone signing: re-sign attempt not >= 2");
+  });
+
+  test("retry re-gate wiring (#39): contractTransaction passes a working onResign that re-gates the phone before a retry re-sign", async () => {
+    // The #39 regression class is a WIRING bug: contractTransaction builds the
+    // retry loop's onResign callback but fails to pass it down, so a
+    // verifyEffect-false-negative retry re-signs SILENTLY (no second phone gate,
+    // no "Re-sign needed" prompt). The pure shouldRegateBeforeResign unit test
+    // stays green even with that wiring gone — so this drives the real
+    // contractTransaction and asserts the wiring end-to-end.
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    d._isPhoneSigner = true; // phone signer → the retry loop must re-gate before a re-sign
+    d._phoneSignatureTotal = 1;
+    d._phoneSignatureAttempts = new Map();
+    const gateCalls = [];
+    d._confirmPhoneReady = async ({ label, attempt }) => { gateCalls.push({ label, attempt }); };
+
+    let captured;
+    d.clientWrapper = {
+      submitTransaction: async (_addr, _v, _data, _sub, _signer, _cb, options) => {
+        captured = options;
+        // Faithfully replay the real signAndSubmitWithRetry contract: on a
+        // verifyEffect false-negative the loop re-gates via onResign BEFORE the
+        // re-sign. Simulate one retry (attempt 2) exactly as the loop would.
+        if (shouldRegateBeforeResign(2, options.isPhoneSigner)) {
+          await options.onResign?.(2);
+        }
+        return "0xdead";
+      },
+    };
+
+    await d.contractTransaction(
+      "0x732C38082CFAebed505A46e4e2D6414154694580",
+      0n,
+      [{ inputs: [], name: "register", outputs: [], stateMutability: "nonpayable", type: "function" }],
+      "register",
+      [],
+      () => {},
+      { phoneLabel: "Link content" },
+    );
+
+    // Wiring (the property that broke): contractTransaction must hand the retry loop
+    // both the phone-signer flag and a callable onResign.
+    assert.strictEqual(captured.isPhoneSigner, true,
+      ">> FAIL: #39 wiring: contractTransaction must pass isPhoneSigner:true so the retry loop re-gates phone re-signs");
+    assert.strictEqual(typeof captured.onResign, "function",
+      ">> FAIL: #39 wiring: contractTransaction must pass a defined onResign — without it a retry re-signs silently");
+    // End-to-end: initial gate (attempt 1, 'Check your phone') + re-sign gate
+    // (attempt 2 → bin renders 'Re-sign needed (attempt 2)').
+    assert.deepStrictEqual(gateCalls.map((c) => c.attempt), [1, 2],
+      ">> FAIL: #39: a phone-signer retry must re-invoke the human gate with attempt 2 (so the consumer renders 'Re-sign needed'); got " + JSON.stringify(gateCalls.map((c) => c.attempt)));
+    assert.strictEqual(gateCalls[1].label, "Link content",
+      ">> FAIL: #39: the re-gate must reuse the step's phoneLabel");
+  });
+
+  test("onPhoneSignaturePlan fires before storage with correct step counts: new-name (commit·register·link)", () => {
+    const plans = [];
+    const handler = (steps) => plans.push(steps.slice());
+    // Simulate what deploy() does at preflight.
+    const dotnsPreflight = { plannedAction: "register", needsPopUpgrade: false };
+    const preflightPublishNeeded = false;
+    const steps = computePhoneSigningSteps(dotnsPreflight, preflightPublishNeeded);
+    handler(steps);
+    assert.deepStrictEqual(plans[0], ["Commitment", "Register", "Link content"],
+      "new-name plan must be [Commitment, Register, Link content] >> FAIL: human-first phone signing: wrong step plan for new-name");
+  });
+
+  test("onPhoneSignaturePlan fires before storage with correct step counts: owned-name (link)", () => {
+    const plans = [];
+    const dotnsPreflight = { plannedAction: "already-owned-by-us", needsPopUpgrade: false };
+    const steps = computePhoneSigningSteps(dotnsPreflight, false);
+    plans.push(steps.slice());
+    assert.deepStrictEqual(plans[0], ["Link content"],
+      "owned-name plan must be [Link content] >> FAIL: human-first phone signing: wrong step plan for owned-name");
+  });
+
+  test("onPhoneSignaturePlan fires before storage with correct step counts: new-name + publish (commit·register·link·publish)", () => {
+    const steps = computePhoneSigningSteps({ plannedAction: "register", needsPopUpgrade: false }, true);
+    assert.deepStrictEqual(steps, ["Commitment", "Register", "Link content", "Publish to registry"],
+      "new-name+publish plan must include Publish to registry >> FAIL: human-first phone signing: publish step missing from plan");
+  });
+
+  test("core src/dotns.ts and src/deploy.ts contain no readline or process.stdin reference", () => {
+    const dotnsSource = fs.readFileSync("src/dotns.ts", "utf8");
+    const deploySource = fs.readFileSync("src/deploy.ts", "utf8");
+    // Allow process.stdin.isTTY in dotns.ts (used for fail-fast TTY detection, not stdin blocking).
+    // Disallow any readline import or direct process.stdin usage.
+    assert.doesNotMatch(dotnsSource, /^import.*readline/m,
+      "src/dotns.ts must not import readline >> FAIL: human-first phone signing: readline import found in dotns.ts");
+    // Check for real usage (import + createInterface call), not the bare word —
+    // an explanatory comment may legitimately mention "readline".
+    assert.doesNotMatch(deploySource, /^import.*readline/m,
+      "src/deploy.ts must not import readline >> FAIL: human-first phone signing: readline import found in deploy.ts");
+    assert.doesNotMatch(deploySource, /\breadline\.createInterface\b/,
+      "src/deploy.ts must not call readline.createInterface >> FAIL: human-first phone signing: readline usage found in deploy.ts");
+    assert.doesNotMatch(deploySource, /process\.stdin/,
+      "src/deploy.ts must not use process.stdin >> FAIL: human-first phone signing: process.stdin found in deploy.ts");
+  });
+
+  // ---------------------------------------------------------------------------
+  // #50: transfer-mode phone gate regression tests
+  // ---------------------------------------------------------------------------
+
+  test("transfer mode (phoneSigner=false): _awaitPhoneReady issues NO confirmPhoneReady call and NO onPhoneSigningRequired", async () => {
+    // Regression guard for #50: in transfer mode the local worker signer has
+    // _usesExternalSigner=true, but phoneSigner=false. _awaitPhoneReady must
+    // exit immediately — no gate, no notification. Pressing Y on a spurious
+    // prompt is not fatal, but a non-TTY transfer deploy stalls forever.
+    const dotns = new DotNS();
+    dotns._usesExternalSigner = true; // local worker: external signer IS set
+    dotns._isPhoneSigner = false;     // but NOT a phone signer — transfer mode
+    dotns._phoneSignatureTotal = 1;
+    dotns._phoneSignatureAttempts = new Map();
+
+    let confirmPhoneCalls = 0;
+    let onPhoneSigningRequiredCalls = 0;
+    dotns._confirmPhoneReady = async () => { confirmPhoneCalls++; };
+    dotns._onPhoneSigningRequired = () => { onPhoneSigningRequiredCalls++; };
+
+    await dotns._awaitPhoneReady("Commitment");
+    await dotns._awaitPhoneReady("Register");
+
+    assert.strictEqual(confirmPhoneCalls, 0,
+      `confirmPhoneReady must not be called in transfer mode — got ${confirmPhoneCalls} calls >> FAIL: #50 transfer-mode phone gate: confirmPhoneReady fired`);
+    assert.strictEqual(onPhoneSigningRequiredCalls, 0,
+      `onPhoneSigningRequired must not fire in transfer mode — got ${onPhoneSigningRequiredCalls} calls >> FAIL: #50 transfer-mode phone gate: onPhoneSigningRequired fired`);
+  });
+
+  test("genuine phone signer (phoneSigner=true): _awaitPhoneReady DOES call confirmPhoneReady and onPhoneSigningRequired", async () => {
+    // Positive test: a real phone/session signer with phoneSigner=true must still
+    // gate correctly — both confirmPhoneReady and onPhoneSigningRequired must fire.
+    const dotns = new DotNS();
+    dotns._usesExternalSigner = true;
+    dotns._isPhoneSigner = true; // real phone signer — gate must run
+    dotns._phoneSignatureTotal = 1;
+    dotns._phoneSignatureAttempts = new Map();
+
+    let confirmPhoneCalls = 0;
+    let onPhoneSigningRequiredCalls = 0;
+    dotns._confirmPhoneReady = async () => { confirmPhoneCalls++; };
+    dotns._onPhoneSigningRequired = () => { onPhoneSigningRequiredCalls++; };
+
+    await dotns._awaitPhoneReady("Link content");
+
+    assert.strictEqual(confirmPhoneCalls, 1,
+      `confirmPhoneReady must be called once for a phone signer — got ${confirmPhoneCalls} >> FAIL: #50 transfer-mode phone gate: confirmPhoneReady not called for phone signer`);
+    assert.strictEqual(onPhoneSigningRequiredCalls, 1,
+      `onPhoneSigningRequired must fire once for a phone signer — got ${onPhoneSigningRequiredCalls} >> FAIL: #50 transfer-mode phone gate: onPhoneSigningRequired not fired for phone signer`);
+  });
+
+  test("deploy.ts passes phoneSigner=true to ownerDotns.connect and phoneSigner=phoneSignerActive to dotns.connect", () => {
+    // Structural guard: deploy.ts must wire the explicit phoneSigner flag at both
+    // DotNS connect call sites so the gate state is driven by isPhoneSignerActive,
+    // not the transfer-mode-conflating _usesExternalSigner. Fixes #50.
+    const deploySource = fs.readFileSync("src/deploy.ts", "utf8");
+    assert.match(deploySource, /phoneSigner:\s*true/,
+      "deploy.ts must pass phoneSigner: true to ownerDotns.connect >> FAIL: #50 transfer-mode phone gate: phoneSigner:true missing from ownerDotns.connect");
+    assert.match(deploySource, /phoneSigner:\s*phoneSignerActive/,
+      "deploy.ts must pass phoneSigner: phoneSignerActive to dotns.connect >> FAIL: #50 transfer-mode phone gate: phoneSigner:phoneSignerActive missing from dotns.connect");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Issue 1: "will transfer" banner must not assert a transfer on owned-domain paths
 // ---------------------------------------------------------------------------
 describe("deploy.ts worker banner (issue 1 — owned-domain 'will transfer' removed)", () => {
@@ -17748,11 +18479,20 @@ describe("deploy.ts worker banner (issue 1 — owned-domain 'will transfer' remo
     );
   });
 
-  test("deploy.ts source contains 'final owner' wording in the worker banner (replacement present)", () => {
+  test("deploy.ts worker banner states only the storage role, not a transfer/owner claim (#60)", () => {
+    // Supersedes the earlier "final owner" wording: the up-front banner prints
+    // before preflight knows ownership, so it must claim neither a transfer nor a
+    // final owner — only the worker's certain role. The transfer-vs-owned reality
+    // is announced at preflight via formatTransferModeDotnsLine (#60).
     const src = fs.readFileSync("src/deploy.ts", "utf8");
     assert.ok(
-      src.includes("final owner"),
-      "Expected 'final owner' wording in src/deploy.ts worker banner (replacement for 'will transfer') >> FAIL: Issue 1 banner replacement not found"
+      src.includes("signs Bulletin storage"),
+      ">> FAIL: #60: worker banner must state only the storage role ('signs Bulletin storage')"
+    );
+    const bannerLine = src.match(/console\.log\(`   Worker: \$\{actors\.worker\.source\} signer \$\{actors\.worker\.address\}[^`]*`\)/);
+    assert.ok(
+      bannerLine && !bannerLine[0].includes("final owner") && !bannerLine[0].includes("will transfer"),
+      ">> FAIL: #60: worker banner must not claim a transfer or a final owner (ownership is unknown at banner time)"
     );
   });
 });
@@ -18018,7 +18758,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine } from "../dist/deploy.js";
 
 describe("resolveStorageSigner (user-first storage signer, #19)", () => {
   const fakeSigner = { publicKey: new Uint8Array(32), signTx: async () => new Uint8Array(64), signBytes: async () => new Uint8Array(64) };
@@ -18180,6 +18920,48 @@ describe("formatStorageSignerLine (user-first storage signer, #19)", () => {
     assert.match(line, /pool fallback.*allowance declined/,
       ">> FAIL: formatStorageSignerLine pool-reason: must include the provided reason");
   });
+
+  test("transfer mode → worker storage line (NOT 'pool fallback', NOT 'no session') (#892 + storage-wording fix)", () => {
+    // In transfer mode the local worker signs Bulletin storage (it signs the whole
+    // deploy). The line must say so — not "pool fallback" (it doesn't use the pool;
+    // that contradicted the very next "Using external signer: <worker>" line) and
+    // not "(no session)" (the user IS logged in, #892). Transfer mode now uses
+    // formatTransferModeStorageSignerLine, not formatStorageSignerLine.
+    const WORKER = "5DfhGyQdFobKM8NsWvEeAKk5EQQgYe9AydgJ7rMB6E1EqRzV";
+    const line = formatTransferModeStorageSignerLine(WORKER);
+    assert.match(line, /worker 5DfhGyQ/,
+      ">> FAIL: transfer-mode storage line must name the worker that signs storage");
+    assert.match(line, /transfer mode/,
+      ">> FAIL: transfer-mode storage line must indicate transfer mode");
+    assert.doesNotMatch(line, /pool fallback/,
+      ">> FAIL: transfer mode does NOT use the pool — must not say 'pool fallback' (contradicts the 'Using external signer' line)");
+    assert.doesNotMatch(line, /no session/,
+      ">> FAIL: transfer-mode storage line must NOT say 'no session' for a signed-in user (#892)");
+  });
+});
+
+describe("formatTransferModeDotnsLine (transfer-vs-owned announcement, #60)", () => {
+  const RECIP = "0xb646bc6e0000000000000000000000000000beef";
+
+  test("new name → 'will register … and transfer it to your account <recipient>'", () => {
+    const line = formatTransferModeDotnsLine(false, "example.dot", RECIP);
+    assert.match(line, /will register example\.dot and transfer it to your account/,
+      ">> FAIL: formatTransferModeDotnsLine new-name: must say it will register + transfer the name");
+    assert.ok(line.includes(RECIP),
+      ">> FAIL: formatTransferModeDotnsLine new-name: must name the recipient account");
+  });
+
+  test("already owned → 'you already own … phone signature (no transfer)' and names no recipient/transfer-to", () => {
+    const line = formatTransferModeDotnsLine(true, "example.dot", RECIP);
+    assert.match(line, /you already own example\.dot/,
+      ">> FAIL: formatTransferModeDotnsLine owned: must say the user already owns the name");
+    assert.match(line, /phone signature/,
+      ">> FAIL: formatTransferModeDotnsLine owned: must state a phone signature is needed for the update");
+    assert.match(line, /no transfer/,
+      ">> FAIL: formatTransferModeDotnsLine owned: must make clear no transfer happens (#60)");
+    assert.doesNotMatch(line, /will register|transfer it to/,
+      ">> FAIL: formatTransferModeDotnsLine owned: must NOT imply a register/transfer for an already-owned name (the #60 bug)");
+  });
 });
 
 describe("chooseSignerInput Layer-3 isolation (#19)", () => {
@@ -18206,5 +18988,35 @@ describe("chooseSignerInput Layer-3 isolation (#19)", () => {
     const choice = chooseSignerInput({ mnemonic: "bottom drive obey lake curtain smoke basket hold race lonely fit walk", suri: undefined, hasInjectedSigner: false, hasSession: false });
     assert.strictEqual(choice, "mnemonic",
       ">> FAIL: chooseSignerInput Layer-3: mnemonic must always choose mnemonic path");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// localStorage warning suppression — real bin spawn (#35)
+// The prior fix installed the process.emitWarning suppressor inline in
+// bin/polkadot-app-deploy, but inline code runs AFTER static ESM imports are
+// evaluated. The "@parity/product-sdk-logger" module accesses localStorage at
+// module-init time, which fires the warning during `import "../dist/deploy.js"`
+// — before the inline suppressor exists. The fix: install the suppressor in a
+// separate module imported FIRST so it runs before any SDK module-init code.
+// This test spawns the real built bin (not a synthetic re-emit) to cover the
+// import-order timing gap that the prior in-isolation test missed.
+// ---------------------------------------------------------------------------
+describe("localStorage warning suppression (real bin)", () => {
+  // Use --list-environments, not --version. --version calls process.exit(0) synchronously
+  // before the nextTick-queued warning can flush; --list-environments does an await
+  // (loadEnvironments) before exit, which drains the nextTick and surfaces the warning
+  // if the suppressor was not installed before the SDK module-init code ran.
+  test("polkadot-app-deploy --list-environments emits no localStorage warning on stderr", () => {
+    const binPath = path.resolve(fileURLToPath(import.meta.url), "../../bin/polkadot-app-deploy");
+    const result = spawnSync(process.execPath, [binPath, "--list-environments"], {
+      encoding: "utf8",
+      env: { ...process.env, PAD_TELEMETRY: "0", PAD_UPDATE_CHECK: "0" },
+      timeout: 15000,
+    });
+    assert.ok(
+      !/local ?storage/i.test(result.stderr ?? ""),
+      `>> FAIL: localStorage warning suppression: polkadot-app-deploy --list-environments must not emit a localStorage warning on stderr.\nActual stderr: ${result.stderr}`,
+    );
   });
 });

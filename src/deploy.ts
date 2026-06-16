@@ -26,7 +26,8 @@ import { mirrorToGitHubPages, MirrorSkipped, pollMirrorFreshness } from "./gh-pa
 import type { MirrorResult } from "./gh-pages-mirror.js";
 import { keccak256, toBytes } from "viem";
 import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, PublisherNotSupportedError, PUBLISHER_ABI } from "./dotns.js";
-import type { ParsedDomainName, DotnsPreflightResult } from "./dotns.js";
+import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep } from "./dotns.js";
+export type { PhoneSignatureStep };
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, detectTestnet } from "./pool.js";
 import type { PoolAuthorization } from "./pool.js";
@@ -496,6 +497,32 @@ export function formatStorageSignerLine(slotAddress: string | null, failReason?:
   return `   Storage signer: pool fallback (${failReason ?? "no session"})`;
 }
 
+/**
+ * Storage-signer status line for transfer mode. In transfer mode the local
+ * worker (Alice / --suri) signs the whole deploy, INCLUDING Bulletin storage —
+ * so it is NOT a pool fallback. The old line said "pool fallback (transfer mode
+ * — worker signs storage)", which contradicted the very next "Using external
+ * signer: <worker>" line. State plainly that the worker signs storage. Exported
+ * for unit testing.
+ */
+export function formatTransferModeStorageSignerLine(workerAddress: string): string {
+  return `   Storage signer: worker ${workerAddress} (transfer mode)`;
+}
+
+/**
+ * #60: the transfer-mode DotNS announcement, printed at preflight once ownership
+ * is known. The up-front worker header states only the worker's storage role (it
+ * can't know ownership yet); this line states the transfer-vs-owned-update reality:
+ *   New name:      "   DotNS: will register <name> and transfer it to your account <recipient>"
+ *   Already owned: "   DotNS: you already own <name> — content update needs your phone signature (no transfer)"
+ * Exported for unit testing.
+ */
+export function formatTransferModeDotnsLine(alreadyOwned: boolean, dotName: string, recipient: string): string {
+  return alreadyOwned
+    ? `   DotNS: you already own ${dotName} — content update needs your phone signature (no transfer)`
+    : `   DotNS: will register ${dotName} and transfer it to your account ${recipient}`;
+}
+
 function selectStorageReconnect(options: DeployOptions): () => Promise<ProviderResult> {
   if (options.storageSigner && options.storageSignerAddress) {
     // Committed-signer: once the slot provider fails on the first attempt,
@@ -920,15 +947,42 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
 
     // Pre-compute dense nonces: skipped chunks consume zero nonce slots, so the
     // actually-submitted chunks receive consecutive nonces startNonce..N.
-    // Re-running assignDenseNonces after reconnect (see startNonce re-fetch below)
-    // is safe: by that point more stored[] entries may be non-null, so the map
-    // shrinks further — still dense, still correct.
-    const assignedNonces = assignDenseNonces(stored, startNonce);
+    // Re-running assignDenseNonces after reconnect (see doReconnectAndRebase below)
+    // is necessary when the pool rotates to a different account (ss58 changes):
+    // old-account nonces are invalid on the new account. `let` because the rebase
+    // reassigns this map on rotation.
+    let assignedNonces = assignDenseNonces(stored, startNonce);
+
+    // Reconnect and rebase dense nonces if the pool rotated to a different account.
+    // Returns { changed: bool, currentNonce: number }.
+    //   changed=true  → ss58 changed; assignedNonces has been rebased to the new
+    //                   account's nonce base. Callers must skip the "nonce consumed →
+    //                   included" heuristic — old-account nonce values are meaningless
+    //                   on the new account (the #951 false-positive).
+    //   changed=false → same-account reconnect; behaviour unchanged (heuristic valid).
+    // #946 sites (nonce-collision re-upload, root-node reconnect) keep calling
+    // doReconnect() directly — they do not read assignedNonces so no rebase needed.
+    const doReconnectAndRebase = async (): Promise<{ changed: boolean; currentNonce: number }> => {
+      const prevSS58 = ss58;
+      await doReconnect();
+      const currentNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
+      const changed = ss58 !== prevSS58;
+      if (changed) {
+        assignedNonces = assignDenseNonces(stored, currentNonce);
+        startNonce = currentNonce;
+      }
+      return { changed, currentNonce };
+    };
 
     // Upload-pass numerator: how many chunks we will actually submit. The
     // reconnect path only re-tries existing stored[]===null entries; it never
     // introduces new ones, so this value is stable across reconnects.
     const uploadTotal = stored.filter((s) => s === null).length;
+    // uploadEmittedIndices tracks which chunk indices have already been counted
+    // in the [N/M] progress line. On connection-error retries the same chunk
+    // index re-enters the batch loop — without this guard uploadEmitted would
+    // exceed uploadTotal (e.g. [3/2], [4/2] …) (#932).
+    const uploadEmittedIndices = new Set<number>();
     let uploadEmitted = 0;
     const nonceAdvanceIndices = new Set<number>();
 
@@ -940,7 +994,14 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       // before submitting any chunks against the destroyed one.
       if (wsHaltDetected && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
         wsHaltDetected = false;
-        await doReconnect();
+        // doReconnectAndRebase (not bare doReconnect): this guard runs *before*
+        // the assignedNonces submission loop below, so a pool-account rotation
+        // here must rebase assignedNonces to the new account's nonce base —
+        // else chunks submit with stale old-account nonces (isValid:false), which
+        // is not a connection error so the per-failure retry never reconnects and
+        // the consumed-heuristic false-"includes" never-stored chunks (#32).
+        // Return value unused: no in-flight chunks at the loop top, only the rebase matters.
+        await doReconnectAndRebase();
       }
       const batchSize = reconnectionsUsed > 0 ? BATCH_SIZE_RECOVERY : BATCH_SIZE_INITIAL;
       // Only submit chunks that haven't been stored yet (relevant after reconnection)
@@ -955,8 +1016,9 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       const batchPromises = batchChunks.map((chunkData: Uint8Array, j: number) => {
         const i = batchIndices[j];
         const nonce = assignedNonces.get(i)!;
-        uploadEmitted++;
-        console.log(`   [${uploadEmitted}/${uploadTotal}] chunk ${i} — ${(chunkData.length / 1024 / 1024).toFixed(2)} MB (nonce: ${nonce})`);
+        const isRetry = uploadEmittedIndices.has(i);
+        if (!isRetry) { uploadEmittedIndices.add(i); uploadEmitted++; }
+        console.log(`   [${uploadEmitted}/${uploadTotal}] chunk ${i} — ${(chunkData.length / 1024 / 1024).toFixed(2)} MB (nonce: ${nonce})${isRetry ? " (retry)" : ""}`);
         return storeChunk(unsafeApi, signer as PolkadotSigner, chunkData, nonce, ss58 as string, { fetchNonce: fetchNonceOverride });
       });
 
@@ -984,18 +1046,25 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       // the WS is healthy, the retry path will reissue with a fresh nonce.
       const needsReconnect = failures.some(f => isConnectionError(f.error));
       if (needsReconnect && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
-        await doReconnect();
-        const currentNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
-        for (const idx of batchIndices) {
-          const chunkNonce = assignedNonces.get(idx);
-          if (chunkNonce !== undefined && chunkNonce < currentNonce && stored[idx] === null) {
-            console.log(`   Chunk ${idx + 1}: nonce ${chunkNonce} consumed (current=${currentNonce}), treating as included`);
-            stored[idx] = { cid: createCID(chunks[idx], CID_CONFIG.codec, 0x12), len: chunks[idx].length, viaFallback: true };
-            nonceAdvanceIndices.add(idx);
-            assignedNonces.delete(idx);
+        const { changed, currentNonce } = await doReconnectAndRebase();
+        // "nonce consumed → included" heuristic: only valid when the account did
+        // NOT change. On rotation the old assignedNonce baseline belongs to a
+        // different account — currentNonce (new account) is always higher and
+        // would produce a false "included" for chunks never submitted anywhere
+        // (#951). Skip the heuristic; the downstream re-probe backstop in
+        // nonceAdvanceIndices handles genuinely-missing chunks.
+        if (!changed) {
+          for (const idx of batchIndices) {
+            const chunkNonce = assignedNonces.get(idx);
+            if (chunkNonce !== undefined && chunkNonce < currentNonce && stored[idx] === null) {
+              console.log(`   Chunk ${idx}: nonce ${chunkNonce} consumed (current=${currentNonce}), treating as included`);
+              stored[idx] = { cid: createCID(chunks[idx], CID_CONFIG.codec, 0x12), len: chunks[idx].length, viaFallback: true };
+              nonceAdvanceIndices.add(idx);
+              assignedNonces.delete(idx);
+            }
           }
+          startNonce = Math.max(startNonce, currentNonce);
         }
-        startNonce = Math.max(startNonce, currentNonce);
         if (failures.some(f => stored[f.index] === null)) {
           // Some chunks still missing post-reconnect — retry the same batch
           // (with a possibly smaller batchSize on the next iteration since
@@ -1018,7 +1087,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           probeFailedCids.has(failCid.toString()) &&
           fail.error?.message?.includes("isValid:false")
         ) {
-          console.log(`   Chunk ${fail.index + 1}: isValid:false but CID was probe-failed — treating as already on chain`);
+          console.log(`   Chunk ${fail.index}: isValid:false but CID was probe-failed — treating as already on chain`);
           captureWarning("isValid:false treated as success (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString() });
           stored[fail.index] = { cid: failCid, len: fail.chunkData.length, viaFallback: true };
           continue;
@@ -1026,18 +1095,22 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
         captureWarning("Chunk upload failed, retrying", { chunkIndex: fail.index + 1, maxRetries: MAX_CHUNK_RETRIES, error: fail.error?.message?.slice(0, 200) });
         const isExpiryFailure = fail.error?.message?.includes("isValid:false");
         if (isExpiryFailure) {
-          console.log(`   Chunk ${fail.index + 1}: tx rejected (isValid:false), likely mortal era expiry — reissuing with fresh nonce`);
+          console.log(`   Chunk ${fail.index}: tx rejected (isValid:false), likely mortal era expiry — reissuing with fresh nonce`);
         }
         let retried = false;
         for (let attempt = 1; attempt <= MAX_CHUNK_RETRIES; attempt++) {
           recordRecoveryAndCheckBudget("chunk_retry");
           const retryDelay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), RETRY_MAX_DELAY_MS);
-          console.log(`   Retrying chunk ${fail.index + 1} (attempt ${attempt}/${MAX_CHUNK_RETRIES}) in ${(retryDelay / 1000).toFixed(0)}s...`);
+          console.log(`   Retrying chunk ${fail.index} (attempt ${attempt}/${MAX_CHUNK_RETRIES}) in ${(retryDelay / 1000).toFixed(0)}s...`);
           await new Promise(r => setTimeout(r, retryDelay));
-          // If this was a connection error, reconnect before retrying
+          // If this was a connection error, reconnect before retrying.
+          // Use doReconnectAndRebase so that a pool account rotation (new ss58)
+          // rebases assignedNonces to the new account's nonce base — preventing
+          // stale old-account nonces from being submitted on the new account (#951).
+          let perRetryChanged = false;
           if (isConnectionError(fail.error) && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
             try {
-              await doReconnect();
+              ({ changed: perRetryChanged } = await doReconnectAndRebase());
             } catch (reconnectErr: any) {
               console.log(`   Reconnect failed: ${reconnectErr.message?.slice(0, 80)}`);
               break;
@@ -1046,8 +1119,12 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           try {
             const currentNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
             const originalNonce = assignedNonces.get(fail.index);
-            if (originalNonce !== undefined && originalNonce < currentNonce) {
-              console.log(`   Chunk ${fail.index + 1}: nonce ${originalNonce} consumed (current=${currentNonce}), treating as included`);
+            // "nonce consumed → included" heuristic: only valid on same account.
+            // On rotation, originalNonce is the new account's rebased value and
+            // the comparison is not meaningful until the new account actually
+            // advances its nonce (#951).
+            if (!perRetryChanged && originalNonce !== undefined && originalNonce < currentNonce) {
+              console.log(`   Chunk ${fail.index}: nonce ${originalNonce} consumed (current=${currentNonce}), treating as included`);
               stored[fail.index] = { cid: createCID(fail.chunkData, CID_CONFIG.codec, 0x12), len: fail.chunkData.length, viaFallback: true };
               nonceAdvanceIndices.add(fail.index);
               assignedNonces.delete(fail.index);
@@ -1073,7 +1150,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
               probeFailedCids.has(failCid.toString()) &&
               e?.message?.includes("isValid:false")
             ) {
-              console.log(`   Chunk ${fail.index + 1}: retry isValid:false but CID was probe-failed — treating as already on chain`);
+              console.log(`   Chunk ${fail.index}: retry isValid:false but CID was probe-failed — treating as already on chain`);
               captureWarning("isValid:false retry treated as success (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString(), attempt });
               stored[fail.index] = { cid: failCid, len: fail.chunkData.length, viaFallback: true };
               assignedNonces.delete(fail.index);
@@ -1095,7 +1172,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           if (isConnectionError(fail.error) && reconnectionsUsed >= MAX_RECONNECTIONS) {
             throw new Error(`Connection lost and max reconnections (${MAX_RECONNECTIONS}) exhausted`);
           }
-          throw new Error(`Chunk ${fail.index + 1} failed after ${MAX_CHUNK_RETRIES} retries: ${fail.error?.message?.slice(0, 100)}`);
+          throw new Error(`Chunk ${fail.index} failed after ${MAX_CHUNK_RETRIES} retries: ${fail.error?.message?.slice(0, 100)}`);
         }
       }
       b += batchSize;
@@ -1127,7 +1204,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       for (const m of missingResults) {
         const idx = cidToIndex.get(m.cid)!;
         for (let attempt = 1; attempt <= MAX_REPROBE_RETRIES; attempt++) {
-          console.log(`   Nonce-collision re-upload: chunk ${idx + 1} (attempt ${attempt}/${MAX_REPROBE_RETRIES})`);
+          console.log(`   Nonce-collision re-upload: chunk ${idx} (attempt ${attempt}/${MAX_REPROBE_RETRIES})`);
           try {
             const freshNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
             const result = await storeChunk(unsafeApi, signer as PolkadotSigner, chunks[idx], freshNonce, ss58 as string, { fetchNonce: fetchNonceOverride });
@@ -1143,7 +1220,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
               try { await doReconnect(); } catch { /* fall through to retry / final-attempt throw */ }
             }
             if (attempt === MAX_REPROBE_RETRIES) {
-              throw new Error(`Nonce-collision re-upload of chunk ${idx + 1} failed after ${MAX_REPROBE_RETRIES} attempts: ${e.message?.slice(0, 100)}`);
+              throw new Error(`Nonce-collision re-upload of chunk ${idx} failed after ${MAX_REPROBE_RETRIES} attempts: ${e.message?.slice(0, 100)}`);
             }
           }
         }
@@ -1168,7 +1245,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     for (let i = 0; i < chunks.length; i++) {
       const expectedCid = createCID(chunks[i], CID_CONFIG.codec, 0x12);
       if (verifiedStored[i].cid.toString() !== expectedCid.toString()) {
-        throw new Error(`Chunk verification failed: chunk ${i + 1} CID mismatch (expected ${expectedCid}, got ${verifiedStored[i].cid})`);
+        throw new Error(`Chunk verification failed: chunk ${i} CID mismatch (expected ${expectedCid}, got ${verifiedStored[i].cid})`);
       }
     }
     console.log(`   All ${chunks.length} chunks verified ✓`);
@@ -2287,6 +2364,21 @@ export interface DeployOptions {
    * CLI: --contract <KEY>=<0xADDRESS> (repeatable).
    */
   contracts?: Record<string, string>;
+  /**
+   * Plan of phone signatures this deploy will need. Fired once, at preflight,
+   * BEFORE storage. Notification only; used by the CLI bin to print the
+   * "Have your phone ready" banner up front.
+   */
+  onPhoneSignaturePlan?: (steps: PhoneSignatureStep[]) => void;
+  /**
+   * Human-ready gate. Awaited immediately BEFORE each phone signature request
+   * is sent. Resolve when the human is at their phone and ready; reject/throw
+   * to abort. The per-signature operation timeout starts only AFTER this
+   * resolves. `attempt` >= 2 means a re-sign.
+   * Absent + non-TTY → fail fast (NonRetryableError).
+   * Absent + TTY → CLI bin must supply the hook; core does not readline.
+   */
+  confirmPhoneReady?: (ctx: { label: string; attempt: number; total: number }) => Promise<void>;
 }
 
 // Resolve the DeployOptions that affect DotNS authentication into the shape
@@ -2632,7 +2724,11 @@ export async function deploy(content: DeployContent, domainName: string | null =
       sessionCleanup = actors.worker.destroy.bind(actors.worker);
       if (actors.worker.source === "session") resolvedUserSession = actors.worker;
       if (actors.recipientH160) {
-        console.log(`   Worker: ${actors.worker.source} signer ${actors.worker.address} (final owner: ${actors.recipientH160})`);
+        // #60: state only the worker's certain role here — it signs Bulletin
+        // storage. Whether a transfer happens depends on ownership, which isn't
+        // known until the DotNS preflight below; the transfer-vs-owned-update
+        // reality is announced there (formatTransferModeDotnsLine).
+        console.log(`   Worker: ${actors.worker.source} signer ${actors.worker.address} (signs Bulletin storage)`);
       } else {
         console.log(`   Using ${actors.worker.source} signer: ${actors.worker.address}`);
       }
@@ -2717,8 +2813,18 @@ export async function deploy(content: DeployContent, domainName: string | null =
     if (slotResult) {
       options = { ...options, storageSigner: slotResult.signer, storageSignerAddress: slotResult.slotAddress };
       console.log(formatStorageSignerLine(slotResult.slotAddress, undefined, slotResult.owned));
+    } else if (options.transferTo && options.signerAddress) {
+      // Transfer mode: the local worker signs the whole deploy, including Bulletin
+      // storage — it is NOT a pool fallback. Label it as the worker so the line
+      // agrees with the "Using external signer: <worker>" line that follows, and
+      // doesn't mislead a signed-in user (supersedes the #892 "pool fallback
+      // (transfer mode …)" wording, which read as a contradiction).
+      console.log(formatTransferModeStorageSignerLine(options.signerAddress));
     } else {
-      console.log(formatStorageSignerLine(null, resolvedUserSession ? "no allowance" : undefined));
+      // Non-transfer fallback: a logged-in user whose slot allocation failed sees
+      // "no allowance"; an anonymous pool deploy sees "(no session)" (#892).
+      const storageFailReason = resolvedUserSession ? "no allowance" : undefined;
+      console.log(formatStorageSignerLine(null, storageFailReason));
     }
   }
 
@@ -2869,6 +2975,15 @@ export async function deploy(content: DeployContent, domainName: string | null =
           const fromName = popStatusName(dotnsPreflight.userStatus);
           console.log(`   Your PoP: ${fromName}`);
           console.log(`   Domain: ${alreadyOwned ? "owned by you" : "available"}`);
+          // #60: announce the transfer-vs-owned-update reality now that preflight
+          // knows ownership. The worker header above states only the storage role
+          // (it can't know ownership yet). In transfer mode a NEW name is registered
+          // + transferred to the recipient; an already-owned name is just
+          // content-updated, signed by the owner's phone (no transfer, an extra
+          // phone tap). Only meaningful in transfer mode (recipient set).
+          if (options.transferTo) {
+            console.log(formatTransferModeDotnsLine(alreadyOwned, `${name}.dot`, options.transferTo));
+          }
         }
 
         if (!dotnsPreflight.canProceed) {
@@ -2878,18 +2993,12 @@ export async function deploy(content: DeployContent, domainName: string | null =
         }
       }
 
-      // Phone signing summary — only for a phone-backed signer (see phoneSignerActive).
+      // Phone signature plan — fire the opt-in hook at preflight, BEFORE storage.
+      // The CLI bin uses this to print the "Have your phone ready" banner up front;
+      // library consumers (playground-cli) ignore it or use their own UI.
       if (phoneSignerActive) {
         const steps = computePhoneSigningSteps(dotnsPreflight, preflightPublishNeeded);
-        if (steps.length === 1) {
-          console.log(`\nHave your phone ready — 1 signature needed (${steps[0].toLowerCase()})`);
-        } else if (steps.length > 1) {
-          const display = steps.flatMap((s, i) =>
-            s === "Register" && steps[i - 1] === "Commitment" ? ["(wait)", s] : [s]
-          );
-          console.log(`\nHave your phone ready — ${steps.length} signatures needed`);
-          console.log(`   ${display.map(s => s.toLowerCase()).join(" · ")}`);
-        }
+        options.onPhoneSignaturePlan?.(steps as PhoneSignatureStep[]);
       }
 
       // Storage provider selection: signer > mnemonic > pool (mirrors resolveDotnsConnectOptions precedence).
@@ -3114,14 +3223,12 @@ export async function deploy(content: DeployContent, domainName: string | null =
           };
           await ownerDotns.connect({
             ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit),
-            onPhoneSigningRequired: (label: string) => console.log(`\n   Check your phone → ${label}`),
+            confirmPhoneReady: options.confirmPhoneReady,
+            phoneSigner: true, // owner path is always a real phone/session signer
           });
-          // Publish (if requested) needs a second owner signature; reflect that in the
-          // heads-up so the count matches the phone taps that follow.
           const willPublish = !!(options.publish && parsed && preflightPublishNeeded !== false);
-          console.log(willPublish
-            ? `\nHave your phone ready — 2 signatures needed (link content · publish)`
-            : `\nHave your phone ready — 1 signature needed (link content)`);
+          // Wire total so confirmPhoneReady gets the right count.
+          ownerDotns.setPhoneSignatureTotal(willPublish ? 2 : 1);
           const contenthashHex = `0x${encodeContenthash(cid as string)}`;
           // #885: the owner is the PGAS-funded session account; elect PGAS for the
           // AH fee so a zero-native owner can update content faucet-free.
@@ -3134,12 +3241,14 @@ export async function deploy(content: DeployContent, domainName: string | null =
         const dotns = new DotNS();
         await dotns.connect({
           ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit),
-          // Per-step "check your phone" reminder — only for a phone-backed signer
-          // (see phoneSignerActive); a transfer-mode local worker signs locally.
-          ...(phoneSignerActive
-            ? { onPhoneSigningRequired: (label: string) => console.log(`\n   Check your phone → ${label}`) }
-            : {}),
+          confirmPhoneReady: options.confirmPhoneReady,
+          // Transfer mode: phoneSigner=false (local worker signs in-process, no phone gate).
+          // Genuine phone/session signer: phoneSigner=true (gate enabled). Fixes #50.
+          phoneSigner: phoneSignerActive,
         });
+        if (phoneSignerActive) {
+          dotns.setPhoneSignatureTotal(computePhoneSigningSteps(dotnsPreflight, preflightPublishNeeded).length);
+        }
 
         // Track whether THIS run freshly registered the name. The transfer-to-
         // signed-in-user handover below only fires on a fresh registration (#928):
@@ -3293,7 +3402,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       console.log("=".repeat(60));
       console.log("\nCheck it out here:");
       console.log(`   ${browserUrlFor(name, envId)}`);
-      console.log(`   ${name}.dot  (in a Polkadot-aware browser)`);
+      console.log(`   ${name}.dot  (in a Polkadot app: mobile or desktop)`);
       console.log("\n" + "=".repeat(60) + "\n");
       return { domainName: name, fullDomain: `${name}.dot`, cid: cid as string, ipfsCid };
     } finally {

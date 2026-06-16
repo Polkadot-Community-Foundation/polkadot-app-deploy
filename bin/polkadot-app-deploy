@@ -1,5 +1,11 @@
 #!/usr/bin/env node
 
+// Must be the FIRST import: installs process.emitWarning suppressor before any
+// SDK module-init code runs. In ESM, static imports are evaluated before inline
+// code, so the suppressor must live in a separate module imported ahead of the
+// SDK modules that trigger the "@parity/product-sdk-logger" localStorage warning.
+import "../dist/suppress-localstorage-warning.js";
+
 import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, unpublish } from "../dist/deploy.js";
 import { VERSION, setDeployAttribute, captureWarning, closeTelemetry, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
 import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
@@ -7,16 +13,7 @@ import { setDeployContext, installLogCapture, buildCliFlagsSummary } from "../di
 import { loadRunState, writeRunState, shouldSkipStaleWarning, shouldShowOomHint, probablyOomRssMb } from "../dist/run-state.js";
 import { loadEnvironments, listEnvironments, formatEnvironmentTable, DEFAULT_ENV_ID } from "../dist/environments.js";
 import * as fs from "fs";
-
-// Suppress "@parity/product-sdk-logger" localStorage warning in Node.js v22+.
-// The logger tries to read log-level config from localStorage which doesn't exist
-// in Node.js — it emits a NoSuchNativeMethod warning we cannot fix upstream.
-const _origEmitWarning = process.emitWarning.bind(process);
-process.emitWarning = (warning, ...rest) => {
-  const msg = (typeof warning === "string" ? warning : warning?.message ?? String(warning)).toLowerCase();
-  if (msg.includes("localstorage") || msg.includes("local storage")) return;
-  _origEmitWarning(warning, ...rest);
-};
+import * as readline from "readline";
 
 // Install early so anything printed during flag parsing / preflight is
 // available to the bug-report log tail.
@@ -479,6 +476,41 @@ try {
     publish: flags.publish,
     failOnPublishError: flags.failOnPublishError,
     transferToSignedInUser: !flags.noTransferToSignedinUser,
+    // Human-first phone signing hooks (spec: 2026-06-13-human-first-phone-signing-design).
+    onPhoneSignaturePlan: (steps) => {
+      if (steps.length === 1) {
+        console.log(`\nHave your phone ready — 1 signature needed (${steps[0].toLowerCase()})`);
+      } else if (steps.length > 1) {
+        const display = steps.flatMap((s, i) =>
+          s === "Register" && steps[i - 1] === "Commitment" ? ["(wait)", s] : [s]
+        );
+        console.log(`\nHave your phone ready — ${steps.length} signatures needed`);
+        console.log(`   ${display.map(s => s.toLowerCase()).join(" · ")}`);
+      }
+    },
+    confirmPhoneReady: ({ label, attempt }) => new Promise((resolve, reject) => {
+      if (attempt >= 2) {
+        console.log(`\n   Re-sign needed (attempt ${attempt}) — approve on your phone, then press Y to continue (Ctrl-C to abort).`);
+      } else {
+        console.log(`\n   Check your phone → ${label}`);
+        console.log(`   Press Y when ready (Ctrl-C to abort):`);
+      }
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      let settled = false;
+      const settle = (fn) => { if (!settled) { settled = true; rl.close(); fn(); } };
+      rl.on("close", () => settle(reject.bind(null, new Error("aborted by user"))));
+      const ask = () => {
+        rl.question("   > ", (line) => {
+          const answer = line.trim().toLowerCase();
+          if (answer === "y" || answer === "") {
+            settle(resolve);
+          } else {
+            ask();
+          }
+        });
+      };
+      ask();
+    }),
   });
 
   const output = process.env.GITHUB_OUTPUT;
