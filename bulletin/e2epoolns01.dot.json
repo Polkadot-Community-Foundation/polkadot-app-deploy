@@ -1,10 +1,10 @@
 {
   "domain": "e2epoolns01.dot",
-  "cid": "bafybeie545xyz7yadeu5losht5iwspyglr635by3yuisozqhxgemzsdcgu",
-  "toolVersion": "0.10.1",
-  "deployedAt": "2026-06-16T16:46:39.519Z",
+  "cid": "bafybeiawvdohrjlwyzpjm5xh7gglddihtgbokehk5d7drpxbsl3ya6miru",
+  "toolVersion": "0.11.2",
+  "deployedAt": "2026-06-17T16:32:03.766Z",
   "encrypted": false,
   "bulletinRpc": "wss://paseo-bulletin-next-rpc.polkadot.io",
   "sourceRepo": "Polkadot-Community-Foundation/polkadot-app-deploy",
-  "sourceCommit": "dbeda85ed7fc6ffb7ae0c79c94518f63c173267a"
+  "sourceCommit": "b3df874d44b4b98a6351131237928df12bcd602d"
 }
