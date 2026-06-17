@@ -64,6 +64,10 @@ on:
         description: 'GitHub repository (owner/name) the source build checks out when polkadot-app-deploy-ref is set. Default: paritytech/polkadot-app-deploy. Point at a fork to consume fixes that have not shipped to npm yet.'
         type: string
         default: 'paritytech/polkadot-app-deploy'
+      polkadot-app-deploy-package:
+        description: 'npm package name to install on the version path. This fork publishes under @polkadot-community-foundation; override only if consuming a differently-scoped build. Ignored when polkadot-app-deploy-ref is set (source build).'
+        type: string
+        default: '@polkadot-community-foundation/polkadot-app-deploy'
       tag:
         description: 'Free-form label attached to the deploy span as deploy.tag (e.g. "e2e-ci-pr", "load-test"). Lets Sentry dashboards filter test/benchmark traffic out of real-user views. Empty = no tag.'
         type: string
@@ -215,6 +219,7 @@ jobs:
         run: |
           REF='${{ inputs.polkadot-app-deploy-ref }}'
           VERSION='${{ inputs.polkadot-app-deploy-version }}'
+          PKG='${{ inputs.polkadot-app-deploy-package }}'
           if [ -n "$REF" ]; then
             echo "Building polkadot-app-deploy from source ref: $REF"
             cd polkadot-app-deploy-src
@@ -226,15 +231,15 @@ jobs:
             echo "RELEASE_RETRY_WRAPPER=$WRAPPER" >> "$GITHUB_ENV"
             echo "::notice::Using source-built polkadot-app-deploy from ref $REF"
           elif [ -n "$VERSION" ]; then
-            echo "Installing @parity/polkadot-app-deploy@$VERSION"
-            npm install -g "@parity/polkadot-app-deploy@$VERSION"
+            echo "Installing $PKG@$VERSION"
+            npm install -g "$PKG@$VERSION"
             echo "BULLETIN_DEPLOY_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-            echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/@parity/polkadot-app-deploy/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
+            echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/$PKG/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
           else
-            echo "Installing @parity/polkadot-app-deploy (latest stable)"
-            npm install -g @parity/polkadot-app-deploy
+            echo "Installing $PKG (latest stable)"
+            npm install -g "$PKG"
             echo "BULLETIN_DEPLOY_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-            echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/@parity/polkadot-app-deploy/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
+            echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/$PKG/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
           fi
 
       - name: Verify minimum polkadot-app-deploy version
