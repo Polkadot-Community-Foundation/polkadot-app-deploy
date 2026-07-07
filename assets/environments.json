@@ -58,6 +58,18 @@
         "MULTICALL3": "0x1C1044BEa5bDe0F435436bB52A8340fBE1D59847",
         "PUBLISHER": "0xf5fe0fc9f4c13dfd3a4a8abd27e64eb652157494"
       }
+    },
+    {
+      "id": "paseo-next",
+      "name": "Paseo Next (PCF)",
+      "network": "testnet",
+      "description": "PCF-owned deployments on the Paseo Next interim chains (AH-next 1500 / Bulletin-next 1501 / People-next 1502). Same chains as paseo-next-v2, but resolves through PCF's own DotNS/CDM/Publisher registries — contracts filled in as each is deployed.",
+      "e2eEligible": false,
+      "ipfs": "https://paseo-bulletin-next-ipfs.polkadot.io",
+      "autoAccountMapping": true,
+      "nativeToEthRatio": 100000000,
+      "registerStorageDeposit": 2000000000000,
+      "contracts": {}
     }
   ],
   "chains": [
@@ -69,6 +81,9 @@
           "wss": "wss://paseo-rpc.n.dwellir.com",
           "uptimeUrl": "https://stats.uptimerobot.com/UrEXbl6Xyt"
         },
+        "paseo-next": {
+          "wss": "wss://paseo-rpc.n.dwellir.com"
+        },
         "summit": {
           "wss": "wss://summit-rpc.polkadot.io"
         }
@@ -79,6 +94,10 @@
       "name": "Asset Hub",
       "endpoints": {
         "paseo-next-v2": {
+          "wss": "wss://paseo-asset-hub-next-rpc.polkadot.io",
+          "parachainId": 1500
+        },
+        "paseo-next": {
           "wss": "wss://paseo-asset-hub-next-rpc.polkadot.io",
           "parachainId": 1500
         },
@@ -95,6 +114,10 @@
           "wss": "wss://paseo-people-next-system-rpc.polkadot.io",
           "parachainId": 1502
         },
+        "paseo-next": {
+          "wss": "wss://paseo-people-next-system-rpc.polkadot.io",
+          "parachainId": 1502
+        },
         "summit": {
           "wss": "wss://summit-people-rpc.polkadot.io"
         }
@@ -105,6 +128,10 @@
       "name": "Bulletin",
       "endpoints": {
         "paseo-next-v2": {
+          "wss": "wss://paseo-bulletin-next-rpc.polkadot.io",
+          "parachainId": 1501
+        },
+        "paseo-next": {
           "wss": "wss://paseo-bulletin-next-rpc.polkadot.io",
           "parachainId": 1501
         },
