@@ -88,6 +88,18 @@
         "MULTICALL3": "0x1C1044BEa5bDe0F435436bB52A8340fBE1D59847",
         "PUBLISHER": "0x234e434e66f246def2207558dcdb0585d2de9fdc"
       }
+    },
+    {
+      "id": "devnet",
+      "name": "Devnet",
+      "network": "testnet",
+      "description": "PCF public products devnet on standard Paseo (AH 1000 / Bulletin 1010 / People 1004). DotNS names + CDM registry are wired later; contracts intentionally empty until deployed.",
+      "e2eEligible": false,
+      "ipfs": "https://bullet.sik.rocks",
+      "autoAccountMapping": true,
+      "nativeToEthRatio": 100000000,
+      "registerStorageDeposit": 2000000000000,
+      "contracts": {}
     }
   ],
   "chains": [
@@ -104,6 +116,9 @@
         },
         "summit": {
           "wss": "wss://summit-rpc.polkadot.io"
+        },
+        "devnet": {
+          "wss": "wss://paseo-rpc.n.dwellir.com"
         }
       }
     },
@@ -121,6 +136,10 @@
         },
         "summit": {
           "wss": "wss://summit-asset-hub-rpc.polkadot.io"
+        },
+        "devnet": {
+          "wss": "wss://asset-hub-paseo-rpc.n.dwellir.com",
+          "parachainId": 1000
         }
       }
     },
@@ -138,6 +157,10 @@
         },
         "summit": {
           "wss": "wss://summit-people-rpc.polkadot.io"
+        },
+        "devnet": {
+          "wss": "wss://people-paseo.rotko.net",
+          "parachainId": 1004
         }
       }
     },
@@ -155,6 +178,10 @@
         },
         "summit": {
           "wss": "wss://summit-bulletin-rpc.polkadot.io"
+        },
+        "devnet": {
+          "wss": "wss://bulletin-paseo.tservices.es:8443",
+          "parachainId": 1010
         }
       }
     }
