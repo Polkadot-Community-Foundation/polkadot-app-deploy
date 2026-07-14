@@ -41,9 +41,9 @@ on:
         type: string
         default: ''
       env:
-        description: 'Target environment id from environments.json (e.g. paseo-next-v2, paseo-next, paseo-review). Default: paseo-next-v2. Drives both the bulletin RPC and the asset-hub RPC.'
+        description: 'Target environment id from environments.json (e.g. devnet, paseo-next-v2, paseo-next, paseo-review). Default: devnet. Drives both the bulletin RPC and the asset-hub RPC.'
         type: string
-        default: ''
+        default: 'devnet'
       pool-size:
         description: 'Number of pool accounts (default: 10)'
         type: number
