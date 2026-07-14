@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { NonRetryableError } from "./errors.js";
 import embeddedEnvironments from "../assets/environments.json" with { type: "json" };
 
-export const DEFAULT_ENV_ID = "paseo-next-v2";
+export const DEFAULT_ENV_ID = "devnet";
 
 export interface PopSelfServeConfig {
   /** The label users select in the personhood self-serve env dropdown — e.g. "Next V2". */
@@ -96,10 +96,10 @@ export interface ResolvedEndpoints {
 const HARDCODED_FALLBACK: EnvironmentsDoc = {
   environments: [
     {
-      id: "paseo-next-v2",
-      name: "Paseo Next v2",
+      id: "devnet",
+      name: "Devnet",
       network: "testnet",
-      description: "Next iteration of the Paseo Next testnet (hardcoded fallback)",
+      description: "PCF devnet — public Paseo AH1000/Bulletin1010 (hardcoded fallback)",
     },
   ],
   chains: [
@@ -107,9 +107,9 @@ const HARDCODED_FALLBACK: EnvironmentsDoc = {
       id: "bulletin",
       name: "Bulletin",
       endpoints: {
-        "paseo-next-v2": {
-          wss: "wss://paseo-bulletin-next-rpc.polkadot.io",
-          parachainId: 1501,
+        "devnet": {
+          wss: "wss://bulletin-paseo.tservices.es:8443",
+          parachainId: 1010,
         },
       },
     },
@@ -117,9 +117,9 @@ const HARDCODED_FALLBACK: EnvironmentsDoc = {
       id: "asset-hub",
       name: "Asset Hub",
       endpoints: {
-        "paseo-next-v2": {
-          wss: "wss://paseo-asset-hub-next-rpc.polkadot.io",
-          parachainId: 1500,
+        "devnet": {
+          wss: "wss://asset-hub-paseo-rpc.n.dwellir.com",
+          parachainId: 1000,
         },
       },
     },

@@ -20,8 +20,8 @@ import * as publicApi from "../dist/index.js";
 import { NonRetryableError } from "../dist/errors.js";
 
 describe("default environment", () => {
-  test("deploys default to paseo-next-v2", () => {
-    assert.equal(DEFAULT_ENV_ID, "paseo-next-v2");
+  test("deploys default to devnet", () => {
+    assert.equal(DEFAULT_ENV_ID, "devnet");
   });
 
   test("environment helpers are exported from the package root", () => {
@@ -85,8 +85,8 @@ describe("loadEnvironments — missing asset → embedded bundled snapshot", () 
 
     assert.equal(result.source, "bundled");
     const resolved = resolveEndpoints(result.doc, DEFAULT_ENV_ID);
-    assert.equal(resolved.bulletin[0], "wss://paseo-bulletin-next-rpc.polkadot.io");
-    assert.equal(resolved.assetHub[0], "wss://paseo-asset-hub-next-rpc.polkadot.io");
+    assert.equal(resolved.bulletin[0], "wss://bulletin-paseo.tservices.es:8443");
+    assert.equal(resolved.assetHub[0], "wss://asset-hub-paseo-rpc.n.dwellir.com");
     assert.equal(resolved.nativeToEthRatio, 100000000n);
     assert.equal(typeof resolved.contracts.DOTNS_REGISTRY, "string");
   });
