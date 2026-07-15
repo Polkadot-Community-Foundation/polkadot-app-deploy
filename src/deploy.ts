@@ -2701,13 +2701,16 @@ export async function unpublish(
 /**
  * Returns the dot.li browser URL for the given domain name, optionally
  * suffixed with a network query parameter so the SPA opens the right chain.
+ * The public products devnet is served by its own gateway (dev-dot.li), so
+ * the "devnet" env resolves to that host instead of the prod dot.li.
  * Currently only the "preview" env needs a suffix — the SPA defaults to
  * paseo-next-v2 which would show "no content" for preview deployments.
  * @param name - the DotNS label (e.g. "myapp")
  * @param envId - the environment id from options.env ?? DEFAULT_ENV_ID
  */
 export function browserUrlFor(name: string, envId: string | undefined): string {
-  const base = `https://${name}.dot.li`;
+  const gatewayHost = envId === "devnet" ? "dev-dot.li" : "dot.li";
+  const base = `https://${name}.${gatewayHost}`;
   return envId === "preview" ? `${base}?network=previewnet` : base;
 }
 

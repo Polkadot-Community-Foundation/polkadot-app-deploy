@@ -18971,6 +18971,14 @@ describe("browserUrlFor", () => {
     );
   });
 
+  test("devnet env uses the dev-dot.li gateway", () => {
+    assert.strictEqual(
+      browserUrlFor("myapp", "devnet"),
+      "https://myapp.dev-dot.li",
+      ">> FAIL: browserUrlFor: devnet env must use the dev-dot.li gateway"
+    );
+  });
+
   test("undefined envId produces plain dot.li URL", () => {
     assert.strictEqual(
       browserUrlFor("myapp", undefined),

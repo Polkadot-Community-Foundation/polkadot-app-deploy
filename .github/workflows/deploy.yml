@@ -77,9 +77,9 @@ on:
         type: boolean
         default: false
       gateway:
-        description: 'Gateway host used to construct browser URLs in the deployment summary and PR comment (e.g. "dot.li", "paseo.li"). Does not affect the deploy itself — only the URL displayed.'
+        description: 'Gateway host used to construct browser URLs in the deployment summary and PR comment (e.g. "dev-dot.li" for the devnet default env, "dot.li", "paseo.li"). Does not affect the deploy itself — only the URL displayed.'
         type: string
-        default: 'dot.li'
+        default: 'dev-dot.li'
       gateway-path-style:
         description: 'If true, build URLs as https://{gateway}/{domain}.dot (e.g. paseo.li/my-app.dot). If false (default), use subdomain form https://{domain}.{gateway} (e.g. my-app.paseo.li).'
         type: boolean
