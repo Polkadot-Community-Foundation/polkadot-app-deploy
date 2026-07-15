@@ -95,7 +95,7 @@
       "network": "testnet",
       "description": "PCF public products devnet on standard Paseo (AH 1000 / Bulletin 1010 / People 1004). DotNS names + CDM registry are wired later; contracts intentionally empty until deployed.",
       "e2eEligible": false,
-      "ipfs": "https://bullet.sik.rocks",
+      "ipfs": "https://devnet-ipfs.api.polkadotcommunity.foundation",
       "autoAccountMapping": true,
       "nativeToEthRatio": 100000000,
       "registerStorageDeposit": 2000000000000,
