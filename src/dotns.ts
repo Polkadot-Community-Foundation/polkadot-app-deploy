@@ -2551,6 +2551,25 @@ export class DotNS {
   async setContenthash(domainName: string, contenthashHex: string, opts: { feeAsset?: "pgas" } = {}): Promise<{ node: string }> {
     return withSpan("deploy.dotns.set-contenthash", "2b. set-contenthash", {}, async () => {
       this.ensureConnected();
+
+      // Writing content is only half the job: hosts resolve a name by reading
+      // `IDotnsRegistry.resolver(node)` and querying THAT contract, so content
+      // written to the content resolver is invisible unless the registry points
+      // the name at it. Registration assigns a default resolver which is not the
+      // content resolver, so a name is mis-bound until something corrects it.
+      //
+      // This used to be corrected only in the manifest-publish path
+      // (src/manifest/publish.ts), so every app that deployed without publishing
+      // a manifest kept the wrong resolver: a 2026-09-04 audit of the products
+      // devnet found 14 of 23 names pointing at the REVERSE resolver, including
+      // docs.dot, playground.dot and collectibles-webview.dot. They looked fine
+      // to `dotns content view` — which reads the configured content resolver
+      // directly — while the apps reported "not registered or has no content".
+      //
+      // Doing it here covers every path that binds content, and it is idempotent:
+      // one extra read per publish, and a write only when the name is wrong.
+      await this.ensureContentResolver(domainName);
+
       const node = namehash(`${domainName}.dot`);
       // Decode the contenthash hex to the IPFS CID string the CLI expects.
       let ipfsCid: string | null = null;
