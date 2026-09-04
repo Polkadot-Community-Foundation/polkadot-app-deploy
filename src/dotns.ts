@@ -879,7 +879,12 @@ export function validateDomainLabel(label: string, opts: { checkReserved?: boole
   // Opt-out via { checkReserved: false } for sublabel contexts (parseDomainName,
   // exampleNoStatusLabel) where the Reserved rule does not apply — subdomains are
   // user-defined strings, not DotNS-registered names.
-  if (opts.checkReserved !== false) {
+  // PAD_ALLOW_RESERVED=1 bypass: for binding content to a reserved (≤5-char)
+  // name that is ALREADY registered/owned by the signer (registered out-of-band
+  // via the owner registerReserved override). The on-chain "reserved reverts"
+  // hazard only applies to registration; a pure setContenthash bind on an
+  // already-owned name is safe. Scoped, opt-in, local-only.
+  if (opts.checkReserved !== false && process.env.PAD_ALLOW_RESERVED !== "1") {
     const classification = classifyDotnsLabel(sanitized);
     if (classification.status === ProofOfPersonhoodStatus.Reserved) {
       // When sanitization changed the label, surface the trail so the user sees
@@ -3173,7 +3178,12 @@ export class DotNS {
       const classification = classifyDotnsLabel(validated);
 
       // Reserved is a terminal rejection — no chain reads needed.
-      if (classification.status === ProofOfPersonhoodStatus.Reserved) {
+      // PAD_ALLOW_RESERVED=1: skip the terminal short-circuit so the ownership
+      // check below runs — a reserved name pre-registered to the signer (via the
+      // owner registerReserved override) resolves to "already-owned-by-us" and
+      // binds content normally. Only the terminal-abort is bypassed; the later
+      // "owned by someone else" / "reserved for another" rejections still apply.
+      if (classification.status === ProofOfPersonhoodStatus.Reserved && process.env.PAD_ALLOW_RESERVED !== "1") {
         const sanitizeTrail = label !== validated
           ? `Input "${label}" was sanitized to "${validated}" (excess trailing digits trimmed). `
           : "";
