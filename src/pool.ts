@@ -26,7 +26,9 @@ export interface PoolAccount {
 
 export interface PoolAuthorization extends PoolAccount {
   transactions: bigint;
-  bytes: bigint;
+  // Renew headroom, NOT "bytes left to store" — store is not byte-gated at all.
+  // See remainingRenewBytes.
+  renewBytes: bigint;
   expiration: number;
 }
 
@@ -53,8 +55,11 @@ export function assetHubTopUpAmount(balanceRaw: bigint, thresholdRaw: bigint, ta
   return amount > 0n ? amount : 0n;
 }
 
-const TOPUP_TRANSACTIONS = 1000;
-const TOPUP_BYTES = 100_000_000n; // 100MB
+// Exported so scripts/e2e-ensure-authorized.mjs (the E2E prerequisites
+// check) can share these quota constants instead of hand-maintaining a
+// second copy that can silently drift from this one.
+export const TOPUP_TRANSACTIONS = 1000;
+export const TOPUP_BYTES = 100_000_000n; // 100MB
 const WS_HEARTBEAT_TIMEOUT_MS = 300_000;
 
 export function derivePoolAccounts(poolSize: number = 10, mnemonic: string = DEV_PHRASE): PoolAccount[] {
@@ -74,15 +79,95 @@ export function derivePoolAccounts(poolSize: number = 10, mnemonic: string = DEV
   return accounts;
 }
 
-// Checks whether the given authorization is sufficient for the intended use.
-// Returns true when `auth` exists and has not expired relative to `currentBlock`.
+// Client-side view of one account's Bulletin storage authorization. Fields mirror
+// the runtime API's `AccountAuthorization`, except `expiration` (`expires_at`
+// on-chain) — the name every consumer here already speaks.
+export interface BulletinAuthorization {
+  expiration: number;
+  transactionsAllowance: number;
+  transactionsUsed: number;    // store + renew
+  bytesAllowance: bigint;
+  bytesUsed: bigint;           // store — soft, see remainingRenewBytes
+  bytesPermanentUsed: bigint;  // renew — the only counter with a hard cap
+}
+
+// The AccountAuthorization fields readAccountAuthorization maps. Exported so the
+// live chain-call test guards exactly the set the client reads, never a stale copy.
+export const ACCOUNT_AUTHORIZATION_FIELDS = [
+  "expires_at",
+  "bytes_allowance",
+  "bytes_used",
+  "bytes_permanent_used",
+  "transactions_allowance",
+  "transactions_used",
+] as const;
+
+/**
+ * Read an account's Bulletin storage authorization via the
+ * `BulletinTransactionStorageApi::account_authorization` runtime API — the one
+ * chain entry point for this, replacing the old `TransactionStorage.Authorizations`
+ * read. That entry is no longer client-readable: its `AuthorizationExtent` carries
+ * an opaque consumer payload (`extra`) where `bytes_permanent` used to sit.
+ *
+ * Returns null both when the account was never authorized and when its grant has
+ * lapsed — the API filters expired entries, so a non-null result is always active.
+ *
+ * A `Some` missing any field throws instead of defaulting to 0: a renamed field
+ * would otherwise read as "no allowance, expires at block 0" and fail every deploy
+ * with a message pointing at the account rather than at the chain.
+ */
+export async function readAccountAuthorization(api: any, address: string): Promise<BulletinAuthorization | null> {
+  const auth = await api.apis.BulletinTransactionStorageApi.account_authorization(address);
+  if (auth == null) return null;
+  const missing = ACCOUNT_AUTHORIZATION_FIELDS.filter(f => auth[f] == null);
+  if (missing.length > 0) {
+    throw new Error(
+      `Bulletin returned an AccountAuthorization for ${address} without ${missing.join(", ")} — ` +
+      `this chain's BulletinTransactionStorageApi does not match what polkadot-app-deploy reads. Upgrade polkadot-app-deploy.`,
+    );
+  }
+  return {
+    expiration: Number(auth.expires_at),
+    transactionsAllowance: Number(auth.transactions_allowance),
+    transactionsUsed: Number(auth.transactions_used),
+    // u64: a decoder may hand back number or bigint; the quota arithmetic can't mix.
+    bytesAllowance: BigInt(auth.bytes_allowance),
+    bytesUsed: BigInt(auth.bytes_used),
+    bytesPermanentUsed: BigInt(auth.bytes_permanent_used),
+  };
+}
+
+// The only byte budget on an authorization that gates anything: `renew` is
+// rejected when `bytes_permanent + size > bytes_allowance`
+// (pallet_bulletin_data_renewal::check_renew_authorization). `bytesUsed` — the
+// store side — is NOT part of that comparison and never gates: the pallet
+// documents `bytes`/`transactions` as "soft side (priority signal); saturate,
+// never gate", and `can_store` is only `data_size_ok(len) && has active
+// authorization`. So do not subtract store bytes here; they buy nothing back and
+// would under-report real renew headroom.
+//
+// Clamped at 0 — a reporting input, never a negative budget.
+export function remainingRenewBytes(auth: BulletinAuthorization): bigint {
+  const left = auth.bytesAllowance - auth.bytesPermanentUsed;
+  return left > 0n ? left : 0n;
+}
+
+// Transactions left in the granted allowance. Also not a gate — the runtime API
+// documents the pair as predicting whether a `store` gets the *priority boost*.
+export function remainingTransactions(auth: BulletinAuthorization): bigint {
+  const left = auth.transactionsAllowance - auth.transactionsUsed;
+  return left > 0 ? BigInt(left) : 0n;
+}
+
+// True when `auth` exists and has not expired relative to `currentBlock` (also
+// takes a PoolAuthorization — same `expiration` field). A fresh read is always
+// active, so the expiry test is for cached/lagging ones; #1059's reauthorization
+// window generalizes it over a future deadline.
 export function isAuthorizationSufficient(
-  auth: any,
+  auth: { expiration: number } | null | undefined,
   currentBlock: number,
 ): boolean {
-  if (auth === undefined) return false;
-  if (Number(auth.expiration ?? 0) <= currentBlock) return false;
-  return true;
+  return auth != null && auth.expiration > currentBlock;
 }
 
 // Returns the subset of `auths` that require a new authorization grant
@@ -125,14 +210,19 @@ export interface AutoReauthorizeEnv {
 }
 
 // #1059 maintainer constraint: auto-reauthorize is TESTNET-ONLY and must
-// never run on mainnet. `bulletinAutoAuthorize` is the existing
-// environments.json flag that already gates //Alice-based auto-authorize in
-// ensureAuthorized() below — reusing it here keeps one source of truth. The
-// `network !== "mainnet"` check is a deliberate second gate on top of the
+// never run on mainnet. `bulletinAutoAuthorize` is an environments.json flag
+// gating two things ONLY: the #1054 Asset Hub balance pre-fund
+// (ensurePoolAccountsFundedOnAssetHub) and the #1059 hard write-gate in
+// bootstrapPool's reauth pre-check (see allowAutoReauthorize below) — both of
+// which are explicit, human-invoked bootstrap-tool paths, signed with
+// whichever key bootstrapPool resolves as the authorizer (see its
+// `authorizerMnemonic` / `envAuthorizer` precedence). polkadot-app-deploy does
+// NOT self-authorize on the Bulletin chain during a deploy: ensureAuthorized()
+// below never signs anything, it only throws (see its no-self-authorize error
+// text) — unlike bulletin-deploy, which this flag's name is inherited from.
+// The `network !== "mainnet"` check is a deliberate second gate on top of the
 // flag (not redundant with it): it survives a future config mistake where
-// `bulletinAutoAuthorize: true` gets set on a mainnet entry, mirroring the
-// "even if the flag were set by mistake, the dispatch is rejected" fail-safe
-// documented on ensureAuthorized's opts.autoAuthorize path.
+// `bulletinAutoAuthorize: true` gets set on a mainnet entry.
 export function isAutoReauthorizeAllowed(env: AutoReauthorizeEnv | null | undefined): boolean {
   return env?.network !== "mainnet" && env?.bulletinAutoAuthorize === true;
 }
@@ -167,32 +257,35 @@ export async function fetchPoolAuthorizations(api: any, accounts: PoolAccount[])
   const results = await Promise.all(
     accounts.map(async (account): Promise<PoolAuthorization> => {
       try {
-        const auth = await api.query.TransactionStorage.Authorizations.getValue(
-          Enum("Account", account.address)
-        );
+        const auth = await readAccountAuthorization(api, account.address);
         return {
           ...account,
-          transactions: auth ? BigInt(auth.extent.transactions_allowance) - BigInt(auth.extent.transactions) : 0n,
-          bytes: auth ? BigInt(auth.extent.bytes_allowance) - BigInt(auth.extent.bytes) : 0n,
-          expiration: auth ? Number(auth.expiration) : 0,
+          transactions: auth ? remainingTransactions(auth) : 0n,
+          renewBytes: auth ? remainingRenewBytes(auth) : 0n,
+          expiration: auth ? auth.expiration : 0,
         };
       } catch {
-        return { ...account, transactions: 0n, bytes: 0n, expiration: 0 };
+        return { ...account, transactions: 0n, renewBytes: 0n, expiration: 0 };
       }
     })
   );
   return results;
 }
 
-// Returns true when the chain spec name identifies a testnet where Alice has
-// authorization authority. Mainnet Bulletin will not have //Alice as authorizer,
-// so defensive Alice-based top-ups must be gated.
+// Returns true when the chain spec name identifies a Polkadot-ecosystem
+// testnet. This is generic testnet detection, NOT an authorizer check — it
+// only decides which of ensureAuthorized's two (non-signing) error messages
+// to show, and (via detectTestnet/isAutoReauthorizeAllowed) gates the
+// explicit bootstrap-tool write paths. It must not be read as "Alice is the
+// authorizer here": testnets can be community-operated with an authorizer
+// this codebase doesn't know (e.g. devnet — see environments.json
+// `bulletinAuthorizer`, deliberately unset there).
 export function isTestnetSpecName(specName: string | undefined | null): boolean {
   if (!specName) return false;
   const s = specName.toLowerCase();
-  // Polkadot-ecosystem testnets where //Alice has authorization authority.
-  // Bulletin on Paseo reports spec_name "bulletin-westend" (as of 2026-04-17),
-  // so match on the testnet qualifier, not the chain name itself.
+  // Polkadot-ecosystem testnets, matched on the testnet qualifier rather than
+  // chain name — Bulletin on Paseo reports spec_name "bulletin-westend" (as
+  // of 2026-04-17), for example.
   if (s.includes("paseo")) return true;
   if (/\b(westend|rococo)\b/.test(s)) return true;
   if (/\b(testnet|devnet)\b/.test(s)) return true;
@@ -234,7 +327,7 @@ export async function ensureAuthorized(
   label?: string,
 ): Promise<void> {
   const [auth, currentBlock] = await Promise.all([
-    api.query.TransactionStorage.Authorizations.getValue(Enum("Account", address)),
+    readAccountAuthorization(api, address),
     api.query.System.Number.getValue(),
   ]);
   if (isAuthorizationSufficient(auth, currentBlock)) return;
@@ -340,6 +433,16 @@ export async function ensurePoolAccountsFundedOnAssetHub(
 
 export interface BootstrapPoolOptions {
   authorizerMnemonic?: string;
+  // The resolved env's `bulletinAuthorizer` (environments.json). Used only
+  // when authorizerMnemonic is not given; takes precedence over guessing.
+  // Needed because //Alice is NOT the authorizer on every testnet-shaped
+  // chain — some (e.g. devnet) are community-operated and their authorizer
+  // is unknown, so there is deliberately no blanket testnet fallback below.
+  envAuthorizer?: string;
+  // Human-readable id/name of the resolved env, used only to name it in the
+  // "no known authorizer" message when neither authorizerMnemonic nor
+  // envAuthorizer is available. Purely cosmetic — does not affect resolution.
+  envLabel?: string;
   bulletinAuthorizeV2?: boolean;
   // #1059 pre-check mode: widen "needs authorization" from "already expired"
   // to "expires within this many blocks" (see accountsNeedingReauthorization).
@@ -357,8 +460,8 @@ export interface BootstrapPoolOptions {
 
 function printAuthStatus(a: PoolAuthorization, currentBlock: number): void {
   if (isAuthorizationSufficient(a, currentBlock)) {
-    const mb = (Number(a.bytes) / 1_000_000).toFixed(1);
-    console.log(`  [${a.index}] ${a.address}  AUTHORIZED — ${a.transactions} txs / ${mb}MB remaining, expires @${a.expiration}`);
+    const mb = (Number(a.renewBytes) / 1_000_000).toFixed(1);
+    console.log(`  [${a.index}] ${a.address}  AUTHORIZED — ${a.transactions} txs left / ${mb}MB renew headroom, expires @${a.expiration}`);
   } else {
     console.log(`  [${a.index}] ${a.address}  NOT AUTHORIZED`);
   }
@@ -425,19 +528,29 @@ export async function bootstrapPool(
       const authKey = keyring.addFromUri(opts.authorizerMnemonic);
       authorizerSigner = getPolkadotSigner(authKey.publicKey, "Sr25519", (data: Uint8Array) => authKey.sign(data));
       console.log(`Using provided authorizer: ${authKey.address}\n`);
+    } else if (opts.envAuthorizer) {
+      // The env declares which key holds authorizer rights on its Bulletin
+      // chain (environments.json `bulletinAuthorizer`). Preferred over any
+      // blanket guess so `polkadot-app-bootstrap --env <id>` works without a
+      // flag, and so an env with no known authorizer (e.g. devnet) never
+      // gets one guessed on its behalf.
+      const authKey = keyring.addFromUri(opts.envAuthorizer);
+      authorizerSigner = getPolkadotSigner(authKey.publicKey, "Sr25519", (data: Uint8Array) => authKey.sign(data));
+      console.log(`Using environment authorizer ${opts.envAuthorizer} (${authKey.address})\n`);
     } else {
-      const isTestnet = await detectTestnet(api);
-      if (isTestnet) {
-        const alice = keyring.addFromUri("//Alice");
-        authorizerSigner = getPolkadotSigner(alice.publicKey, "Sr25519", (data: Uint8Array) => alice.sign(data));
-        console.log(`Testnet detected — defaulting to //Alice as authorizer (${alice.address})\n`);
-      } else {
-        console.log(
-          "Authorization is needed but no authorizer key was provided.\n" +
-          "Re-run with --authorizer \"<seed>\" to grant authorization.",
-        );
-        return;
-      }
+      // Deliberately NOT defaulting to //Alice here. That default used to
+      // fire on ANY testnet-shaped chain (detectTestnet), including
+      // community-operated ones (e.g. devnet) where //Alice does not
+      // actually hold authorizer rights — the grant would be silently
+      // rejected on-chain (BadSigner, or a Payment error if Alice is also
+      // unfunded there) instead of failing with a clear, actionable message.
+      const envNote = opts.envLabel ? ` for environment '${opts.envLabel}'` : "";
+      console.log(
+        `No known authorizer${envNote} — this environment does not declare a bulletinAuthorizer ` +
+        "(likely community-operated, so the actual authorizer key is unknown here).\n" +
+        "Re-run with --authorizer \"<seed>\" to grant authorization.",
+      );
+      return;
     }
 
     // --- Step 4: grant authorization for each account that needs it ---

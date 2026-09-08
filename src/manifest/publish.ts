@@ -19,17 +19,27 @@ import {
   storeDirectory,
   storeFile,
   resolveDotnsConnectOptions,
+  resolveBulletinEndpoints,
+  setBulletinEndpoints,
   type DeployOptions,
 } from "../deploy.js";
-import { DotNS } from "../dotns.js";
+import { DotNS, DEFAULT_TLD, stripTldSuffix, type OwnershipResult } from "../dotns.js";
 import { NonRetryableError } from "../errors.js";
-import { loadEnvironments, resolveEndpoints, getPopSelfServeConfig } from "../environments.js";
+import {
+  loadEnvironments,
+  resolveEndpoints,
+  getPopSelfServeConfig,
+  DEFAULT_ENV_ID,
+  type ResolvedEndpoints,
+  type PopSelfServeConfig,
+} from "../environments.js";
 import { pessimisticSizePreflight } from "./byte-budget.js";
 import type { LoadedProductConfig } from "./config-load.js";
 import type {
   AppManifest,
   ExecutableConfig,
   ExecutableManifest,
+  FundingManifest,
   ProductConfig,
   RootManifest,
   WidgetManifest,
@@ -47,9 +57,13 @@ export interface PublishManifestOptions {
    * this CID instead of re-uploading the same bytes.
    */
   buildDirCid?: { absPath: string; cid: string };
-  /** Env id (e.g. "paseo-next-v2"). Drives RPC + contract resolution. */
+  /**
+   * Env id (e.g. "paseo-next-v2"). Drives DotNS RPC + contract resolution
+   * AND the Bulletin endpoint the icon/executable uploads target — both use
+   * the same resolved env, matching the legacy deploy.
+   */
   env?: string;
-  /** Optional bulletin RPC override. */
+  /** Optional bulletin RPC override — same precedence as the legacy deploy's `--rpc`. */
   rpc?: string;
   /** Required: signer mnemonic. */
   mnemonic?: string;
@@ -68,7 +82,7 @@ export interface PublishManifestResult {
  *
  * Uploads the icon and any executables that aren't covered by `buildDirCid`,
  * then writes the root + per-executable text records on dotNS. Subnames
- * (`app|widget|worker.<domain>`) are created on demand and pointed at the
+ * (`app|widget|funding|worker.<domain>`) are created on demand and pointed at the
  * content resolver before any `setText`.
  */
 export async function publishManifest(opts: PublishManifestOptions): Promise<PublishManifestResult> {
@@ -89,6 +103,22 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   }
 
   const configDir = path.dirname(sourcePath);
+
+  // Resolve the env's Bulletin endpoint(s) up front — same env/--rpc
+  // precedence deploy() uses (resolveBulletinEndpoints is the exact function
+  // deploy() itself calls) — and point the module-level storage endpoint at
+  // it BEFORE any storeFile/storeDirectory call below. Without this,
+  // storeFile/storeDirectory connect with no client of their own, falling
+  // back to getProvider()'s module-default endpoint (DEFAULT_BULLETIN_RPC)
+  // regardless of opts.env/opts.rpc, while the DotNS text-record writes
+  // further down correctly use the resolved env — so the manifest content
+  // could land on the wrong Bulletin chain. Resolve once here and reuse the
+  // result in connectDotNS below (no second load).
+  const envId = opts.env ?? DEFAULT_ENV_ID;
+  const { doc } = await loadEnvironments();
+  const resolved = resolveEndpoints(doc, envId);
+  const popSelfServe = getPopSelfServeConfig(doc, envId);
+  setBulletinEndpoints(resolveBulletinEndpoints(resolved.bulletin, opts.rpc));
 
   const iconAbs = path.resolve(configDir, config.icon.path);
   const iconBytes = await readFileOrThrow(iconAbs, "icon");
@@ -134,11 +164,12 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
     storageProvider?.client?.destroy?.();
   }
 
-  const dotns = await connectDotNS(opts);
+  const dotns = await connectDotNS(opts, resolved, popSelfServe, envId);
 
   try {
-    // DotNS helpers append `.dot` internally, so pass the bare label.
-    const baseLabel = stripDotSuffix(config.domain);
+    // DotNS helpers append `.<tld>` internally (this env's resolved TLD — see
+    // DotNS._tld / connectDotNS above), so pass the bare label.
+    const baseLabel = stripDotSuffix(config.domain, resolved.tld ?? DEFAULT_TLD);
 
     await dotns.ensureContentResolver(baseLabel);
 
@@ -153,17 +184,7 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
       if (!cid) throw new NonRetryableError(`Internal: missing CID for executable kind '${exec.kind}'`);
 
       const ownership = await dotns.checkSubdomainOwnership(exec.kind, baseLabel);
-      if (!ownership.owned) {
-        if (ownership.owner) {
-          throw new NonRetryableError(
-            `Subname ${exec.kind}.${config.domain} is owned by ${ownership.owner}, not the publisher. Aborting.`,
-          );
-        }
-        console.log(`  Registering subname ${exec.kind}.${config.domain}…`);
-        await dotns.registerSubdomain(exec.kind, baseLabel);
-      }
-
-      await dotns.ensureContentResolver(`${exec.kind}.${baseLabel}`);
+      await registerOrEnsureResolver(dotns, ownership, exec.kind, baseLabel, config.domain);
 
       const subContenthash = `0x${encodeContenthash(cid)}`;
       console.log(`  Setting contenthash on ${exec.kind}.${config.domain} → ${cid}…`);
@@ -183,6 +204,46 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   }
 }
 
+/**
+ * Perf win: `registerSubdomain` already sets the fresh subname's resolver
+ * to the content resolver atomically (`setSubnodeOwner` + `setResolver`,
+ * batched via `Utility.batch_all` — see dotns.ts `registerSubdomain`).
+ * Calling `ensureContentResolver` again right after a fresh register was
+ * therefore a wasted chain read on every executable of every fresh deploy.
+ * Only the already-owned path still needs it — a pre-existing subname can
+ * have a stale or unset resolver.
+ *
+ * Takes a minimal injectable `dotns`-like interface (rather than the
+ * concrete `DotNS` class) purely so this branch can be unit-tested without a
+ * live chain connection; `publishManifest` always calls it with a real
+ * `DotNS` instance.
+ */
+export interface RegisterOrEnsureResolverDeps {
+  registerSubdomain(sublabel: string, parentLabel: string): Promise<unknown>;
+  ensureContentResolver(domainName: string): Promise<{ changed: boolean }>;
+}
+
+export async function registerOrEnsureResolver(
+  dotns: RegisterOrEnsureResolverDeps,
+  ownership: OwnershipResult,
+  execKind: string,
+  baseLabel: string,
+  domain: string,
+): Promise<{ registered: boolean }> {
+  if (!ownership.owned) {
+    if (ownership.owner) {
+      throw new NonRetryableError(
+        `Subname ${execKind}.${domain} is owned by ${ownership.owner}, not the publisher. Aborting.`,
+      );
+    }
+    console.log(`  Registering subname ${execKind}.${domain}…`);
+    await dotns.registerSubdomain(execKind, baseLabel);
+    return { registered: true };
+  }
+  await dotns.ensureContentResolver(`${execKind}.${baseLabel}`);
+  return { registered: false };
+}
+
 async function readFileOrThrow(p: string, label: string): Promise<Uint8Array> {
   try {
     return await fs.readFile(p);
@@ -191,12 +252,12 @@ async function readFileOrThrow(p: string, label: string): Promise<Uint8Array> {
   }
 }
 
-async function connectDotNS(opts: PublishManifestOptions): Promise<DotNS> {
-  const envId = opts.env ?? "paseo-next-v2";
-  const { doc } = await loadEnvironments();
-  const resolved = resolveEndpoints(doc, envId);
-  const popSelfServe = getPopSelfServeConfig(doc, envId);
-
+async function connectDotNS(
+  opts: PublishManifestOptions,
+  resolved: ResolvedEndpoints,
+  popSelfServe: PopSelfServeConfig | null,
+  envId: string,
+): Promise<DotNS> {
   const deployOptsShim: Pick<DeployOptions, "mnemonic" | "derivationPath" | "signer" | "signerAddress"> = {
     mnemonic: opts.mnemonic,
     derivationPath: opts.derivationPath,
@@ -210,6 +271,7 @@ async function connectDotNS(opts: PublishManifestOptions): Promise<DotNS> {
     envId,
     popSelfServe,
     resolved.registerStorageDeposit,
+    resolved.tld,
   );
 
   const dotns = new DotNS();
@@ -239,6 +301,9 @@ function composeExecutable(exec: ExecutableConfig): ExecutableManifest {
       ...(exec.description !== undefined ? { description: exec.description } : {}),
     } as WidgetManifest;
   }
+  if (exec.kind === "funding") {
+    return { $v: 1, kind: "funding", appVersion: exec.appVersion, modes: exec.modes } as FundingManifest;
+  }
   return {
     $v: 1,
     kind: "worker",
@@ -248,6 +313,9 @@ function composeExecutable(exec: ExecutableConfig): ExecutableManifest {
   } as WorkerManifest;
 }
 
-function stripDotSuffix(domain: string): string {
-  return domain.replace(/\.dot$/i, "");
+// tld is a required param: this function's single caller (below) always
+// passes a resolved value (`resolved.tld ?? DEFAULT_TLD`), so a default here
+// was dead code.
+function stripDotSuffix(domain: string, tld: string): string {
+  return stripTldSuffix(domain, tld);
 }

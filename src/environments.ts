@@ -36,12 +36,44 @@ export interface Environment {
   badge?: string;
   backend?: string;
   ipfs?: string;
+  /**
+   * Host serving the browser SPA that resolves DotNS names for this env
+   * (issue #142). Defaults to "dot.li" when omitted — set this only when an
+   * env's names are NOT resolvable via the default gateway (e.g. devnet-family
+   * envs, which are served by "dev-dot.li").
+   */
+  webGateway?: string;
+  /**
+   * DotNS TLD for names registered on this environment (e.g. "paseo" on
+   * paseo-next-v2 following its redeploy). Defaults to "dot" (DEFAULT_TLD in
+   * src/dotns.ts) when omitted — set this only when an env's DotNS deployment
+   * uses a non-default suffix. devnet is community-operated (we don't control
+   * its deployment) and deliberately omits this, falling back to the code
+   * default.
+   */
+  tld?: string;
   uptimeUrl?: string;
   autoAccountMapping?: boolean;
   nativeToEthRatio?: number;
   registerStorageDeposit?: number;
   contracts?: Record<string, string>;
   popSelfServe?: PopSelfServeConfig;
+  /**
+   * Which key holds `TransactionStorage` authorizer rights on this env's
+   * Bulletin chain (e.g. "//Alice" on paseo-next-v2). This is signing
+   * material, not just naming: bin/polkadot-app-bootstrap and
+   * scripts/e2e-ensure-authorized.mjs both feed it straight into
+   * `keyring.addFromUri(...)` to build a live signer for manual/CI
+   * authorization grants. The invariant that matters is that the deploy
+   * path itself never reads this field — polkadot-app-deploy does not
+   * self-authorize on Bulletin (see ensureAuthorized in src/pool.ts, which
+   * only ever throws, never signs) — so it is consumed only by explicit
+   * human/CI tooling, never at deploy time. Left unset when the authorizer
+   * is unknown — e.g. devnet, which is community-operated — so a missing
+   * value fails with a clear "no known authorizer" message instead of an
+   * opaque on-chain rejection from a wrong guess.
+   */
+  bulletinAuthorizer?: string;
 }
 
 export interface ChainEndpoint {
@@ -85,10 +117,19 @@ export interface ResolvedEndpoints {
   network: "testnet" | "mainnet";
   envName: string;
   ipfs?: string;
+  webGateway?: string;
+  /** Undefined when the env doesn't declare one — callers fall back to DEFAULT_TLD ("dot") at the point of use, same convention as webGateway. */
+  tld?: string;
   autoAccountMapping: boolean;
   contracts: Record<string, string>;
   nativeToEthRatio: bigint;
   registerStorageDeposit?: bigint;
+  /**
+   * Undefined when the env doesn't declare one (e.g. devnet — community-
+   * operated, authorizer unknown). Read-only naming for bin/polkadot-app-bootstrap;
+   * nothing in the deploy path signs with this.
+   */
+  bulletinAuthorizer?: string;
 }
 
 // ---- Hardcoded ultimate fallback (matches today's default behavior) ---------
@@ -395,10 +436,13 @@ export function resolveEndpoints(
     network: env.network,
     envName: env.name,
     ipfs: env.ipfs,
+    webGateway: env.webGateway,
+    tld: env.tld,
     autoAccountMapping: env.autoAccountMapping ?? false,
     contracts: env.contracts ?? {},
     nativeToEthRatio: BigInt(env.nativeToEthRatio ?? 1_000_000),
     ...(env.registerStorageDeposit !== undefined ? { registerStorageDeposit: BigInt(env.registerStorageDeposit) } : {}),
+    ...(env.bulletinAuthorizer !== undefined ? { bulletinAuthorizer: env.bulletinAuthorizer } : {}),
   };
 }
 
