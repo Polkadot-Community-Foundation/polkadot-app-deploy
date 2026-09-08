@@ -20,7 +20,6 @@ import {
   toHex,
   zeroAddress,
   namehash,
-  concatHex,
 } from "viem";
 import { CID } from "multiformats/cid";
 import { withSpan, captureWarning, setDeployAttribute, setDeploySentryTag, truncateAddress, markCodePath } from "./telemetry.js";
@@ -30,6 +29,8 @@ import { validateContractAddresses } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
 import { NonRetryableError } from "./errors.js";
 import type { PolkadotSigner } from "polkadot-api";
+import { classifyProtocolVersion, getAdapter } from "./dotns-protocol.js";
+import type { DotnsProtocolAdapter, DotnsProtocolVersion, DotnsPricingInput } from "./dotns-protocol.js";
 
 /** One step in the phone-signature plan fired at preflight. */
 export type PhoneSignatureStep = "Commitment" | "Register" | "Link content" | "Publish to registry";
@@ -57,6 +58,15 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
   /** Optional override for the storage deposit required for a fresh TLD register(). Loaded from environments.json per-env. */
   registerStorageDeposit?: bigint;
   /**
+   * Optional per-environment DotNS TLD (e.g. "paseo" on paseo-next-v2; "dot"
+   * on every other env). See environments.json's per-env `tld` field. When
+   * omitted, connect() reads DotnsProtocolRegistry.tld() on-chain instead of
+   * silently assuming a default (dotns PR #218); that read itself falls back
+   * to DEFAULT_TLD ("dot") only when it COMPLETES but reverts or returns
+   * empty data (pre-#218 deployment). See resolveTldFromRegistryResult.
+   */
+  tld?: string;
+  /**
    * Called immediately before each on-chain transaction that requires an
    * interactive mobile wallet approval. Only wired in when the session signer
    * is active; pool/mnemonic paths leave this unset.
@@ -67,8 +77,17 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
    * is sent. Resolve when the human is at their phone and ready; reject/throw
    * to abort. The per-signature operation timeout starts only AFTER this
    * resolves. `attempt` >= 2 means a re-sign (principle 4).
+   *
+   * `approvalBudgetMs` (#194) discloses how long the human has to approve
+   * before the watcher gives up as silent (see PHONE_APPROVAL_MS) — the
+   * caller should surface it in the prompt so the deadline is never a
+   * surprise. `reason: "silence"` (#194) marks the re-arm case: the watcher
+   * went silent with no prior event and the caller is re-prompting instead of
+   * failing the run outright (see PHONE_SILENCE_MAX_REARMS); undefined/"resign"
+   * keeps today's "Re-sign needed" wording for the verifyEffect-false-negative
+   * re-sign case.
    */
-  confirmPhoneReady?: (ctx: { label: string; attempt: number; total: number }) => Promise<void>;
+  confirmPhoneReady?: (ctx: { label: string; attempt: number; total: number; approvalBudgetMs: number; reason?: "resign" | "silence" }) => Promise<void>;
   /**
    * True when the injected signer is a real phone/session signer that needs the
    * human-ready gate (`_awaitPhoneReady`). False (default) for local workers used
@@ -79,6 +98,18 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
    * transfer-aware predicate that `isPhoneSignerActive` in deploy.ts already uses.
    */
   phoneSigner?: boolean;
+  /**
+   * Optional per-environment pin for the DotNS protocol generation (e.g. from
+   * environments.json's per-env `dotnsProtocol` field). ASSERTED against the
+   * live connect()-time probe, never used to override it — connect() throws
+   * naming both values when they disagree. A pin that silently overrode the
+   * probe would recreate exactly the "addresses are identical across
+   * generations so nothing flags a drift" failure this detection exists to
+   * prevent (2026-09-01 outage). Not wired from environments.json yet — that
+   * plumbing is a follow-up; this option exists so connect() can already
+   * honour it once it is.
+   */
+  dotnsProtocol?: DotnsProtocolVersion;
 }
 export interface OwnershipResult { owned: boolean; owner: string | null; }
 
@@ -97,7 +128,37 @@ export type TxResolution =
   | { kind: typeof TX_KIND_HASH; hash: string; block?: { hash: string; number: number } }
   | { kind: typeof TX_KIND_NONCE_ADVANCED; rpc: string }
   | { kind: typeof TX_KIND_BEST_BLOCK };
-export interface PriceValidationResult { priceWei: bigint; requiredStatus: number; userStatus: number; message: string; }
+
+// Sentinel txHash placed in setTextRecord's return when the skip-if-unchanged
+// pre-check finds the on-chain value already matches — no tx was submitted,
+// so there is no real hash to report. Not part of TxResolution (that union
+// describes contractTransaction's tx-submission outcomes; this is a
+// no-op-write outcome that never reaches contractTransaction).
+export const TX_KIND_SKIPPED = "skipped" as const;
+
+/**
+ * Pure skip-decision for `setTextRecord`'s already-set pre-check: true when
+ * the on-chain value already equals the target, meaning the write can be
+ * skipped entirely. Mirrors setContenthash's inline `current === expected`
+ * check, extracted here so the decision is unit-testable without a live chain.
+ */
+export function shouldSkipTextWrite(current: string, target: string): boolean {
+  return current === target;
+}
+
+export interface PriceValidationResult {
+  priceWei: bigint;
+  requiredStatus: number;
+  userStatus: number;
+  message: string;
+  /**
+   * The PopRules.pricingVersion() this price was resolved against — set only
+   * on protocol v2 (needsPricingBeforeCommit), where the committed
+   * registration tuple must carry the SAME version this price came from.
+   * Undefined on v1, where pricing has no versioning concept.
+   */
+  pricingVersion?: bigint;
+}
 export interface ParsedDomainName {
   isSubdomain: boolean;
   label: string;
@@ -157,12 +218,16 @@ const SOURCE_BUFFER = ONE_PAS;
 // pallet-revive dry-run returns flags=1 data=0x when free balance < this amount.
 export const MINIMUM_REGISTER_STORAGE_DEPOSIT = 2_000_000_000_000n; // 200 PAS
 // The register() msg.value is the tier-resolved deposit from PopRules, NOT a
-// fixed RENT_PRICE: 0 for a verified (Lite/Full) signer, PopRules.startingPrice
-// for a NoStatus signer. It is a refundable escrow deposit, not a burned fee.
-// startingPrice is owner-updatable per env, so it is read live (see
-// gateOnFeeBalance) — an on-chain updateStartingPrice is picked up with no
-// release. The old hardcoded RENT_PRICE (dotns commit f8a0f963) no longer
-// matches the deployed DotnsRegistrarController. See issue #884.
+// fixed RENT_PRICE: 0 for a verified (Lite/Full) signer, PopRules's live
+// deposit read for a NoStatus signer. It is a refundable escrow deposit, not a
+// burned fee. The deposit read is owner-updatable per env, so it is read live
+// (see gateOnFeeBalance) — an on-chain update is picked up with no release.
+// The old hardcoded RENT_PRICE (dotns commit f8a0f963) no longer matches the
+// deployed DotnsRegistrarController. See issue #884.
+// Which view function resolves the deposit is protocol-version-dependent
+// (2026-09-01 drift): v1 calls the flat PopRules.startingPrice(); v2 removed
+// that function and calls the per-label PopRules.price(label) instead —
+// startingPrice is v1-only now. See src/dotns-protocol.ts's depositCall().
 export function registerDepositWei(userStatus: number, startingPriceWei: bigint): bigint {
   return userStatus === ProofOfPersonhoodStatus.NoStatus ? startingPriceWei : 0n;
 }
@@ -215,7 +280,10 @@ export function feeFloorFor(plannedAction: DotnsSuccessAction, storageDeposit = 
   return FEE_FLOOR_REGISTER + storageDeposit + rentPriceNative + transferFeeNative;
 }
 
-function topUpTargetFor(plannedAction: DotnsSuccessAction, storageDeposit = MINIMUM_REGISTER_STORAGE_DEPOSIT, rentPriceNative = 0n, transferFeeNative = 0n): bigint {
+// Exported for unit tests (issue: topUpTargetFor had no test coverage even
+// though it spends real testnet funds and its sibling feeFloorFor — same
+// shape, same historical bug class — is tested).
+export function topUpTargetFor(plannedAction: DotnsSuccessAction, storageDeposit = MINIMUM_REGISTER_STORAGE_DEPOSIT, rentPriceNative = 0n, transferFeeNative = 0n): bigint {
   if (isOwnedAction(plannedAction)) return TOP_UP_TARGET + transferFeeNative;
   return TOP_UP_TARGET + storageDeposit + rentPriceNative + transferFeeNative;
 }
@@ -284,7 +352,21 @@ export const TX_WALL_CLOCK_CEILING_MS: number = 240_000;
 // arrives for this long, the watch is considered silently stalled (papi observable
 // + dead WS) and the promise rejects with a 'transaction watcher silent for Ns
 // after <lastEvent>' error that signAndSubmitWithRetry can retry.
+//
+// #194: this governs MACHINE no-progress only (WS stall, dropped subscription)
+// — see PHONE_APPROVAL_MS for the separate human-approval budget. Before #194
+// this single constant did double duty: on a phone/session signer, lastEventAt
+// can only advance once the human approves (the first event is "signed"), so
+// the silence deadline WAS the approval budget too. Tuning one must not
+// silently retune the other, hence the split.
 export const TX_NO_PROGRESS_MS: number = 90_000;
+// #194: silence deadline used in place of TX_NO_PROGRESS_MS specifically when
+// the signer is a phone/session signer (signAndSubmitExtrinsic's opts.isPhoneSigner
+// === true) — see the comment on TX_NO_PROGRESS_MS above for why these two
+// needed to become independent constants. Same initial value (90_000) so
+// current behaviour is unchanged; a future retune of either no longer affects
+// the other.
+export const PHONE_APPROVAL_MS: number = 90_000;
 // #1108: grace window before the best-block short-circuit engages. Give GRANDPA
 // finality a fair chance first — so a healthy deploy (Asset Hub finality is
 // typically ~12–40s) still resolves via the "finalized" event with a real tx
@@ -343,7 +425,9 @@ export async function verifyEffectWithGrace(
  * event before the silence deadline. On the phone/session-signer path this
  * typically means the user hasn't approved the request on their phone yet.
  * Typed separately from a plain Error so signAndSubmitWithRetry can apply a
- * different policy (pause-and-resume) instead of the default retry.
+ * different policy — pause-and-resume (#194: bounded re-arm, see
+ * PHONE_SILENCE_MAX_REARMS and DotNS.contractTransaction) — instead of the
+ * default retry/backoff loop.
  */
 export class WatcherSilentNoEventError extends Error {
   constructor(silentMs: number) {
@@ -370,23 +454,60 @@ export function classifyTxRetryDecision(err: unknown): "retry" | "abort" {
 }
 
 /**
- * Phone-signer no-event fast-fail (#990, backported from polkadot-app-deploy).
+ * Distinct subclass of NonRetryableError (not a plain one) so a caller can
+ * identify "this specific failure is eligible for a bounded human re-arm"
+ * without string-matching an error message. Anything that merely checks
+ * `instanceof NonRetryableError` (e.g. bin/polkadot-app-deploy's exit-code
+ * branch, or the existing #990 tests) is unaffected — this IS one.
+ */
+export class PhoneSilenceNonRetryableError extends NonRetryableError {}
+
+/**
+ * Phone-signer no-event classification (#990, backported from
+ * polkadot-app-deploy; call-site behaviour updated by #194).
  * WatcherSilentNoEventError means the watcher never saw a single prior event —
  * the phone never approved the request — which is a materially different
- * situation from a WS stall after signing. For a phone signer, retrying pays
- * another ~90s of silence for no better odds (the phone still won't have
- * approved); fail immediately with a clear, actionable message instead.
+ * situation from a WS stall after signing. For a phone signer, generic
+ * attempt/backoff retry would just pay another ~90s of silence for no better
+ * odds (the phone still won't have approved), so this returns a
+ * PhoneSilenceNonRetryableError to keep signAndSubmitWithRetry's generic
+ * retry loop from running.
+ * That does NOT mean the run ends here, though: DotNS.contractTransaction
+ * (NOT signAndSubmitWithRetry — see the comment there for why) treats this
+ * classification as "eligible for a bounded human re-arm": when it's a real
+ * phone signer with a phoneLabel, it re-prompts and resubmits up to
+ * PHONE_SILENCE_MAX_REARMS times before giving up with this exact error,
+ * since the storage work is already sunk (paid + finalised) by this point and
+ * forcing a full re-deploy is strictly worse than asking the human to look at
+ * their phone again.
  * Non-phone signers, or a WatcherSilentNoEventError instance not present (e.g.
  * a plain "watcher silent" Error where a prior event DID arrive), fall through
  * to the default classifyTxRetryDecision/retry path unchanged. Pure so the
- * decision is unit-testable without driving a real retry loop.
+ * classification is unit-testable without driving a real retry loop — the
+ * re-arm loop itself lives at the call site, not here.
  */
-export function classifyWatcherSilentFastFail(err: unknown, isPhoneSigner: boolean | undefined): NonRetryableError | null {
+export function classifyWatcherSilentFastFail(err: unknown, isPhoneSigner: boolean | undefined): PhoneSilenceNonRetryableError | null {
   if (err instanceof WatcherSilentNoEventError && isPhoneSigner === true) {
-    return new NonRetryableError("No signature received from the phone — re-run when you can approve on your phone.");
+    return new PhoneSilenceNonRetryableError("No signature received from the phone — re-run when you can approve on your phone.");
   }
   return null;
 }
+
+// #194: bound on how many times DotNS.contractTransaction will re-prompt a
+// phone signer after the watcher goes silent with no prior event, before
+// giving up with classifyWatcherSilentFastFail's NonRetryableError. Unbounded
+// re-arming risks a hung interactive session (nobody at the phone, Ctrl-C
+// never sent); 3 re-arms is a generous human budget (3 × PHONE_APPROVAL_MS
+// of machine silence alone, on top of the human think-time) while still
+// guaranteeing termination.
+export const PHONE_SILENCE_MAX_REARMS: number = 3;
+
+// #194: onResign's signature widened with an optional `reason` so the same
+// hook serves both the pre-existing verifyEffect-false-negative re-sign case
+// (reason omitted → "Re-sign needed" wording, driven off `attempt`) and the
+// contractTransaction-level silence re-arm case (reason: "silence" → "still
+// nothing from your phone" wording, regardless of `attempt`).
+type PhoneOnResign = (attempt: number, reason?: "resign" | "silence") => Promise<void>;
 
 // Jittered exponential backoff for DotNS tx retries. Bursty nonce contention
 // (parallel deploys briefly sharing the signer's nonce stream) clears within a
@@ -505,6 +626,101 @@ export function makeRetryStatusFilter(sink: (status: string) => void): {
 
 export const DEFAULT_MNEMONIC: string = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
 
+// DotNS's per-network TLD (issue: paseo-next-v2 redeploy). Most envs keep
+// ".dot"; paseo-next-v2 now uses ".paseo" — see assets/environments.json's
+// per-env `tld` field and src/environments.ts's ResolvedEndpoints.tld.
+// DEFAULT_TLD is the fallback for every existing call site / library consumer
+// that never passes a tld — NOT a module-level mutable global (deploy() is
+// consumed as a library by playground-cli, so per-instance/per-call state is
+// required, never a process-wide default that a concurrent caller could flip).
+export const DEFAULT_TLD: string = "dot";
+
+// Every TLD DotNS has ever minted names under. Used only by parseDomainName's
+// wrong-TLD guard: an input ending in a DIFFERENT known TLD than the one this
+// environment is configured for is almost always an operator mistake (typed
+// the old ".dot" suffix on a paseo-next-v2 deploy, or vice versa) and must be
+// rejected with a clear message instead of silently mis-parsed as a subdomain
+// leaf (e.g. "myapp.dot" ending up as sublabel "myapp" under parent "dot").
+export const KNOWN_TLDS: readonly string[] = ["dot", "paseo"];
+
+// ---------------------------------------------------------------------------
+// On-chain TLD resolution (dotns PR #218 — DotnsProtocolRegistry.tld()/tldNode()).
+//
+// Resolution order, exactly:
+//   1. environments.json's per-env `tld` field, when set — no chain read.
+//   2. Absent — read DotnsProtocolRegistry.tld() at connect() time.
+//   3. That read completes but reverts / returns empty `0x` — pre-#218
+//      deployment — fall back to DEFAULT_TLD.
+// A dry-run call that never COMPLETES (RPC timeout, WS drop, connection
+// error) is NOT case 3 — it must propagate as a connect() failure. Silently
+// defaulting to "dot" there would write contenthash to the wrong on-chain
+// node on a live ".paseo" env with no revert and no error to catch it.
+//
+// The impure half (the actual dry-run call, which must tell "completed but
+// unusable" apart from "never completed") lives on the DotNS class
+// (dryRunRegistryString, private). Everything below is pure and takes the
+// completed-or-not outcome as data, so it's unit-testable without a live
+// chain — no mock papi client required.
+// ---------------------------------------------------------------------------
+
+/**
+ * Outcome of a DotnsProtocolRegistry dry-run read. `ok: false` means the dry
+ * run COMPLETED (the chain replied) but reverted, returned empty `0x`, or no
+ * registry address was configured for this env — every one of those
+ * collapses to the same "can't determine on-chain state" signal. It does
+ * NOT mean the call threw — a throw (network/RPC failure) must propagate
+ * past this type entirely, never get wrapped into `{ ok: false }`.
+ */
+export type RegistryDryRunResult<T> = { ok: true; value: T } | { ok: false };
+
+// dotns PR #218's `tld()` returns the SUFFIX with its leading dot (e.g.
+// ".paseo"), but every call site in this file interpolates
+// `${label}.${this._tld}` — storing the raw return value verbatim would
+// produce "myapp..paseo". Strip exactly one leading dot; do nothing if the
+// contract ever starts returning the bare label instead.
+export function normalizeOnChainTld(raw: string): string {
+  return raw.startsWith(".") ? raw.slice(1) : raw;
+}
+
+// Case-INSENSITIVE strip of a `.${tld}` suffix, if present. Factors out the
+// identical `new RegExp(\`\\.${tld}$\`, "i")` construction that would
+// otherwise be duplicated inline at every call site that needs to strip a
+// resolved TLD from a user-supplied label (e.g. src/commands/transfer.ts,
+// src/manifest/publish.ts). Differs deliberately from parseDomainName's
+// case-SENSITIVE `endsWith`/`slice` suffix handling — that one enforces an
+// exact-case match as part of parsing and must not be routed through this
+// case-insensitive helper.
+export function stripTldSuffix(input: string, tld: string): string {
+  return input.replace(new RegExp(`\\.${tld}$`, "i"), "");
+}
+
+// Pure decision for resolution step 2/3: given the completed-or-not outcome
+// of a `tld()` dry run, either normalize the on-chain value or fall back to
+// DEFAULT_TLD (pre-#218 deployment / no registry configured).
+export function resolveTldFromRegistryResult(result: RegistryDryRunResult<string>): string {
+  if (!result.ok) return DEFAULT_TLD;
+  return normalizeOnChainTld(result.value);
+}
+
+// Pure consistency check for the tldNode() safety net: our own namehash(tld)
+// must agree with the contract's tldNode(), or every node this run computes
+// targets the wrong on-chain record — a silent, total-corruption bug class.
+// `result.ok === false` means the registry doesn't support tldNode() (pre-#218)
+// or none is configured — nothing to check, not a failure.
+export function checkTldNodeConsistency(tld: string, result: RegistryDryRunResult<string>): void {
+  if (!result.ok) return;
+  const localNode = namehash(tld).toLowerCase();
+  const onChainNode = result.value.toLowerCase();
+  if (localNode !== onChainNode) {
+    throw new Error(
+      `DotNS tldNode mismatch: local namehash("${tld}") = ${localNode}, but the on-chain ` +
+      `DotnsProtocolRegistry.tldNode() = ${onChainNode}. The local namehash convention differs ` +
+      `from the contract's, so every node this run computes would target the wrong on-chain ` +
+      `record. Aborting before any writes.`,
+    );
+  }
+}
+
 let _rpcIdCounter: number = 0;
 async function fetchNonceFromEndpoint(rpc: string, ss58Address: string): Promise<number> {
   if (!globalThis.WebSocket) throw new Error("WebSocket support is required to fetch nonce");
@@ -564,6 +780,102 @@ export async function verifyNonceAdvanced(
     }
   }
   return { advanced: false };
+}
+
+// Jittered backoff between nonce-contention re-submits (#1158). Shorter base/cap
+// than dotnsRetryBackoffMs: a re-acquisition attempt is a cheap nonce-refetch-
+// and-resubmit cycle, not a full watch, so concurrent siblings need to de-sync
+// quickly rather than wait out a long ceiling. Same injectable-rand shape as
+// dotnsRetryBackoffMs so tests stay deterministic.
+const NONCE_CONTENTION_BACKOFF_BASE_MS = 250;
+const NONCE_CONTENTION_BACKOFF_MAX_MS = 2_000;
+export function nonceContentionBackoffMs(attempt: number, rand: () => number = Math.random): number {
+  const base = Math.min(NONCE_CONTENTION_BACKOFF_BASE_MS * 2 ** (attempt - 1), NONCE_CONTENTION_BACKOFF_MAX_MS);
+  const jitter = (rand() * 2 - 1) * NONCE_CONTENTION_BACKOFF_BASE_MS; // ± one base unit
+  return Math.max(0, Math.round(base + jitter));
+}
+
+// Bounded attempts for the nonce-contention re-acquisition loop below — separate
+// from DOTNS_TX_MAX_ATTEMPTS (which governs the general, expensive full-watch
+// retry loop in signAndSubmitWithRetry). Kept small so a genuinely unlandable
+// write fails fast instead of thrashing until an outer CI retry wrapper's
+// timeout hides it (#1158 repro: ~12min until a 15-min CI timeout).
+export const DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS: number = 5;
+
+// True only for the specific ambiguous nonce-advance-fallback message thrown by
+// signAndSubmitExtrinsic's poll loop (nonce moved past expectedNonce AND
+// verifyEffectWithGrace's re-polls found no observable effect — i.e. a sibling
+// consumed the nonce slot and our own tx did not land). Checked BEFORE
+// classifyTxRetryDecision in signAndSubmitWithRetry's catch — same pattern as
+// classifyWatcherSilentFastFail above — so this specific case gets its own
+// bounded re-acquisition loop instead of the generic attempt/backoff path.
+export function isNonceContentionAmbiguous(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.startsWith("nonce-advance fallback:");
+}
+
+/**
+ * #1158: bounded nonce re-acquisition for the ambiguous nonce-advance-fallback
+ * case on the zero-config write path, where concurrent deploys share ONE Asset
+ * Hub nonce space (the bare default signer, no derivation). When a sibling
+ * deploy's tx consumes the nonce slot our own tx was built against,
+ * `resubmit()` rejects with the ambiguous message (nonce advanced, but our
+ * effect isn't observable) instead of resolving. The old code fell through to
+ * signAndSubmitWithRetry's general retry loop, which reused the SAME stale
+ * nonceFallback.expectedNonce on every attempt — so the very next attempt's
+ * first poll tick saw "nonce already > (still-stale) N" and rejected again
+ * near-instantly, before its own freshly-submitted tx had any chance to land.
+ * That thrashing is the real #1158 repro.
+ *
+ * Fix: re-fetch the LIVE account nonce (never the stale expectedNonce a prior
+ * attempt was built against) so the next resubmit has a real chance to land,
+ * wait a short jittered backoff so concurrent siblings de-sync rather than
+ * lock-stepping onto the same slot again, and bound the whole thing to
+ * `maxAttempts` so a genuinely unlandable write fails FAST with a clear,
+ * actionable terminal error.
+ *
+ * `resubmit` is a full rebuild+sign+watch cycle — its own outcome already
+ * encodes the nonce-advance detection + verifyEffectWithGrace re-polls, so
+ * this function only decides whether/how to retry it; it never re-implements
+ * that detection. A resubmit failure that is NOT the ambiguous case (e.g. a
+ * websocket blip) is rethrown as-is — folding a genuinely different failure
+ * into the contention loop's own message would mask the real cause.
+ */
+export async function reacquireNonceOnContention(
+  resubmit: () => Promise<TxResolution>,
+  nonceFallback: { rpcs: string[]; senderSS58: string; expectedNonce: number },
+  label: string,
+  opts: {
+    fetchNonce?: (rpcs: string[], ss58: string) => Promise<number>;
+    sleep?: (ms: number) => Promise<void>;
+    backoffMs?: (attempt: number) => number;
+    maxAttempts?: number;
+  } = {},
+): Promise<TxResolution> {
+  const fetchNonceFn = opts.fetchNonce ?? fetchNonce;
+  const sleepFn = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const backoffFn = opts.backoffMs ?? nonceContentionBackoffMs;
+  const maxAttempts = opts.maxAttempts ?? DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Raw number (not String(...)) — sum()/avg() only work on numeric-emitting
+    // Sentry attributes, not stringified ones.
+    setDeployAttribute("deploy.dotns.nonce_contention_retries", attempt);
+    const ms = backoffFn(attempt);
+    console.log(`   ${label}: nonce contention (attempt ${attempt}/${maxAttempts}) — re-acquiring nonce and resubmitting in ${ms}ms…`);
+    await sleepFn(ms);
+    try {
+      nonceFallback.expectedNonce = await fetchNonceFn(nonceFallback.rpcs, nonceFallback.senderSS58);
+    } catch { /* keep the previous baseline; the next resubmit's own poll re-checks it anyway */ }
+    try {
+      return await resubmit();
+    } catch (e: any) {
+      if (!isNonceContentionAmbiguous(e)) throw e;
+      // else: sibling stole the newly-acquired slot too — loop again, bounded by maxAttempts
+    }
+  }
+  throw new NonRetryableError(
+    `DotNS write could not acquire a nonce slot after ${maxAttempts} attempts — the shared signer (${nonceFallback.senderSS58}) is under nonce contention; pass your own --mnemonic for an isolated nonce space.`,
+  );
 }
 
 export const ProofOfPersonhoodStatus = {
@@ -635,6 +947,16 @@ const DOTNS_CONTENT_RESOLVER_ABI = [
   { inputs: [{ name: "node", type: "bytes32" }], name: "contenthash", outputs: [{ name: "", type: "bytes" }], stateMutability: "view", type: "function" },
 ] as const;
 
+// dotns PR #218 (merged): DotnsProtocolRegistry exposes the deployment's TLD
+// on-chain. `tld()` returns the SUFFIX (e.g. ".paseo", leading dot included —
+// see normalizeOnChainTld above); `tldNode()` returns namehash(bare label) so
+// callers can cross-check their own namehash implementation against the
+// contract's. Reverts on any pre-#218 deployment.
+const DOTNS_PROTOCOL_REGISTRY_ABI = [
+  { inputs: [], name: "tld", outputs: [{ name: "", type: "string" }], stateMutability: "view", type: "function" },
+  { inputs: [], name: "tldNode", outputs: [{ name: "", type: "bytes32" }], stateMutability: "view", type: "function" },
+] as const;
+
 const DOTNS_TEXT_RESOLVER_ABI = [
   { inputs: [{ name: "node", type: "bytes32" }, { name: "key", type: "string" }, { name: "value", type: "string" }], name: "setText", outputs: [], stateMutability: "nonpayable", type: "function" },
   { inputs: [{ name: "node", type: "bytes32" }, { name: "key", type: "string" }], name: "text", outputs: [{ name: "", type: "string" }], stateMutability: "view", type: "function" },
@@ -655,7 +977,7 @@ export const PUBLISHER_ABI = [
 // or surface as a fatal error.
 export class PublisherNotSupportedError extends Error {
   constructor(envName: string) {
-    super(`Publisher contract is not configured for environment '${envName}'. Use an env that has a deployed Publisher (currently: paseo-next-v2).`);
+    super(`Publisher contract is not configured for environment '${envName}'. Use an env that has a deployed Publisher (currently: devnet).`);
     this.name = "PublisherNotSupportedError";
   }
 }
@@ -866,17 +1188,48 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operationName: s
   return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
 }
 
-export const DOT_NODE: `0x${string}` = "0x3fce7d1364a893e213bc4212792b517ffc88f5b13b86c8ef9c8d390c3a1370ce";
-
 export function convertWeiToNative(weiValue: bigint): bigint { return weiValue / NATIVE_TO_ETH_RATIO; }
-export function computeDomainTokenId(label: string): bigint {
-  const labelhash = keccak256(toBytes(label));
-  const node = keccak256(concatHex([DOT_NODE, labelhash]));
-  return BigInt(node);
+// #1240 follow-up: this used to hardcode a `.dot` TLD node (DOT_NODE) and
+// concat it with the label hash by hand — a SECOND node-derivation path that
+// #1240's `namehash(\`${x}.${this._tld}\`)` template conversion never
+// touched (a grep for "namehash(`" doesn't match a manual concatHex). Every
+// other call site derives the ERC-721 tokenId via namehash of the full
+// "label.tld" string; do the same here so there's exactly one derivation to
+// keep correct. Proven wrong in production (bulletin-deploy, the private
+// twin of this repo): registering "ssoqedtuwf.paseo" on paseo-next-v2 minted
+// namehash("ssoqedtuwf.paseo"), but the post-register ownerOf lookup queried
+// namehash("ssoqedtuwf.dot") (the old hardcoded node) and reverted with
+// ERC721NonexistentToken — after the 11 PAS mint succeeded.
+export function computeDomainTokenId(label: string, tld: string = DEFAULT_TLD): bigint {
+  return BigInt(namehash(`${label}.${tld}`));
+}
+
+// Shared by transferName and transferSubname (and the CLI's own --to
+// resolution in src/commands/transfer.ts): a transfer recipient of the zero
+// address (0x0000...0000) is not "nobody's account" here — it's the ERC-721 /
+// registry burn sentinel. Neither transferFrom nor setSubnodeOwner reject it
+// on-chain, so an unguarded `--to 0x000...000` (a plausible typo for an empty
+// --to, or a copy-paste mistake) would silently and irreversibly destroy the
+// name/subname. Fail fast, before any chain read, with a message that names
+// the exact target so the caller understands what almost happened.
+export function assertNotZeroRecipient(toH160: string, fullName: string): void {
+  if (toH160.toLowerCase() === zeroAddress) {
+    throw new Error(
+      `Refusing to transfer ${fullName} to the zero address (${zeroAddress}): this would permanently burn ` +
+      `it — there is no owner to recover it from afterward. Pass a real recipient with --to <0xH160>.`,
+    );
+  }
 }
 export function countTrailingDigits(label: string): number { let count = 0; for (let i = label.length - 1; i >= 0; i--) { const code = label.charCodeAt(i); if (code >= 48 && code <= 57) count++; else break; } return count; }
 export function stripTrailingDigits(label: string): string { return label.replace(/\d+$/, "").replace(/-$/, ""); }
 
+// NOTE (issue #1189): this REWRITES the label — it does not validate. Only
+// validateDomainLabel is the registration gate, and it no longer calls this
+// function (it refuses non-compliant labels instead, see below). Kept exported
+// for its existing callers: public API via src/index.ts, and E2E label
+// generators that construct already-compliant names. Do not wire this back
+// into anything that decides what gets registered/paid for/written on-chain —
+// that reintroduces the exact silent-retarget bug #1189 fixed.
 export function sanitizeDomainLabel(label: string): string {
   const trailingDigitCount = countTrailingDigits(label);
   // PopRules accepts exactly 0 or 2 trailing digits; everything else reverts.
@@ -912,48 +1265,244 @@ export function sanitizeDomainLabel(label: string): string {
   return stripped;
 }
 
-export function validateDomainLabel(label: string, opts: { checkReserved?: boolean; skipSanitize?: boolean } = {}): string {
-  if (!/^[a-z0-9-]{3,63}$/.test(label)) throw new Error("Invalid domain label: must be 3-63 chars and contain only lowercase letters, digits, and hyphens");
-  if (label.startsWith("-") || label.endsWith("-")) throw new Error("Invalid domain label: cannot start or end with hyphen");
-  const sanitized = opts.skipSanitize ? label : sanitizeDomainLabel(label);
+// Pure, non-recursive status classifier — the numeric-only half of
+// classifyDotnsLabel. Split out so buildLabelAlternatives can filter candidate
+// labels (including candidates that turn out Reserved) WITHOUT calling
+// classifyDotnsLabel itself, which (for the baselength<=5 branch) builds its
+// message via buildLabelAlternatives. Calling classifyDotnsLabel from inside
+// buildLabelAlternatives would recurse (candidate "dim02" classifies as
+// Reserved → builds alternatives for "dim02" → candidate "dim02" again → ...).
+// Mirrors PopRules._classifyValidatedName exactly. classifyDotnsLabel below
+// calls this for its status/baseLength/trailingDigits rather than
+// re-deriving them, so the branch logic has one source of truth.
+function classifyLabelStatus(label: string): { status: number; trailingDigits: number; baseLength: number } {
+  const trailingDigits = countTrailingDigits(label);
+  const baseLength = label.length - trailingDigits;
+  if (trailingDigits === 1 || trailingDigits > 2 || baseLength <= 5) {
+    return { status: ProofOfPersonhoodStatus.Reserved, trailingDigits, baseLength };
+  }
+  if (baseLength <= 8) {
+    return { status: trailingDigits === 2 ? ProofOfPersonhoodStatus.ProofOfPersonhoodLite : ProofOfPersonhoodStatus.ProofOfPersonhoodFull, trailingDigits, baseLength };
+  }
+  return { status: ProofOfPersonhoodStatus.NoStatus, trailingDigits, baseLength };
+}
+
+function tierDescriptionFor(status: number): string {
+  if (status === ProofOfPersonhoodStatus.NoStatus) return "open to any account";
+  if (status === ProofOfPersonhoodStatus.ProofOfPersonhoodLite) return "requires Personhood Lite";
+  if (status === ProofOfPersonhoodStatus.ProofOfPersonhoodFull) return "requires Personhood Full";
+  return "unavailable";
+}
+
+// Shared NoStatus-anchoring convention (issue #1189): pad the charset-cleaned
+// base to 9 chars with 'x' then append "00" — 9+ chars with exactly 2
+// trailing digits is always NoStatus, so this is always registrable
+// regardless of how short or reserved-adjacent the original base was.
+// exampleNoStatusLabel (below) and buildLabelAlternatives both call this —
+// one convention, not two.
+function noStatusFallbackBase(base: string): string {
+  return `${base.padEnd(9, "x").slice(0, 9)}00`;
+}
+
+export interface DomainLabelAlternative {
+  label: string;
+  baseLength: number;
+  status: number;
+  tierDescription: string;
+}
+
+// Pure helper (issue #1189): given ANY label — typically one refused by
+// validateDomainLabel or classifyDotnsLabel — derive up to 3 compliant
+// alternatives from the operator's OWN input, each labelled with the
+// Personhood tier it needs. Never returns a candidate that is itself Reserved
+// or otherwise invalid; the NoStatus fallback (c) always survives because it's
+// engineered to be 9+ chars with exactly 2 trailing digits.
+export function buildLabelAlternatives(label: string): DomainLabelAlternative[] {
+  const trailingRun = label.slice(label.length - countTrailingDigits(label));
+  const base = stripTrailingDigits(label);
+  // Preserve the operator's own digits: last 2 of the original run if it's
+  // long enough, else the single digit zero-padded ("1" -> "01").
+  const twoDigitSuffix = trailingRun.length >= 2 ? trailingRun.slice(-2) : trailingRun.padStart(2, "0");
+  const noStatusBase = noStatusFallbackBase(base.replace(/[^a-z0-9-]/g, "x"));
+
+  const candidateLabels = [
+    `${base}${twoDigitSuffix}`, // (a) 2 trailing digits
+    base,                        // (b) 0 trailing digits
+    noStatusBase,                 // (c) NoStatus-safe fallback
+  ];
+
+  const seen = new Set<string>();
+  const alternatives: DomainLabelAlternative[] = [];
+  for (const candidate of candidateLabels) {
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    if (!/^[a-z0-9-]{3,63}$/.test(candidate)) continue;
+    if (candidate.startsWith("-") || candidate.endsWith("-")) continue;
+    if (/-\d+$/.test(candidate)) continue;
+    const { status, baseLength } = classifyLabelStatus(candidate);
+    if (status === ProofOfPersonhoodStatus.Reserved) continue;
+    alternatives.push({ label: candidate, baseLength, status, tierDescription: tierDescriptionFor(status) });
+  }
+  return alternatives;
+}
+
+function formatAlternativesList(alternatives: DomainLabelAlternative[], tld: string = DEFAULT_TLD): string {
+  return alternatives.map((a) => `  - ${a.label}.${tld} — base ${a.baseLength}, ${a.tierDescription}`).join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1185: Reserved (and the trailing-digit / hyphen-base rules) are
+// REGISTRATION-TIME AUTHORIZATION properties, not label-syntax properties —
+// the same category as "already owned". A name registered on-chain via
+// registerReserved (which bypasses PopRules entirely, enforcing only
+// isSingleLabel + length >= 3) legitimately violates every rule below, yet
+// genuinely exists — its owner must be able to deploy to it. So none of
+// these rules can live in validateDomainLabel (parse-time, no ownership
+// context); they live here instead, consumed by ownership-aware preflight
+// AFTER the chain tells us who owns the name.
+// ---------------------------------------------------------------------------
+
+export type Registrability =
+  | { registrable: true }
+  | { registrable: false; rule: "reserved-base" | "trailing-digits" | "hyphen-base"; message: string };
+
+// One predicate for every PopRules-derived rule. Precedence, highest first:
+// trailing-digits (count not 0 or 2) -> hyphen-base (raw label matches
+// `-\d+$`, the dotns-cli base-name-extraction trap) -> reserved-base
+// (baseLength <= 5). trailing-digits must win over hyphen-base because the
+// hyphen-base remediation only makes sense for labels whose digit count is
+// already compliant (mirrors #1189's ordering decision for the same reason).
+// Reuses classifyLabelStatus for baseLength/trailingDigits so the thresholds
+// can't drift from classifyDotnsLabel's.
+export function classifyRegistrability(label: string): Registrability {
+  const { trailingDigits, baseLength } = classifyLabelStatus(label);
+
+  if (trailingDigits !== 0 && trailingDigits !== 2) {
+    const digitWord = trailingDigits === 1 ? "digit" : "digits";
+    return {
+      registrable: false,
+      rule: "trailing-digits",
+      message: `Name has ${trailingDigits} trailing ${digitWord}; DotNS allows exactly 0 or 2 trailing digits. Use a base name with no trailing digits or a 2-digit suffix.`,
+    };
+  }
+
   // dotns-cli (paritytech/dotns-sdk packages/cli/src/utils/validation.ts)
-  // computes the registry's "base name" by stripping trailing digits only.
-  // When the label matches `<word>-<digits>$`, that base name ends in `-` and
-  // the on-chain `isBaseNameReserved(baseName)` reverts with
-  // `PopError("Name must be lowercase ASCII DNS label")` — after the consumer's
-  // Bulletin upload is already done. Reject pre-upload instead.
-  // This is a registered-name-only rule: subdomain sublabels have no such
-  // constraint (setSubnodeOwner only requires isSingleLabel()). Skip when
-  // opts.skipSanitize is set.
-  if (!opts.skipSanitize && /-\d+$/.test(sanitized)) {
-    const baseWithHyphen = sanitized.replace(/\d+$/, "");
-    const dropHyphen = sanitized.replace(/-(\d+)$/, "$1");
-    const insertSegment = sanitized.replace(/-(\d+)$/, "-pr$1");
-    throw new Error(
-      `Invalid domain label: "${sanitized}" — dotns base-name extraction leaves a trailing hyphen ("${baseWithHyphen}"), which the registry rejects with PopError("Name must be lowercase ASCII DNS label"). Drop the hyphen before the digits (e.g. "${dropHyphen}") or add a non-digit segment between (e.g. "${insertSegment}").`,
+  // computes the registry's "base name" by stripping trailing digits ONLY —
+  // not a trailing hyphen. A label of the form `<word>-<digits>$` therefore
+  // yields a base name ending in `-`, and the on-chain
+  // `isBaseNameReserved(baseName)` reverts with
+  // PopError("Name must be lowercase ASCII DNS label"). Tested on the RAW
+  // label (trailing-digit count is already known-compliant at this point).
+  if (/-\d+$/.test(label)) {
+    const baseWithHyphen = label.replace(/\d+$/, "");
+    return {
+      registrable: false,
+      rule: "hyphen-base",
+      message: `dotns-cli's base-name extraction leaves a trailing hyphen ("${baseWithHyphen}"), which the registry rejects with PopError("Name must be lowercase ASCII DNS label").`,
+    };
+  }
+
+  if (baseLength <= 5) {
+    return {
+      registrable: false,
+      rule: "reserved-base",
+      message: `Base name is ${baseLength} char${baseLength === 1 ? "" : "s"}; DotNS reserves base names of 5 chars or fewer for governance (PopRules).`,
+    };
+  }
+
+  return { registrable: true };
+}
+
+// The three-way operator message for a label DotNS naming rules forbid
+// registering. Style matches formatPopShortfallReason: lead-in sentence,
+// blank line, "  - " bullets. The "cannot register it" phrase appears in
+// BOTH branches so a single telemetry regex (naming.governance_reserved)
+// classifies both; "base name is \d+ chars" (when the rule is
+// reserved-base) already matches isExpectedError's existing pattern.
+export function formatUnregistrableReason(args: {
+  label: string;
+  registrability: Extract<Registrability, { registrable: false }>;
+  existingOwner: string | null;   // lowercased H160, or null when unregistered
+  selfAddress: string;            // lowercased H160 of the signer
+  tld?: string;
+}): string {
+  const { label, registrability, existingOwner, tld = DEFAULT_TLD } = args;
+  const alternatives = buildLabelAlternatives(label);
+  const alternativesBlock = alternatives.length > 0
+    ? `\n\nAlternatively, use a name you can register yourself:\n${formatAlternativesList(alternatives, tld)}`
+    : "";
+
+  if (existingOwner === null) {
+    return (
+      `${label}.${tld} is not registered, and bulletin-deploy cannot register it: ${registrability.message}\n\n` +
+      `Names like this can only be registered by an account whitelisted on the DotNS controller:\n` +
+      `  - Request whitelisting at https://github.com/paritytech/dotns/issues/new/choose\n` +
+      `  - From the whitelisted account: dotns register domain -n ${label} --governance\n` +
+      `  - Transfer it to this signer if they differ\n` +
+      `Then re-run this deploy unchanged.` +
+      alternativesBlock
     );
   }
-  // Fast client-side Reserved-class preflight (issue #573).
-  // classifyDotnsLabel mirrors PopRules._classifyValidatedName — pure, no chain call.
-  // Reserved labels (baselength ≤ 5) always revert on-chain; reject immediately.
-  // Called on sanitized so excess-trailing-digit stripping has already run.
-  // Opt-out via { checkReserved: false } for sublabel contexts (parseDomainName,
-  // exampleNoStatusLabel) where the Reserved rule does not apply — subdomains are
-  // user-defined strings, not DotNS-registered names.
-  if (opts.checkReserved !== false) {
-    const classification = classifyDotnsLabel(sanitized);
-    if (classification.status === ProofOfPersonhoodStatus.Reserved) {
-      // When sanitization changed the label, surface the trail so the user sees
-      // both the original input and the form that was actually classified.
-      const sanitizeTrail = label !== sanitized
-        ? `Input "${label}" was sanitized to "${sanitized}" (excess trailing digits trimmed). `
-        : "";
-      throw new NonRetryableError(
-        `${sanitizeTrail}Invalid domain label "${sanitized}": ${classification.message}`,
-      );
-    }
+
+  return (
+    `${label}.${tld} is owned by ${existingOwner}, and bulletin-deploy cannot register it for a different account: ${registrability.message}\n\n` +
+    `This signer does not hold that name. If you control ${existingOwner}'s key, redeploy with that account (e.g. via --mnemonic) to update its content directly.` +
+    alternativesBlock
+  );
+}
+
+// Decides Reserved (and the other PopRules-derived rules) by OWNERSHIP, not
+// by label syntax — the #1185 fix. A registrable label always falls through
+// untouched. A non-registrable label is authorised only when the signer
+// already owns it (registerReserved bypasses PopRules on-chain, so ownership
+// is the authorization the same way it is for any already-owned name); any
+// other ownership state aborts with the shared operator message.
+export function decideRegistrabilityOutcome(args: {
+  label: string;
+  registrability: Registrability;
+  existingOwner: string | null;
+  selfAddress: string;
+  tld?: string;
+}): { canProceed: boolean; plannedAction: "already-owned-by-us" | "register" | "abort"; reason?: string } {
+  const { label, registrability, existingOwner, selfAddress, tld = DEFAULT_TLD } = args;
+  // Ownership is checked FIRST and reported distinctly from registrability.
+  // These two must not be collapsed into one branch: `plannedAction` is a
+  // load-bearing string elsewhere (src/deploy.ts reads "already-owned-by-us"
+  // to skip registration, and the phone-signature planner branches on
+  // "register"), so claiming "already-owned-by-us" for a registrable label
+  // nobody owns would tell a caller to skip registering a name that does not
+  // exist. Preflight only reads canProceed/reason today, which is the sole
+  // reason that collapse wasn't a live bug — not a reason to keep it.
+  if (existingOwner !== null && existingOwner === selfAddress) {
+    return { canProceed: true, plannedAction: "already-owned-by-us" };
   }
-  return sanitized;
+  if (registrability.registrable) {
+    return { canProceed: true, plannedAction: "register" };
+  }
+
+  return {
+    canProceed: false,
+    plannedAction: "abort",
+    reason: formatUnregistrableReason({ label, registrability, existingOwner, selfAddress, tld }),
+  };
+}
+
+// Issue #1185: contract-level syntax ONLY — the charset/length regex and the
+// leading/trailing-hyphen check are the only rules the DotNS contract itself
+// enforces on a label of any kind (registered name or subdomain sublabel).
+// Every PopRules-derived rule (trailing-digit count, hyphen-base, Reserved
+// baselength) used to live here too, but those are REGISTRATION-TIME
+// AUTHORIZATION properties, not label-syntax properties — a name registered
+// via registerReserved legitimately violates all three, yet genuinely exists
+// on-chain, and its owner must be able to deploy to it. Those rules now live
+// in classifyRegistrability, consumed by ownership-aware preflight (see
+// above) AFTER the chain has told us who owns the name. validateDomainLabel
+// never rewrites and never takes an options param — it always returns the
+// label unchanged or throws a plain (contract-syntax) Error.
+export function validateDomainLabel(label: string): string {
+  if (!/^[a-z0-9-]{3,63}$/.test(label)) throw new Error("Invalid domain label: must be 3-63 chars and contain only lowercase letters, digits, and hyphens");
+  if (label.startsWith("-") || label.endsWith("-")) throw new Error("Invalid domain label: cannot start or end with hyphen");
+  return label;
 }
 
 // Pure helper exposed for tests. The DotNS RegistrarController checks
@@ -992,29 +1541,36 @@ export function isCommitmentTimingBarerevert(msg: string): boolean {
 //   PopFull required: userStatus must be PopFull
 //   PopLite required: userStatus in { PopLite, PopFull }
 //   NoStatus required: any user tier may register
-export function classifyDotnsLabel(label: string): { status: number; message: string } {
-  const totalLength = label.length;
-  const trailingDigits = countTrailingDigits(label);
-  // PopRules requires exactly 0 or 2 trailing digits; 1 or 3+ revert on-chain.
-  if (trailingDigits === 1 || trailingDigits > 2) {
+export function classifyDotnsLabel(label: string, tld: string = DEFAULT_TLD): { status: number; message: string } {
+  // Status/baseLength/trailingDigits all come from the single shared
+  // classifier — this function only turns that decision into a message.
+  const { status, trailingDigits, baseLength } = classifyLabelStatus(label);
+  if (status === ProofOfPersonhoodStatus.Reserved) {
+    // PopRules requires exactly 0 or 2 trailing digits; 1 or 3+ revert on-chain.
+    if (trailingDigits === 1 || trailingDigits > 2) {
+      return {
+        status,
+        message: `Name has ${trailingDigits} trailing digit${trailingDigits === 1 ? "" : "s"}; DotNS allows exactly 0 or 2 trailing digits. Use a base name with no trailing digits or a 2-digit suffix.`,
+      };
+    }
+    // baseLength <= 5. Issue #1189: the trailing sentence used to point at our
+    // internal E2E naming jargon ('rc<N>pool' / 'rc<N>dir' / 'nightly-<role>'),
+    // which means nothing to an external consumer. Replaced with alternatives
+    // derived from the operator's own input, same as validateDomainLabel's
+    // digit-count refusal message.
+    const alternatives = buildLabelAlternatives(label);
+    const suggestion = alternatives.length > 0
+      ? `\n\nUse a name you can register instead:\n${formatAlternativesList(alternatives, tld)}`
+      : "";
     return {
-      status: ProofOfPersonhoodStatus.Reserved,
-      message: `Name has ${trailingDigits} trailing digit${trailingDigits === 1 ? "" : "s"}; DotNS allows exactly 0 or 2 trailing digits. Use a base name with no trailing digits or a 2-digit suffix.`,
+      status,
+      message: `Base name is ${baseLength} char${baseLength === 1 ? "" : "s"}; DotNS reserves base names of 5 chars or fewer for governance (PopRules).${suggestion}`,
     };
   }
-  const baselength = totalLength - trailingDigits;
-  if (baselength <= 5) {
-    return {
-      status: ProofOfPersonhoodStatus.Reserved,
-      message: `Base name is ${baselength} char${baselength === 1 ? "" : "s"}; DotNS reserves base names of 5 chars or fewer for governance (PopRules). Use a base name of 6+ chars — role prefixes like 'rc<N>pool' / 'rc<N>dir' / 'nightly-<role>' work well.`,
-    };
-  }
-  if (baselength >= 6 && baselength <= 8) {
-    if (trailingDigits === 2) return { status: ProofOfPersonhoodStatus.ProofOfPersonhoodLite, message: "Requires Light personhood verification" };
-    return { status: ProofOfPersonhoodStatus.ProofOfPersonhoodFull, message: "Requires Full personhood verification" };
-  }
-  // baselength >= 9: open to any caller (0 or 2 trailing digits already enforced above).
-  return { status: ProofOfPersonhoodStatus.NoStatus, message: "Available to all" };
+  if (status === ProofOfPersonhoodStatus.ProofOfPersonhoodLite) return { status, message: "Requires Light personhood verification" };
+  if (status === ProofOfPersonhoodStatus.ProofOfPersonhoodFull) return { status, message: "Requires Full personhood verification" };
+  // NoStatus: baseLength >= 9, open to any caller (0 or 2 trailing digits already enforced above).
+  return { status, message: "Available to all" };
 }
 
 // Pure helper — returns whether a user with `userStatus` is allowed to
@@ -1034,29 +1590,61 @@ export function canRegister(requiredStatus: number, userStatus: number): boolean
   return true;
 }
 
-function exampleNoStatusLabel(label: string): string {
-  // Called when we already know the label is Reserved — bypass checkReserved so
-  // we can construct a suggestion from the bad input rather than throwing again.
-  const base = stripTrailingDigits(validateDomainLabel(label, { checkReserved: false })).replace(/[^a-z0-9-]/g, "x");
-  return `${base.padEnd(9, "x").slice(0, 9)}00.dot`;
+// Issue #1185 (hardening deferred from #1189): this used to call
+// validateDomainLabel(label, { checkReserved: false }), which post-#1189
+// COULD throw (the digit-count refusal was gated on skipSanitize, not
+// checkReserved) inside a function whose job is "construct a suggestion from
+// bad input without throwing again" — unreachable only because both call
+// sites sat downstream of a validateDomainLabel that already threw. #1185
+// deletes the options param entirely, so this no longer calls
+// validateDomainLabel at all; it strips/cleans the input directly. Shares its
+// padding convention with buildLabelAlternatives' NoStatus fallback via
+// noStatusFallbackBase (issue #1189) — one convention, not two.
+function exampleNoStatusLabel(label: string, tld: string = DEFAULT_TLD): string {
+  const base = stripTrailingDigits(label).replace(/[^a-z0-9-]/g, "x");
+  return `${noStatusFallbackBase(base)}.${tld}`;
 }
 
-export function parseDomainName(input: string): ParsedDomainName {
-  const name = input.replace(/\.dot$/, "");
+// #paseo-tld: `tld` selects which suffix is THIS environment's own — it must
+// match the caller's resolved environment (DEFAULT_TLD = "dot" for every
+// existing call site / library consumer that never passes one). Stripping is
+// therefore scoped to that one suffix, not to "any TLD-shaped string": an
+// input ending in a DIFFERENT KNOWN_TLDS entry is almost always an operator
+// mistake (typed the old ".dot" suffix on a paseo-next-v2 deploy, or vice
+// versa) and must be rejected explicitly — falling through to the generic
+// "no suffix" branch would silently misparse "myapp.dot" on a ".paseo" env as
+// subdomain "myapp" under a registered parent literally named "dot".
+export function parseDomainName(input: string, tld: string = DEFAULT_TLD): ParsedDomainName {
+  const configuredSuffix = `.${tld}`;
+  let name: string;
+  if (input.endsWith(configuredSuffix)) {
+    name = input.slice(0, -configuredSuffix.length);
+  } else {
+    const wrongTld = KNOWN_TLDS.find((known) => known !== tld && input.endsWith(`.${known}`));
+    if (wrongTld) {
+      throw new Error(
+        `Domain "${input}" ends in ".${wrongTld}", but this environment uses ".${tld}" names. ` +
+        `Pass the bare label (e.g. "${input.slice(0, -(wrongTld.length + 1))}") or the correct ".${tld}" suffix instead.`,
+      );
+    }
+    name = input;
+  }
   const parts = name.split(".");
   if (parts.length === 1) {
     const sanitized = validateDomainLabel(parts[0]);
-    return { isSubdomain: false, label: sanitized, sublabel: null, parentLabel: null, fullName: `${sanitized}.dot` };
+    return { isSubdomain: false, label: sanitized, sublabel: null, parentLabel: null, fullName: `${sanitized}.${tld}` };
   }
   if (parts.length === 2) {
-    // Sublabel is a user-defined subdomain leaf, not a DotNS-registered name —
-    // skip the Reserved check AND the digit sanitiser (setSubnodeOwner only
-    // requires isSingleLabel(); no digit limit on subnode leaves). Parent IS
-    // the registered name; apply full validation including sanitiser.
-    const sanitizedSub = validateDomainLabel(parts[0], { checkReserved: false, skipSanitize: true });
+    // Sublabel is a user-defined subdomain leaf, not a DotNS-registered name;
+    // parent IS the registered name. Both are now bare calls — validateDomainLabel
+    // no longer takes an options param (#1185): it never applied a digit-count
+    // or Reserved rule to a sublabel in the first place (those rules only ever
+    // gated the checkReserved/skipSanitize branches, both deleted), so dropping
+    // the options changes nothing for either side of a subdomain.
+    const sanitizedSub = validateDomainLabel(parts[0]);
     const sanitizedParent = validateDomainLabel(parts[1]);
     const fullLabel = `${sanitizedSub}.${sanitizedParent}`;
-    return { isSubdomain: true, label: fullLabel, sublabel: sanitizedSub, parentLabel: sanitizedParent, fullName: `${fullLabel}.dot` };
+    return { isSubdomain: true, label: fullLabel, sublabel: sanitizedSub, parentLabel: sanitizedParent, fullName: `${fullLabel}.${tld}` };
   }
   throw new Error(`Invalid domain: only one level of subdomains supported (got ${parts.length} labels)`);
 }
@@ -1085,6 +1673,37 @@ function parsePersonhoodStatusResult(result: unknown): number {
     ? ((result[0] as { status?: unknown } | null)?.status ?? result[0])
     : (result as { status?: unknown } | null)?.status;
   return normalizeProofOfPersonhoodStatus(status);
+}
+
+// Floor for a Revive.call dry-run's storage_deposit_limit when the dry-run's
+// own estimate is zero or thin. This is a *different* concept from
+// MINIMUM_REGISTER_STORAGE_DEPOSIT (line ~184 below): that one is the
+// env-configurable (this._registerStorageDeposit) floor for a fresh TLD
+// register() specifically. This one is a generic per-Revive.call floor used
+// by any dry-run, register included. They happen to share the same numeric
+// value today (2_000_000_000_000n / 200 PAS) — that's a coincidence of the
+// current chain's storage pricing, not a coupling. Keep them as separate
+// named constants so an env-specific register-deposit override can never
+// silently change this generic floor, or vice versa.
+const REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT = 2_000_000_000_000n;
+
+// Shared storage_deposit_limit buffer formula for Revive.call dry-runs: 20%
+// headroom over the dry-run's own storageDeposit estimate, floored at
+// REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT so a zero/thin estimate still gets a
+// workable limit. Both the single-call path (ReviveClientWrapper's
+// dryRunReviveCall, used by submitTransaction and submitBatchedTransactions)
+// and the batched contract-call path (DotNS.submitBatchedContractCalls, used
+// by subdomain registration) must go through this one function — duplicating
+// this arithmetic inline at a second call site is exactly how the two drift,
+// leaving one path with a stale buffer and a rejected or underfunded call.
+// Exported for unit tests.
+export function computeStorageDepositLimit(
+  estimatedStorageDeposit: bigint,
+  minimum: bigint = REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT,
+): bigint {
+  if (estimatedStorageDeposit === 0n) return minimum;
+  const buffered = (estimatedStorageDeposit * 120n) / 100n;
+  return buffered < minimum ? minimum : buffered;
 }
 
 export class ReviveClientWrapper {
@@ -1175,7 +1794,7 @@ export class ReviveClientWrapper {
     extrinsic: any,
     signer: PolkadotSigner,
     statusCallback: (status: string) => void,
-    opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas" } = {},
+    opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean } = {},
   ): Promise<TxResolution> {
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -1198,16 +1817,22 @@ export class ReviveClientWrapper {
       // verifies the on-chain effect and resolves without waiting for GRANDPA
       // finality — so a finality-lag window can't time out an already-landed write.
       let bestBlockIncluded = false;
+      // #194: phone/session signers wait out PHONE_APPROVAL_MS (the human
+      // approval budget) instead of TX_NO_PROGRESS_MS (the machine no-progress
+      // budget) — see the comments on those two constants. Same value today,
+      // but resolved independently so retuning one never silently retunes the
+      // other.
+      const silenceDeadlineMs = opts.isPhoneSigner === true ? PHONE_APPROVAL_MS : TX_NO_PROGRESS_MS;
       // Per-call read so tests / slow chains can override without a reimport.
       // Explicit empty/null check (not `|| default`) so "0" — engage immediately —
       // is honoured rather than falling back to the default. Clamped below
-      // TX_NO_PROGRESS_MS so the best-block branch always gets a poll tick before
+      // silenceDeadlineMs so the best-block branch always gets a poll tick before
       // the silence-rejection pre-empts it (an over-large override is otherwise a
       // footgun that disables best-block resolution entirely).
       const graceRawEnv = process.env.BULLETIN_DOTNS_BESTBLOCK_GRACE_MS;
       const bestBlockGraceMs = Math.min(
         graceRawEnv != null && graceRawEnv !== "" ? parseInt(graceRawEnv, 10) : DOTNS_BEST_BLOCK_GRACE_MS,
-        TX_NO_PROGRESS_MS - 5_000,
+        silenceDeadlineMs - 5_000,
       );
 
       const poll = async (): Promise<void> => {
@@ -1261,11 +1886,12 @@ export class ReviveClientWrapper {
             return;
           }
           const silentMs = Date.now() - lastEventAt;
-          if (silentMs > TX_NO_PROGRESS_MS) {
+          if (silentMs > silenceDeadlineMs) {
             statusCallback("failed");
             // No-event case (never reached "signed"/"broadcasted"): throw a typed
             // error so signAndSubmitWithRetry can detect it and apply phone-signer
-            // pause-and-resume instead of the default WS-stall retry.
+            // pause-and-resume (bounded re-arm, #194) instead of the default
+            // WS-stall retry/backoff loop.
             if (lastEventType === "(none)") {
               finish(reject)(new WatcherSilentNoEventError(silentMs));
             } else {
@@ -1316,7 +1942,7 @@ export class ReviveClientWrapper {
     });
   }
 
-  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: (attempt: number) => Promise<void> } = {}): Promise<TxResolution> {
+  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: PhoneOnResign; fetchNonce?: (rpcs: string[], ss58: string) => Promise<number>; sleep?: (ms: number) => Promise<void>; nonceContentionBackoffMs?: (attempt: number) => number } = {}): Promise<TxResolution> {
     const filter = makeRetryStatusFilter(statusCallback);
     let lastError: unknown;
     for (let attempt = 1; attempt <= DOTNS_TX_MAX_ATTEMPTS; attempt++) {
@@ -1338,12 +1964,39 @@ export class ReviveClientWrapper {
         // Phone-signer no-event fast-fail (#990): checked BEFORE the default
         // retry classification so it pre-empts retry/backoff entirely — a
         // silent watcher that never saw a prior event means the phone never
-        // approved, and retrying just pays another ~90s of silence for the
-        // same non-outcome.
+        // approved, and generic retry/backoff would just pay another ~90s of
+        // silence for the same non-outcome. This method throws immediately —
+        // it does NOT itself implement the #194 bounded re-arm. That lives one
+        // level up, in DotNS.contractTransaction, wrapping the withTimeout()
+        // call: the human wait plus up to PHONE_SILENCE_MAX_REARMS re-arms of
+        // PHONE_APPROVAL_MS machine silence each cannot fit inside a single
+        // OPERATION_TIMEOUT_MS (300s) — 4 attempts × 90s already exceeds it
+        // before any human think-time — so re-arming here would die to a
+        // generic "timed out after 300000ms" partway through instead of ever
+        // reaching the bound. contractTransaction re-invokes this whole method
+        // (fresh withTimeout, fresh attempt counter) per re-arm instead.
         const fastFail = classifyWatcherSilentFastFail(e, opts.isPhoneSigner);
         if (fastFail) {
           filter.flush();
           throw fastFail;
+        }
+
+        // #1158: the ambiguous nonce-advance-fallback case gets its own bounded
+        // re-acquisition loop (see reacquireNonceOnContention) instead of the
+        // generic attempt/backoff path below — checked before
+        // classifyTxRetryDecision so it pre-empts the general retry entirely.
+        if (opts.nonceFallback && isNonceContentionAmbiguous(e)) {
+          try {
+            return await reacquireNonceOnContention(
+              () => this.signAndSubmitExtrinsic(buildExtrinsic(), signer, filter.callback, opts),
+              opts.nonceFallback,
+              label,
+              { fetchNonce: opts.fetchNonce, sleep: opts.sleep, backoffMs: opts.nonceContentionBackoffMs },
+            );
+          } catch (contentionErr: any) {
+            filter.flush();
+            throw contentionErr;
+          }
         }
 
         const decision = classifyTxRetryDecision(e);
@@ -1392,9 +2045,7 @@ export class ReviveClientWrapper {
       });
       throw new ContractDryRunRevertError(msg, (gasEstimate.revertData ?? "0x") as `0x${string}`, gasEstimate.revertFlags ?? 0n);
     }
-    const minimumStorageDeposit = 2_000_000_000_000n;
-    let storageDepositLimit = gasEstimate.storageDeposit === 0n ? minimumStorageDeposit : (gasEstimate.storageDeposit * 120n) / 100n;
-    if (storageDepositLimit < minimumStorageDeposit) storageDepositLimit = minimumStorageDeposit;
+    const storageDepositLimit = computeStorageDepositLimit(gasEstimate.storageDeposit);
     return {
       weight_limit: { ref_time: gasEstimate.gasRequired.referenceTime, proof_size: gasEstimate.gasRequired.proofSize },
       storage_deposit_limit: storageDepositLimit,
@@ -1653,9 +2304,10 @@ export function formatPopShortfallReason(opts: {
   popSelfServe: PopSelfServeConfig | null;
   aliasState: AliasAccountClassification | null;
   exampleNoStatusLabel: string;
+  tld?: string;
 }): string {
-  const { label, requiredName, currentName, isTestnet, environmentId, popSelfServe, aliasState, exampleNoStatusLabel: noStatusEx } = opts;
-  const leadIn = `${label}.dot requires ${requiredName}, but this signer is ${currentName}.`;
+  const { label, requiredName, currentName, isTestnet, environmentId, popSelfServe, aliasState, exampleNoStatusLabel: noStatusEx, tld = DEFAULT_TLD } = opts;
+  const leadIn = `${label}.${tld} requires ${requiredName}, but this signer is ${currentName}.`;
 
   let testnetBlock = "";
   if (isTestnet && popSelfServe != null) {
@@ -1698,13 +2350,27 @@ export class DotNS {
   /** True only when the signer is a real phone/session signer that needs `_awaitPhoneReady`. */
   private _isPhoneSigner = false;
   private _localMnemonic: string | null = null;
-  private _contracts: typeof CONTRACTS & { PUBLISHER?: string } = CONTRACTS;
+  private _contracts: typeof CONTRACTS & { PUBLISHER?: string; DOTNS_PROTOCOL_REGISTRY?: string } = CONTRACTS;
   private _nativeToEthRatio: bigint = NATIVE_TO_ETH_RATIO;
   private _environmentId: string | null = null;
   private _popSelfServe: PopSelfServeConfig | null = null;
   private _registerStorageDeposit: bigint = MINIMUM_REGISTER_STORAGE_DEPOSIT;
+  private _tld: string = DEFAULT_TLD;
+  // Defaults to v1 so every existing test/library caller that constructs a
+  // DotNS instance and stubs its chain-accessing methods WITHOUT ever calling
+  // connect() keeps today's exact v1 behaviour (call order, ABI shape,
+  // deposit-gate function) — connect()'s live probe overwrites both fields
+  // once it runs. Never left unset/throwing: that would break every such
+  // caller, which is most of the existing unit suite.
+  // Production can never reach a register with an unprobed adapter: connect()
+  // always runs detectProtocolVersion(), and every register-path method calls
+  // ensureConnected() first. That is what makes a default safe here rather
+  // than the silent-fallback hazard it would otherwise be — do not "simplify"
+  // this into a throw-if-unset without re-checking both of those.
+  private _protocolVersion: DotnsProtocolVersion = "v1";
+  private _adapter: DotnsProtocolAdapter = getAdapter("v1");
   private _onPhoneSigningRequired: ((label: string) => void) | undefined = undefined;
-  private _confirmPhoneReady: ((ctx: { label: string; attempt: number; total: number }) => Promise<void>) | undefined = undefined;
+  private _confirmPhoneReady: ((ctx: { label: string; attempt: number; total: number; approvalBudgetMs: number; reason?: "resign" | "silence" }) => Promise<void>) | undefined = undefined;
   /** Total phone-signature count for this DotNS session (drives the `total` field passed to confirmPhoneReady). */
   private _phoneSignatureTotal = 0;
   /** Running attempt counter per label for re-sign detection. Reset at connect/disconnect. */
@@ -1738,6 +2404,82 @@ export class DotNS {
   constructor() { this.client = null; this.clientWrapper = null; this.rpc = null; this.substrateAddress = null; this.evmAddress = null; this.signer = null; this.connected = false; this.assetHubEndpoints = RPC_ENDPOINTS; }
 
   /**
+   * The authoritative, post-connect resolved TLD: `options.tld` when the env
+   * configured one, otherwise whatever `connect()` read from
+   * `DotnsProtocolRegistry.tld()` (or `DEFAULT_TLD` if that read completed
+   * but was unusable — see resolveTldFromRegistryResult). Callers that need
+   * to reflect the REAL on-chain TLD in display strings after connect() —
+   * rather than a possibly-wrong pre-connect default — should read this
+   * getter instead of re-deriving their own value.
+   */
+  get tld(): string { return this._tld; }
+
+  /** The DotNS protocol generation detected by connect()'s live probe (readonly; for telemetry and tests). Defaults to "v1" before connect() runs — see the field's own comment. */
+  get protocolVersion(): DotnsProtocolVersion { return this._protocolVersion; }
+
+  /** Test-only: bypass connect()'s live probe and pin the adapter directly, for unit tests that stub chain calls without going through connect(). */
+  __setProtocolVersionForTest(version: DotnsProtocolVersion): void {
+    this._protocolVersion = version;
+    this._adapter = getAdapter(version);
+  }
+
+  /**
+   * Module-scope memoization for the tldNode() consistency check (#218 perf
+   * fix): once `checkTldNodeConsistency` has completed — verified match, or
+   * `{ok:false}` (pre-#218 registry / none configured) — for a given
+   * (registryAddress, tld) pair, every later connect() against that same
+   * pair in this process skips the `tldNode()` dry-run round trip entirely.
+   * A single deploy() can construct several DotNS instances against the SAME
+   * registry, and this invariant never changes once true, so re-verifying it
+   * over the network on every connect is pure waste on an RPC already known
+   * to be timeout-prone under load.
+   *
+   * Deliberately a Set, not a cache of "did it throw" — a THROW (RPC
+   * timeout/WS drop) must NEVER be memoized here: it has to propagate AND be
+   * retried in full on the very next connect(), never silently treated as
+   * "already checked". Only `.add()` calls sit after a completed dry run;
+   * nothing on a throw path can reach one.
+   */
+  private static readonly _tldNodeVerifiedCache = new Set<string>();
+
+  /** Test-only: clear the tldNode-consistency memoization cache so cases from one test don't leak into the next. */
+  static __resetTldNodeCacheForTest(): void {
+    DotNS._tldNodeVerifiedCache.clear();
+  }
+
+  /**
+   * Resolves `this._tld` from `options.tld` (if configured) or from the
+   * on-chain `tld()` read, then verifies the `tldNode()` consistency
+   * invariant for that (registry, tld) pair — skipping the invariant check
+   * entirely when already memoized (see `_tldNodeVerifiedCache` above).
+   *
+   * Deliberately sequential, NOT `Promise.all`, even when `configuredTld` is
+   * undefined and both reads are in play: the tldNode() cache is keyed on
+   * the RESOLVED tld, so its key isn't knowable until the tld() read
+   * completes — there is no way to consult the cache before that. Firing
+   * both concurrently would guarantee the tldNode() round trip happens on
+   * EVERY connect, permanently forfeiting the one saving this cache exists
+   * for. Round-trip COUNT matters more here than wall-clock latency (the
+   * whole motivation is an RPC already known to be timeout-prone under
+   * load), so: await tld() first, THEN decide — on a cache hit, the
+   * tldNode() round trip is skipped entirely.
+   */
+  private async resolveAndVerifyTld(configuredTld: string | undefined): Promise<void> {
+    const registryAddress = this._contracts.DOTNS_PROTOCOL_REGISTRY;
+    if (configuredTld !== undefined) {
+      this._tld = configuredTld;
+    } else {
+      const tldResult = await this.dryRunRegistryString("tld");
+      this._tld = resolveTldFromRegistryResult(tldResult);
+    }
+    const cacheKey = registryAddress ? `${registryAddress.toLowerCase()}|${this._tld}` : null;
+    if (cacheKey && DotNS._tldNodeVerifiedCache.has(cacheKey)) return;
+    const tldNodeResult = await this.dryRunRegistryString("tldNode");
+    checkTldNodeConsistency(this._tld, tldNodeResult);
+    if (cacheKey) DotNS._tldNodeVerifiedCache.add(cacheKey);
+  }
+
+  /**
    * Tear down the current papi client (if any) and stand up a fresh WS
    * connection + ReviveClientWrapper against `endpoint`. Escapes a
    * wedged/slow/stale connection — used by connect()'s ReviveApi.address
@@ -1759,7 +2501,7 @@ export class DotNS {
       // Validate early — before any chain calls — so a stale environments.json
       // surfaces a clear error rather than a confusing RPC revert.
       validateContractAddresses(options.contracts, options.environmentId ?? "unknown");
-      this._contracts = { ...CONTRACTS, ...options.contracts } as typeof CONTRACTS & { PUBLISHER?: string };
+      this._contracts = { ...CONTRACTS, ...options.contracts } as typeof CONTRACTS & { PUBLISHER?: string; DOTNS_PROTOCOL_REGISTRY?: string };
     }
     if (options.environmentId) {
       this._environmentId = options.environmentId;
@@ -1769,6 +2511,9 @@ export class DotNS {
     }
     if (options.registerStorageDeposit !== undefined) {
       this._registerStorageDeposit = options.registerStorageDeposit;
+    }
+    if (options.tld !== undefined) {
+      this._tld = options.tld;
     }
     if (options.onPhoneSigningRequired !== undefined) {
       this._onPhoneSigningRequired = options.onPhoneSigningRequired;
@@ -1851,6 +2596,28 @@ export class DotNS {
       setDeployAttribute("deploy.dotns.rpc_used", rpc);
       setDeployAttribute("deploy.dotns.evm_address", this.evmAddress!);
       this.connected = true;
+
+      // dotns PR #218 TLD resolution + tldNode consistency (completes-vs-throws
+      // rationale: see dryRunRegistryString's doc comment above). Memoization
+      // of the tldNode round trip: see resolveAndVerifyTld.
+      await this.resolveAndVerifyTld(options.tld);
+
+      // 2026-09-01 drift: detect the live DotNS protocol generation BEFORE
+      // any DotNS operation — never trust configured addresses (CREATE3 keeps
+      // them identical across generations, which is exactly why the address
+      // drift guardrail never caught this). See detectProtocolVersion's doc
+      // comment for the three-valued classification this relies on.
+      await this.detectProtocolVersion();
+      // Optional pin (e.g. environments.json's per-env `dotnsProtocol`):
+      // ASSERTED against the live probe, never obeyed over it. A pin that
+      // silently overrode the probe would recreate exactly the failure this
+      // detection exists to prevent.
+      if (options.dotnsProtocol && options.dotnsProtocol !== this._protocolVersion) {
+        this.connected = false;
+        throw new Error(
+          `DotNS protocol mismatch on ${this._environmentId ?? "unknown"}: environments.json pins dotnsProtocol="${options.dotnsProtocol}" but the live probe detected "${this._protocolVersion}". The pin and the chain disagree — update the pin or investigate why the chain doesn't match it.`,
+        );
+      }
 
       // Ensure the account is mapped before any dry-run that requires a mapped
       // origin. Auto-map chains may reject explicit map_account; fall back to
@@ -2174,6 +2941,105 @@ export class DotNS {
     });
   }
 
+  /**
+   * Low-level dry-run read against DotnsProtocolRegistry (tld() / tldNode()).
+   * Deliberately does NOT reuse contractCall/contractCallNullable: both of
+   * those throw on a revert or on empty data, which would make "contract
+   * doesn't support this function yet" indistinguishable from "the RPC call
+   * itself never completed" — exactly the distinction resolution step 3
+   * depends on. Here:
+   *   - no DOTNS_PROTOCOL_REGISTRY address configured → { ok: false }
+   *     (nothing to call; treated the same as "not supported").
+   *   - the dry run COMPLETES (chain replied) but reverts, or returns empty
+   *     `0x` → { ok: false } (pre-#218 deployment).
+   *   - `performDryRunCall` itself THROWS (RPC timeout, WS drop, connection
+   *     error) → NOT caught here; propagates to the caller. Collapsing that
+   *     into { ok: false } would make a network blip indistinguishable from
+   *     "pre-#218", silently defaulting to the wrong TLD on a live env with
+   *     no revert and no error — the worst failure mode in this whole change.
+   */
+  private async dryRunRegistryString(functionName: "tld" | "tldNode"): Promise<RegistryDryRunResult<string>> {
+    this.ensureConnected();
+    if (!this.clientWrapper) throw new Error(`DotNS registry read (${functionName}): polkadot-api client not available`);
+    const registryAddress = this._contracts.DOTNS_PROTOCOL_REGISTRY;
+    if (!registryAddress) return { ok: false };
+    const encodedCallData = encodeFunctionData({ abi: DOTNS_PROTOCOL_REGISTRY_ABI, functionName, args: [] });
+    const callResult = await this.clientWrapper.performDryRunCall(this.substrateAddress!, registryAddress, 0n, encodedCallData);
+    if (!callResult.result.isOk) return { ok: false };
+    const rawData: string = callResult.result.value.data ?? "0x";
+    if (rawData.length <= 2) return { ok: false };
+    const value = decodeFunctionResult({ abi: DOTNS_PROTOCOL_REGISTRY_ABI, functionName, data: rawData as `0x${string}` }) as string;
+    return { ok: true, value };
+  }
+
+  /**
+   * Low-level "did this view function answer" probe, used by the DotNS
+   * protocol-version detection below. Same non-throwing-on-revert posture as
+   * dryRunRegistryString and for the same reason: "the function doesn't
+   * exist on this generation" (a revert or empty data) must be
+   * distinguishable from "the RPC call itself never completed" (a THROW,
+   * which propagates here — a network blip must never be silently read as
+   * "this probe says no").
+   */
+  private async probeViewFunctionOk(contractAddress: string, abi: readonly any[], functionName: string, args: unknown[] = []): Promise<boolean> {
+    this.ensureConnected();
+    if (!this.clientWrapper) throw new Error(`DotNS protocol probe (${functionName}): polkadot-api client not available`);
+    const encodedCallData = encodeFunctionData({ abi, functionName, args });
+    const callResult = await this.clientWrapper.performDryRunCall(this.substrateAddress!, contractAddress, 0n, encodedCallData);
+    if (!callResult.result.isOk) return false;
+    const rawData: string = callResult.result.value.data ?? "0x";
+    return rawData.length > 2;
+  }
+
+  /**
+   * Detect the live DotNS protocol generation by probing POP_RULES — never by
+   * trusting configured addresses, since CREATE3 keeps them identical across
+   * generations (the exact reason the 2026-09-01 outage went unflagged by the
+   * address-drift guardrail). Dry-run read only: no transactions, no state
+   * writes. Caches nothing itself — connect() calls this once per instance
+   * and stores the result on _protocolVersion/_adapter.
+   *
+   * All classification — including the three-valued handling of
+   * hasContractCode's own true/false/null result (see its doc comment: null
+   * means the runtime doesn't expose the storage map, or the query itself
+   * threw, and callers must not treat it as "no code") — lives in
+   * classifyProtocolVersion. This method's only job is to gather the three
+   * live inputs and pass them through unflattened; see that function's doc
+   * comment for the full reasoning, including paritytech/bulletin-deploy#1349
+   * (the bug that motivated moving the null-handling here rather than
+   * checking hasCodeResult at this call site).
+   */
+  private async detectProtocolVersion(): Promise<void> {
+    this.ensureConnected();
+    const popRulesAddress = this._contracts.POP_RULES;
+    const env = this._environmentId ?? "unknown";
+    // All three reads go in one Promise.all: there is no data dependency
+    // between them, because "no code" is only ever concluded from
+    // hasCodeResult === false (in the classifier) and never from a silent
+    // probe. Awaiting the code-presence read first would cost connect() an
+    // extra RTT layer on every deploy for nothing.
+    const [hasCodeResult, pricingVersionOk, startingPriceOk] = await Promise.all([
+      this.clientWrapper!.hasContractCode(popRulesAddress),
+      this.probeViewFunctionOk(popRulesAddress, getAdapter("v2").popRulesAbi, "pricingVersion", []),
+      this.probeViewFunctionOk(popRulesAddress, getAdapter("v1").popRulesAbi, "startingPrice", []),
+    ]);
+    const classification = classifyProtocolVersion({ hasCode: hasCodeResult, pricingVersionOk, startingPriceOk });
+    if (classification.version === null) {
+      // Always name env + the POP_RULES address here: not every caller passes
+      // an environmentId (secondary DotNS instances connect without one and
+      // log env as "unknown"), and the address is what actually identifies
+      // which deployment failed to classify. The reason text itself —
+      // including which case it is and any code-presence caveat — comes
+      // entirely from classifyProtocolVersion.
+      throw new Error(`${env} (POP_RULES ${popRulesAddress}): ${classification.reason}`);
+    }
+    const version = classification.version;
+    this._protocolVersion = version;
+    this._adapter = getAdapter(version);
+    setDeployAttribute("deploy.dotns.protocol_version", version);
+    console.log(`   DotNS protocol ${version} detected on ${env}`);
+  }
+
   async contractCall(contractAddress: string, contractAbi: readonly any[], functionName: string, args: any[] = []): Promise<any> {
     this.ensureConnected();
     if (!this.clientWrapper) throw new Error("contractCall: polkadot-api client not available");
@@ -2284,8 +3150,12 @@ export class DotNS {
     if (phoneLabel !== undefined) {
       await this._awaitPhoneReady(phoneLabel);
     }
-    return await withTimeout(
-      this.clientWrapper.submitTransaction(contractAddress, value, encodedCallData, this.substrateAddress!, this.signer!, statusCallback, {
+    // #194: each submission attempt (the initial one, and any re-arm below)
+    // gets its OWN fresh OPERATION_TIMEOUT_MS budget — see the re-arm loop
+    // below for why this must be a per-attempt timeout, not one shared across
+    // re-arms.
+    const submitOnce = (): Promise<TxResolution> => withTimeout(
+      this.clientWrapper!.submitTransaction(contractAddress, value, encodedCallData, this.substrateAddress!, this.signer!, statusCallback, {
         rpcs, useNoncePolling, functionName, args, contracts: this._contracts, verifyEffect, feeAsset,
         // Re-gate phone-signer retries (#39): a verifyEffect false-negative
         // makes signAndSubmitWithRetry re-sign; for a phone signer that needs
@@ -2293,17 +3163,56 @@ export class DotNS {
         // your phone / Press Y") before re-signing. Both _awaitPhoneReady and the
         // retry-loop guard no-op for non-phone signers (local/dev workers).
         isPhoneSigner: this._isPhoneSigner,
-        onResign: phoneLabel !== undefined ? () => this._awaitPhoneReady(phoneLabel) : undefined,
+        // #194: thread the re-arm `reason` (undefined/"resign" for the #39
+        // verifyEffect-false-negative case, "silence" for the watcher-silence
+        // re-arm below) through to _awaitPhoneReady so confirmPhoneReady's
+        // consumer can render the right prompt for each case.
+        onResign: phoneLabel !== undefined ? (_attempt: number, reason?: "resign" | "silence") => this._awaitPhoneReady(phoneLabel, reason) : undefined,
       }),
       OPERATION_TIMEOUT_MS,
       functionName,
     );
+
+    // Non-phone signers (transfer-mode local workers, mnemonic signers) are
+    // entirely unaffected: classifyWatcherSilentFastFail already returns null
+    // when isPhoneSigner !== true, so submitOnce() can never reject with
+    // PhoneSilenceNonRetryableError on this path — this early return is just
+    // the pre-#194 call shape, unchanged.
+    if (phoneLabel === undefined || !this._isPhoneSigner) return await submitOnce();
+
+    // #194: bounded resumable re-arm for a phone signer's watcher-silence.
+    // Deliberately done HERE — wrapping withTimeout, one level above
+    // signAndSubmitWithRetry — rather than inside that method's retry loop,
+    // because the human wait plus PHONE_APPROVAL_MS of machine silence,
+    // repeated up to PHONE_SILENCE_MAX_REARMS times, cannot fit inside a
+    // single OPERATION_TIMEOUT_MS (300s): 1 initial + 3 re-arms = 4 attempts
+    // × 90s of machine silence alone is 360s, before any human think-time.
+    // Re-arming inside signAndSubmitWithRetry would die to a generic "timed
+    // out after 300000ms" partway through the sequence instead of ever
+    // reaching the bound — defeating the whole point of #194. Each re-armed
+    // submitOnce() call above gets its own fresh OPERATION_TIMEOUT_MS budget,
+    // and the human wait sits outside it — the same #969 split-timeout
+    // posture as the initial gate above.
+    const maxAttempts = 1 + PHONE_SILENCE_MAX_REARMS;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await submitOnce();
+      } catch (e: any) {
+        // Anything other than the exact phone-silence classification (a
+        // dispatch error, a real WS blip, the human declining) is not this
+        // loop's concern to reclassify — propagate immediately, no re-arm.
+        if (!(e instanceof PhoneSilenceNonRetryableError) || attempt === maxAttempts) throw e;
+        await this._awaitPhoneReady(phoneLabel, "silence");
+      }
+    }
+    // Unreachable: the loop above always returns or throws by attempt === maxAttempts.
+    throw new Error("contractTransaction: unreachable — phone-silence re-arm loop exited without resolving");
   }
 
   async checkOwnership(label: string, ownerAddress: string | null = null): Promise<OwnershipResult> {
     this.ensureConnected();
     const checkAddress = (ownerAddress || this.evmAddress!).toLowerCase();
-    const tokenId = computeDomainTokenId(label);
+    const tokenId = computeDomainTokenId(label, this._tld);
     try {
       const owner = await withTimeout(this.contractCallNullable(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_ABI, "ownerOf", [tokenId]), 30000, "ownerOf");
       if (owner === null) return { owned: false, owner: null };
@@ -2334,14 +3243,15 @@ export class DotNS {
   ): Promise<{ status: "ok" | "skipped-already-owned"; txHash?: string; feeWei?: bigint }> {
     this.ensureConnected();
     const validated = validateDomainLabel(label);
-    const tokenId = computeDomainTokenId(validated);
+    assertNotZeroRecipient(toH160, `${validated}.${this._tld}`);
+    const tokenId = computeDomainTokenId(validated, this._tld);
     const owner = (await withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_TRANSFER_ABI, "ownerOf", [tokenId]), 30000, "ownerOf")) as string;
     if (owner.toLowerCase() === toH160.toLowerCase()) {
       statusCallback("already owned by recipient");
       return { status: "skipped-already-owned" };
     }
     if (owner.toLowerCase() !== this.evmAddress!.toLowerCase()) {
-      throw new Error(`Cannot transfer ${validated}.dot: it is owned by ${owner}, not the worker ${this.evmAddress}.`);
+      throw new Error(`Cannot transfer ${validated}.${this._tld}: it is owned by ${owner}, not the worker ${this.evmAddress}.`);
     }
     const { feeWei, feeNative } = await this.quoteTransferFloorNative(validated, this.evmAddress!, toH160);
     const txRes = await this.contractTransaction(
@@ -2350,9 +3260,83 @@ export class DotNS {
     );
     const after = (await withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_TRANSFER_ABI, "ownerOf", [tokenId]), 30000, "ownerOf")) as string;
     if (after.toLowerCase() !== toH160.toLowerCase()) {
-      throw new Error(`Transfer of ${validated}.dot did not land: owner is ${after}, expected ${toH160}.`);
+      throw new Error(`Transfer of ${validated}.${this._tld} did not land: owner is ${after}, expected ${toH160}.`);
     }
     return { status: "ok", txHash: txRes.kind === TX_KIND_HASH ? txRes.hash : undefined, feeWei };
+  }
+
+  /** Reassign an existing subname (e.g. `app.foo.<tld>`) to `toH160`.
+   *
+   *  Subnames are NOT ERC-721 tokens, so they cannot go through
+   *  transferName/transferFrom — the registrar has no token for them. Instead
+   *  the *parent-domain* owner reassigns a subname via the registry's
+   *  setSubnodeOwner (the same call deploy uses to create it). Authorisation is
+   *  on parent ownership, not on the subname's current owner, so the connected
+   *  signer must own `${parentLabel}.${this._tld}`. Idempotent: a no-op when
+   *  the recipient already owns it.
+   *
+   *  #paseo-tld follow-up: this method was added (PR #151) AFTER bulletin's
+   *  #1240 per-env-TLD port ran, so it hardcoded `.dot` in three places —
+   *  exactly the derivation-site bug class #1240/#1244 fixed elsewhere in this
+   *  file (see computeDomainTokenId's doc comment). Fixed here the same way:
+   *  derive every node from `this._tld`, resolved by connect(), not a literal. */
+  async transferSubname(
+    sublabel: string,
+    parentLabel: string,
+    toH160: string,
+    statusCallback: (status: string) => void = () => {},
+  ): Promise<{ status: "ok" | "skipped-already-owned"; txHash?: string }> {
+    this.ensureConnected();
+    const fullName = `${sublabel}.${parentLabel}.${this._tld}`;
+    assertNotZeroRecipient(toH160, fullName);
+    const parentNode = namehash(`${parentLabel}.${this._tld}`);
+    const subnode = namehash(fullName);
+
+    // Only the parent owner may reassign a subname. Check parent ownership up
+    // front so the failure is actionable rather than a bare registry revert.
+    const parentOwner = (await withTimeout(
+      this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "owner", [parentNode]),
+      30000, "owner",
+    )) as string | null;
+    if (!parentOwner || parentOwner === zeroAddress) {
+      throw new Error(`Cannot transfer ${fullName}: parent ${parentLabel}.${this._tld} is not registered.`);
+    }
+    if (parentOwner.toLowerCase() !== this.evmAddress!.toLowerCase()) {
+      throw new Error(
+        `Cannot transfer ${fullName}: it is a subname, which only the owner of the parent ` +
+        `${parentLabel}.${this._tld} can reassign (subnames are not transferable tokens). Parent is owned ` +
+        `by ${parentOwner}, but the signer is ${this.evmAddress}. Sign as the parent owner ` +
+        `(e.g. pass its --mnemonic).`,
+      );
+    }
+
+    const current = (await withTimeout(
+      this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "owner", [subnode]),
+      30000, "owner",
+    )) as string | null;
+    if (current && current.toLowerCase() === toH160.toLowerCase()) {
+      statusCallback("already owned by recipient");
+      return { status: "skipped-already-owned" };
+    }
+
+    // setSubnodeOwner overwrites the subnode owner. We deliberately do NOT batch
+    // setResolver (as registerSubdomain does for a fresh node): once ownership
+    // moves to a third party the signer is no longer the subnode owner, so a
+    // trailing setResolver would revert. The recipient sets the resolver/content
+    // on their next deploy.
+    const subnodeRecord = { parentNode, subLabel: sublabel, parentLabel, owner: toH160 };
+    const txRes = await this.contractTransaction(
+      this._contracts.DOTNS_REGISTRY, 0n, DOTNS_REGISTRY_ABI, "setSubnodeOwner",
+      [subnodeRecord], statusCallback,
+    );
+    const after = (await withTimeout(
+      this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "owner", [subnode]),
+      30000, "owner",
+    )) as string | null;
+    if (!after || after.toLowerCase() !== toH160.toLowerCase()) {
+      throw new Error(`Transfer of ${fullName} did not land: owner is ${after ?? "unset"}, expected ${toH160}.`);
+    }
+    return { status: "ok", txHash: txRes.kind === TX_KIND_HASH ? txRes.hash : undefined };
   }
 
   async getUserPopStatus(ownerAddress: string | null = null): Promise<number> {
@@ -2384,7 +3368,7 @@ export class DotNS {
     // contractCall on DOTNS_REGISTRY.owner(node). This is only needed for
     // subdomain deploys which are a minority path.
     if (!this.clientWrapper) return { owned: false, owner: null };
-    const node = namehash(`${sublabel}.${parentLabel}.dot`);
+    const node = namehash(`${sublabel}.${parentLabel}.${this._tld}`);
     try {
       const owner = await withTimeout(this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "owner", [node]), 30000, "owner");
       if (!owner || owner === zeroAddress) return { owned: false, owner: null };
@@ -2394,11 +3378,11 @@ export class DotNS {
   }
 
   async registerSubdomain(sublabel: string, parentLabel: string): Promise<{ sublabel: string; parentLabel: string; owner: string }> {
-    return withSpan("deploy.dotns.register-subdomain", `2a. register ${sublabel}.${parentLabel}.dot`, {}, async () => {
+    return withSpan("deploy.dotns.register-subdomain", `2a. register ${sublabel}.${parentLabel}.${this._tld}`, {}, async () => {
       this.ensureConnected();
-      console.log(`\n   Registering subdomain ${sublabel}.${parentLabel}.dot...`);
-      const parentNode = namehash(`${parentLabel}.dot`);
-      const subnodeNode = namehash(`${sublabel}.${parentLabel}.dot`);
+      console.log(`\n   Registering subdomain ${sublabel}.${parentLabel}.${this._tld}...`);
+      const parentNode = namehash(`${parentLabel}.${this._tld}`);
+      const subnodeNode = namehash(`${sublabel}.${parentLabel}.${this._tld}`);
       const subnodeRecord = { parentNode, subLabel: sublabel, parentLabel, owner: this.evmAddress! };
 
       // verifyEffect: mirrors setContenthash/setTextRecord. Guards the nonce-advance
@@ -2448,7 +3432,7 @@ export class DotNS {
           { contractAddress: this._contracts.DOTNS_REGISTRY, abi: DOTNS_REGISTRY_ABI, functionName: "setResolver", args: [subnodeNode, this._contracts.DOTNS_CONTENT_RESOLVER] },
         ],
         (s: string) => console.log(`      ${s}`),
-        `Utility.batch_all (register ${sublabel}.${parentLabel}.dot)`,
+        `Utility.batch_all (register ${sublabel}.${parentLabel}.${this._tld})`,
         { verifyEffect },
       );
       logTxResolution(txResolution);
@@ -2521,11 +3505,12 @@ export class DotNS {
       proof_size: headEstimate.gasRequired.proofSize,
       ref_time: headEstimate.gasRequired.referenceTime,
     };
-    const minimumStorageDeposit = 2_000_000_000_000n;
-    let storage_deposit_limit = headEstimate.storageDeposit === 0n
-      ? minimumStorageDeposit
-      : (headEstimate.storageDeposit * 120n) / 100n;
-    if (storage_deposit_limit < minimumStorageDeposit) storage_deposit_limit = minimumStorageDeposit;
+    // Route through the same computeStorageDepositLimit() helper
+    // ReviveClientWrapper.dryRunReviveCall uses, instead of recomputing the
+    // 20%-buffer-floored-at-minimum formula inline — the two had drifted
+    // into separate copies of the same arithmetic (issue: storage_deposit_limit
+    // buffer formula duplicated past its own helper).
+    const storage_deposit_limit = computeStorageDepositLimit(headEstimate.storageDeposit);
 
     const client = this.clientWrapper.client;
     const buildBatch = () => {
@@ -2570,7 +3555,7 @@ export class DotNS {
       // one extra read per publish, and a write only when the name is wrong.
       await this.ensureContentResolver(domainName);
 
-      const node = namehash(`${domainName}.dot`);
+      const node = namehash(`${domainName}.${this._tld}`);
       // Decode the contenthash hex to the IPFS CID string the CLI expects.
       let ipfsCid: string | null = null;
       if (contenthashHex && contenthashHex !== "0x") {
@@ -2676,7 +3661,7 @@ export class DotNS {
       } catch { /* keep last finalOnChain for the error message below */ }
       if (finalOnChain !== expected) {
         throw new Error(
-          `Post-deploy verification failed for ${domainName}.dot: on-chain contenthash is ${finalOnChain}, ` +
+          `Post-deploy verification failed for ${domainName}.${this._tld}: on-chain contenthash is ${finalOnChain}, ` +
           `not the ${expected} we just wrote (after ${CONTENTHASH_VERIFY_ATTEMPTS} read attempts). ` +
           `The setContenthash tx may have silently failed, or another party overwrote the domain. ` +
           `Re-run the deploy to retry.`,
@@ -2713,7 +3698,7 @@ export class DotNS {
    */
   async ensureContentResolver(domainName: string): Promise<{ changed: boolean }> {
     this.ensureConnected();
-    const node = namehash(`${domainName}.dot`);
+    const node = namehash(`${domainName}.${this._tld}`);
     const target = this._contracts.DOTNS_CONTENT_RESOLVER;
     let current: unknown = null;
     try {
@@ -2728,7 +3713,7 @@ export class DotNS {
     if (typeof current === "string" && current.toLowerCase() === target.toLowerCase()) {
       return { changed: false };
     }
-    console.log(`   Redirecting resolver for ${domainName}.dot to content resolver ${target}…`);
+    console.log(`   Redirecting resolver for ${domainName}.${this._tld} to content resolver ${target}…`);
     // #1108: verifyEffect lets the write resolve on best-block inclusion (not
     // just GRANDPA finality) — reuses the SAME proven resolver(node) read this
     // method already does for its pre-check, so it carries no new false-positive
@@ -2747,7 +3732,7 @@ export class DotNS {
   /** Read a text record off `DOTNS_CONTENT_RESOLVER`. Returns `""` when unset. */
   async getTextRecord(domainName: string, key: string): Promise<string> {
     this.ensureConnected();
-    const node = namehash(`${domainName}.dot`);
+    const node = namehash(`${domainName}.${this._tld}`);
     // #1060: an unset key legitimately returns empty `0x` — contractCallNullable
     // (not the throwing contractCall) so this keeps the "" contract the doc above
     // promises instead of throwing.
@@ -2768,7 +3753,22 @@ export class DotNS {
     return withSpan("deploy.dotns.set-text", `2c. set-text ${key}`, {}, async () => {
       this.ensureConnected();
       console.log(`   Setting text[${key}]: ${value}`);
-      const node = namehash(`${domainName}.dot`);
+      const node = namehash(`${domainName}.${this._tld}`);
+
+      // Pre-check: skip the tx if already set to the same value (mirrors
+      // setContenthash's pre-check above). Reuses getTextRecord, which
+      // already returns "" for an unset key.
+      try {
+        const current = await this.getTextRecord(domainName, key);
+        if (shouldSkipTextWrite(current, value)) {
+          console.log(`   text[${key}] already set — skipping tx`);
+          setDeployAttribute("deploy.dotns.text_unchanged", "true");
+          return { value, txHash: TX_KIND_SKIPPED };
+        }
+      } catch (_) {
+        // Read failure — proceed with the normal set path.
+      }
+      setDeployAttribute("deploy.dotns.text_unchanged", "false");
 
       // verifyEffect: mirrors setContenthash — used by submitTransaction's
       // nonce-advance fallback path so a nonce consumed by a concurrent writer
@@ -2834,7 +3834,7 @@ export class DotNS {
       }
       if (onChainValue !== value) {
         throw new Error(
-          `Post-set verification failed for text[${key}] on ${domainName}.dot: on-chain value is ${JSON.stringify(onChainValue)}, not ${JSON.stringify(value)} we just wrote. The setText tx may have silently failed, or another writer overwrote the record.`,
+          `Post-set verification failed for text[${key}] on ${domainName}.${this._tld}: on-chain value is ${JSON.stringify(onChainValue)}, not ${JSON.stringify(value)} we just wrote. The setText tx may have silently failed, or another writer overwrote the record.`,
         );
       }
       console.log(`   Verified text[${key}]: ${onChainValue}\n`);
@@ -2856,7 +3856,7 @@ export class DotNS {
     }
     return withSpan("deploy.dotns.set-text-batch", `2c. set-text batch (${entries.length})`, {}, async () => {
       this.ensureConnected();
-      const node = namehash(`${domainName}.dot`);
+      const node = namehash(`${domainName}.${this._tld}`);
       const calls = entries.map((e) => {
         console.log(`   Setting text[${e.key}]: ${e.value}`);
         return {
@@ -2903,7 +3903,7 @@ export class DotNS {
       for (const v of lastResults) {
         if (v.onChain !== v.expected) {
           throw new Error(
-            `Post-set verification failed for text[${v.key}] on ${domainName}.dot: on-chain value is ${JSON.stringify(v.onChain)}, not ${JSON.stringify(v.expected)} we just wrote. The batched setText tx may have silently failed, or another writer overwrote the record.`,
+            `Post-set verification failed for text[${v.key}] on ${domainName}.${this._tld}: on-chain value is ${JSON.stringify(v.onChain)}, not ${JSON.stringify(v.expected)} we just wrote. The batched setText tx may have silently failed, or another writer overwrote the record.`,
           );
         }
         console.log(`   Verified text[${v.key}]: ${v.onChain}`);
@@ -2918,7 +3918,7 @@ export class DotNS {
   // CooldownActive revert is treated as success-equivalent — the registry
   // is already in the desired state from a recent prior publish.
   async publishLabel(label: string): Promise<{ status: "published" | "already-published" | "cooldown-skipped"; txHash?: string }> {
-    return withSpan("deploy.publish", `3. publish ${label}.dot`, { "deploy.publish.label": label }, async () => {
+    return withSpan("deploy.publish", `3. publish ${label}.${this._tld}`, { "deploy.publish.label": label }, async () => {
       this.ensureConnected();
       const publisher = this._contracts.PUBLISHER;
       if (!publisher || publisher === zeroAddress) {
@@ -2973,7 +3973,7 @@ export class DotNS {
         );
         if (finalPublished !== true) {
           throw new Error(
-            `Post-publish verification failed for ${label}.dot: isPublished returned ${finalPublished} after the publish tx. ` +
+            `Post-publish verification failed for ${label}.${this._tld}: isPublished returned ${finalPublished} after the publish tx. ` +
             `The publish tx may have silently failed via nonce-advance, or another party removed the label. Re-run to retry.`,
           );
         }
@@ -2998,7 +3998,7 @@ export class DotNS {
   // which both saves gas and avoids emitting a spurious Unpublished event
   // for a label that was never in the set.
   async unpublishLabel(label: string): Promise<{ status: "unpublished" | "already-unpublished"; txHash?: string }> {
-    return withSpan("deploy.unpublish", `unpublish ${label}.dot`, { "deploy.unpublish.label": label }, async () => {
+    return withSpan("deploy.unpublish", `unpublish ${label}.${this._tld}`, { "deploy.unpublish.label": label }, async () => {
       this.ensureConnected();
       const publisher = this._contracts.PUBLISHER;
       if (!publisher || publisher === zeroAddress) {
@@ -3053,7 +4053,7 @@ export class DotNS {
         );
         if (finalPublished === true) {
           throw new Error(
-            `Post-unpublish verification failed for ${label}.dot: isPublished still returned true after the unpublish tx. ` +
+            `Post-unpublish verification failed for ${label}.${this._tld}: isPublished still returned true after the unpublish tx. ` +
             `The unpublish tx may have silently failed via nonce-advance, or another party re-published the label. Re-run to retry.`,
           );
         }
@@ -3070,7 +4070,7 @@ export class DotNS {
 
   async getContenthash(domainName: string): Promise<string> {
     this.ensureConnected();
-    const node = namehash(`${domainName}.dot`);
+    const node = namehash(`${domainName}.${this._tld}`);
     // #1060: a first-time deploy (no contenthash ever set) legitimately reads
     // back empty `0x` here. getContenthash has callers with no try/catch around
     // this call (verifyEffect's poll loop and the final read-back in
@@ -3103,25 +4103,26 @@ export class DotNS {
 
   async ensureNotRegistered(label: string): Promise<void> {
     this.ensureConnected();
-    console.log(`\n   Checking availability of ${label}.dot...`);
-    const tokenId = computeDomainTokenId(label);
+    console.log(`\n   Checking availability of ${label}.${this._tld}...`);
+    const tokenId = computeDomainTokenId(label, this._tld);
     try {
       const owner = await withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_ABI, "ownerOf", [tokenId]), 30000, "Availability check");
-      if (owner !== zeroAddress) throw new Error(`Domain ${label}.dot already owned by ${owner}`);
+      if (owner !== zeroAddress) throw new Error(`Domain ${label}.${this._tld} already owned by ${owner}`);
     } catch (error: any) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       if (errorMessage.includes("already owned")) throw error;
     }
-    console.log(`   ${label}.dot is available`);
+    console.log(`   ${label}.${this._tld} is available`);
   }
 
-  async generateCommitment(label: string, includeReverse: boolean = false): Promise<{ commitment: any; registration: any }> {
+  async generateCommitment(label: string, includeReverse: boolean = false, pricing?: DotnsPricingInput): Promise<{ commitment: any; registration: any }> {
     this.ensureConnected();
     console.log(`\n   Generating commitment hash...`);
     label = validateDomainLabel(label);
     const secret = `0x${crypto.randomBytes(32).toString("hex")}`;
-    const registration = { label, owner: this.evmAddress, secret, reserved: includeReverse };
-    const commitment = await withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, DOTNS_REGISTRAR_CONTROLLER_ABI, "makeCommitment", [registration]), 30000, "Commitment generation");
+    const base = { label, owner: this.evmAddress!, secret, reserved: includeReverse };
+    const registration = this._adapter.buildRegistration(base, pricing ?? {});
+    const commitment = await withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "makeCommitment", [registration]), 30000, "Commitment generation");
     console.log(`   Commitment: ${commitment}`);
     return { commitment, registration };
   }
@@ -3136,11 +4137,11 @@ export class DotNS {
     // resolution here is safe and self-consistent.
     const verifyCommitted = async (): Promise<boolean> => {
       try {
-        const ts = await this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, DOTNS_REGISTRAR_CONTROLLER_ABI, "commitments", [commitment]);
+        const ts = await this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "commitments", [commitment]);
         return ts != null && BigInt(ts as any) > 0n;
       } catch { return false; }
     };
-    const commitTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, 0n, DOTNS_REGISTRAR_CONTROLLER_ABI, "commit", [commitment], (s) => console.log(`      ${s}`), { phoneLabel: "Commitment", verifyEffect: verifyCommitted });
+    const commitTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, 0n, this._adapter.controllerAbi, "commit", [commitment], (s) => console.log(`      ${s}`), { phoneLabel: "Commitment", verifyEffect: verifyCommitted });
     logTxResolution(commitTxRes);
     console.log(`   Committed at: ${new Date().toISOString()}`);
   }
@@ -3152,9 +4153,9 @@ export class DotNS {
 
     console.log(`\n   Reading minimum commitment age...`);
     const [minimumAge, maximumAge, initialCommitTimestamp] = await Promise.all([
-      withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, DOTNS_REGISTRAR_CONTROLLER_ABI, "minCommitmentAge", []), 30000, "minCommitmentAge"),
-      withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, DOTNS_REGISTRAR_CONTROLLER_ABI, "maxCommitmentAge", []), 30000, "maxCommitmentAge"),
-      withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, DOTNS_REGISTRAR_CONTROLLER_ABI, "commitments", [commitment]), 30000, "commitments"),
+      withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "minCommitmentAge", []), 30000, "minCommitmentAge"),
+      withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "maxCommitmentAge", []), 30000, "maxCommitmentAge"),
+      withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "commitments", [commitment]), 30000, "commitments"),
     ]);
 
     const minimumAgeSeconds = typeof minimumAge === "bigint" ? Number(minimumAge) : minimumAge;
@@ -3221,33 +4222,78 @@ export class DotNS {
           : "Requires Personhood Lite verification",
       );
     }
-    const priceMeta = await withTimeout(this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "priceWithCheck", [label, this.evmAddress!]), 30000, "priceWithCheck");
-    const priceRaw = (priceMeta as any)?.price;
-    if (priceRaw == null) {
-      throw new Error(
-        `priceWithCheck returned unexpected shape (expected object with .price): ` +
-        JSON.stringify(priceMeta, (_, v) => typeof v === "bigint" ? v.toString() : v)
+    // v2 (needsPricingBeforeCommit): pricing is versioned and must be read
+    // via priceWithCheckAtVersion against a LIVE pricingVersion() read, so the
+    // resolved price and the version the caller commits provably come from
+    // the same read (commit() stamps pricingVersion() live at commit time;
+    // register() requires the tuple's pricingVersion to equal that stamp —
+    // reading it here, before commit, is correct; a cost-model change landing
+    // in the window between this read and commit is an inherent upstream
+    // race, not something this call can prevent).
+    // v1: unchanged — priceWithCheck via the shared, version-agnostic ABI,
+    // exactly as before this change.
+    let priceWei: bigint;
+    let pricingVersion: bigint | undefined;
+    if (this._adapter.needsPricingBeforeCommit) {
+      pricingVersion = (await withTimeout(
+        this.contractCall(this._contracts.POP_RULES, this._adapter.popRulesAbi, "pricingVersion", []),
+        30000, "pricingVersion",
+      )) as bigint;
+      const priceMeta = await withTimeout(
+        this.contractCall(this._contracts.POP_RULES, this._adapter.popRulesAbi, "priceWithCheckAtVersion", [label, this.evmAddress!, pricingVersion]),
+        30000, "priceWithCheckAtVersion",
       );
+      const priceRaw = (priceMeta as any)?.price;
+      if (priceRaw == null) {
+        throw new Error(
+          `priceWithCheckAtVersion returned unexpected shape (expected object with .price): ` +
+          JSON.stringify(priceMeta, (_, v) => typeof v === "bigint" ? v.toString() : v)
+        );
+      }
+      priceWei = typeof priceRaw === "bigint" ? priceRaw : BigInt(priceRaw);
+    } else {
+      const priceMeta = await withTimeout(this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "priceWithCheck", [label, this.evmAddress!]), 30000, "priceWithCheck");
+      const priceRaw = (priceMeta as any)?.price;
+      if (priceRaw == null) {
+        throw new Error(
+          `priceWithCheck returned unexpected shape (expected object with .price): ` +
+          JSON.stringify(priceMeta, (_, v) => typeof v === "bigint" ? v.toString() : v)
+        );
+      }
+      priceWei = typeof priceRaw === "bigint" ? priceRaw : BigInt(priceRaw);
     }
-    const priceWei = typeof priceRaw === "bigint" ? priceRaw : BigInt(priceRaw);
     // Required status was already printed by classifyName() above; only the new
     // facts (the signer's own status + the resolved price) need printing here.
     console.log(`   User status: ${popStatusName(userStatus)}`);
     console.log(`   Price: ${formatEther(priceWei)} PAS`);
-    return { priceWei, requiredStatus, userStatus, message };
+    return { priceWei, requiredStatus, userStatus, message, pricingVersion };
   }
 
   async finalizeRegistration(registration: any, priceWei: bigint): Promise<void> {
     this.ensureConnected();
-    console.log(`\n   Finalizing registration for ${registration.label}.dot...`);
+    console.log(`\n   Finalizing registration for ${registration.label}.${this._tld}...`);
+    // bufferedPaymentWei is the +10%-buffered wei amount, kept only for the
+    // "Paying: X PAS" log line below — purely cosmetic, no chain-arithmetic
+    // risk. The actual msg.value must be computed by bufferedWeiToNative
+    // (the SAME function gateOnFeeBalance's pre-flight quote path already
+    // uses for rentPriceNative, and the one dotns-register-fee.test.js
+    // pins), not by hand-rolled floor division here: the old inline version
+    // did `((priceWei*110n)/100n) / this._nativeToEthRatio` — a pure floor,
+    // whereas bufferedWeiToNative rounds UP on any remainder. The two can
+    // disagree by up to 1 native planck whenever the buffered wei value
+    // isn't an exact multiple of nativeToEthRatio, which is the common case
+    // for an oracle-set price. See dotns-register-fee.test.js for a worked
+    // example and the consequence this had: the old floor-division formula
+    // could spuriously throw "Payment conversion underflow" for a tiny but
+    // genuinely payable priceWei (floors to 0 native units where the correct
+    // rounded-up payment is 1 unit).
     const bufferedPaymentWei = (priceWei * 110n) / 100n;
-    const bufferedPaymentNative = bufferedPaymentWei / this._nativeToEthRatio;
-    if (priceWei > 0n && bufferedPaymentNative === 0n) {
-      throw new Error(
-        `Payment conversion underflow: priceWei=${priceWei} rounds to 0 native units ` +
-        `(nativeToEthRatio=${this._nativeToEthRatio}). Cannot call register with zero payment.`
-      );
-    }
+    // Invariant: bufferedWeiToNative (via weiToNative) rounds any nonzero
+    // remainder UP, so a positive priceWei can never convert to 0 native
+    // units — a "payment conversion underflow" guard here is unreachable
+    // and was removed (see dotns-register-fee.test.js for the worked
+    // example pinning this rounding behavior).
+    const bufferedPaymentNative = bufferedWeiToNative(priceWei, this._nativeToEthRatio);
     setDeployAttribute("deploy.payment_wei", priceWei.toString());
     console.log(`   Oracle price: ${formatEther(priceWei)} PAS`);
     console.log(`   Paying: ${formatEther(bufferedPaymentWei)} PAS`);
@@ -3259,11 +4305,11 @@ export class DotNS {
     const registeredLabel = registration.label;
     const verifyRegistered = async (): Promise<boolean> => {
       try {
-        const owner = await this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_ABI, "ownerOf", [computeDomainTokenId(registeredLabel)]);
+        const owner = await this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_ABI, "ownerOf", [computeDomainTokenId(registeredLabel, this._tld)]);
         return typeof owner === "string" && owner.toLowerCase() === this.evmAddress!.toLowerCase();
       } catch { return false; }
     };
-    const registerTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, bufferedPaymentNative, DOTNS_REGISTRAR_CONTROLLER_ABI, "register", [registration], (s) => console.log(`      ${s}`), { phoneLabel: "Register", verifyEffect: verifyRegistered });
+    const registerTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, bufferedPaymentNative, this._adapter.controllerAbi, "register", [registration], (s) => console.log(`      ${s}`), { phoneLabel: "Register", verifyEffect: verifyRegistered });
     logTxResolution(registerTxRes);
     if (registerTxRes.kind === TX_KIND_HASH) {
       setDeployAttribute("deploy.register.tx", registerTxRes.hash);
@@ -3280,12 +4326,12 @@ export class DotNS {
   async verifyOwnership(label: string): Promise<void> {
     this.ensureConnected();
     console.log(`\n   Verifying ownership...`);
-    const tokenId = computeDomainTokenId(label);
+    const tokenId = computeDomainTokenId(label, this._tld);
     const actualOwner = await withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_ABI, "ownerOf", [tokenId]), 30000, "ownerOf");
     if (actualOwner.toLowerCase() !== this.evmAddress!.toLowerCase()) {
       console.log(`   Expected: ${this.evmAddress}`);
       console.log(`   Actual: ${actualOwner}`);
-      throw new Error(`Owner mismatch for ${label}.dot`);
+      throw new Error(`Owner mismatch for ${label}.${this._tld}`);
     }
     console.log(`   Owner: ${actualOwner}`);
   }
@@ -3298,7 +4344,7 @@ export class DotNS {
   }
 
   private async _preflightInternal(label: string, reproveAttempted: boolean, transferRecipientH160?: string): Promise<DotnsPreflightResult> {
-    return withSpan("deploy.dotns.preflight", `preflight ${label}.dot`, {}, async () => {
+    return withSpan("deploy.dotns.preflight", `preflight ${label}.${this._tld}`, {}, async () => {
       // Seed auto-reprove telemetry for every span, including ones that never
       // reach the stale-alias branch (boolean-both-values rule).
       setDeployAttribute("deploy.dotns.reprove.auto", "false");
@@ -3307,26 +4353,51 @@ export class DotNS {
       const validated = validateDomainLabel(label);
       const trailingDigits = countTrailingDigits(validated);
       const baselength = validated.length - trailingDigits;
-      const classification = classifyDotnsLabel(validated);
+      const classification = classifyDotnsLabel(validated, this._tld);
 
-      // Reserved is a terminal rejection — no chain reads needed.
-      if (classification.status === ProofOfPersonhoodStatus.Reserved) {
-        const sanitizeTrail = label !== validated
-          ? `Input "${label}" was sanitized to "${validated}" (excess trailing digits trimmed). `
-          : "";
-        return {
-          label: validated, classification, userStatus: 0, trailingDigits, baselength,
-          isAvailable: false, existingOwner: null, isBaseNameReserved: false, reservationOwner: null,
-          isTestnet: false, canProceed: false,
-          reason: `${sanitizeTrail}${classification.message}`,
-          plannedAction: "abort", needsPopUpgrade: false,
-        };
-      }
+      // Issue #1185: Reserved (and the trailing-digit/hyphen-base rules) are
+      // NOT a terminal, ownership-blind rejection anymore — a name registered
+      // via registerReserved bypasses PopRules entirely, so its owner must be
+      // able to deploy to it. classifyRegistrability + decideRegistrabilityOutcome
+      // (below, after the ownership read) decide this instead. The early
+      // return that used to live here was reachable in practice only because
+      // validateDomainLabel itself used to throw for Reserved labels first —
+      // now that validateDomainLabel is contract-syntax-only, this is where
+      // the ownership-aware decision actually happens.
+      const registrability = classifyRegistrability(validated);
 
       const baseName = stripTrailingDigits(validated);
       const [userStatus, baseReservation, ownership, isTestnet, signerFreeBalance] = await Promise.all([
         this.getUserPopStatus(),
-        withTimeout(this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "isBaseNameReserved", [baseName]), 30000, "isBaseNameReserved") as Promise<[boolean, string, bigint]>,
+        // Non-fatal (#1185): deleting the early Reserved abort above widens
+        // what reaches this call — every 1-digit, 3+-digit, hyphen-base, and
+        // short-base label now hits isBaseNameReserved where previously only
+        // "registrable" labels did. A hyphen-adjacent base (e.g. from
+        // `foo--88`, where stripTrailingDigits only removes ONE trailing
+        // hyphen) can revert here; treat a revert/empty-data the same as
+        // "not reserved" rather than failing preflight over a read that is
+        // advisory context, not an authorization gate. Uses the same
+        // this.contractCall the pre-#1185 code used (not contractCallNullable
+        // — a different RPC path with its own stub surface); only the
+        // fatal-vs-non-fatal handling changes, via a plain try/catch.
+        //
+        // Code review finding: a blanket catch-all here would also swallow a
+        // genuine RPC/connection failure (timeout, WS drop) and silently
+        // default to "not reserved" — fail-open on network noise, not just
+        // on a real revert. Rethrow anything that looks like the read itself
+        // never completed; only default when the dry-run call DID complete
+        // (a revert or empty-data response).
+        (async (): Promise<[boolean, string, bigint]> => {
+          try {
+            return await withTimeout(this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "isBaseNameReserved", [baseName]), 30000, "isBaseNameReserved") as [boolean, string, bigint];
+          } catch (e: any) {
+            const msg = e?.message ?? String(e);
+            if (/timed out after \d+ms|heartbeat timeout|WS halt|Unable to connect|ChainHead disjointed|websocket.*closed|socket closed|disconnect/i.test(msg)) {
+              throw e;
+            }
+            return [false, zeroAddress, 0n];
+          }
+        })(),
         this.checkOwnership(validated),
         this.isTestnet(),
         this.readFreeBalance(this.substrateAddress!),
@@ -3357,9 +4428,43 @@ export class DotNS {
           label: validated, classification, userStatus, trailingDigits, baselength,
           isAvailable: false, existingOwner, isBaseNameReserved: isReserved, reservationOwner,
           isTestnet, canProceed: false,
-          reason: `Domain ${validated}.dot is already owned by ${existingOwner}.`,
+          reason: `Domain ${validated}.${this._tld} is already owned by ${existingOwner}.`,
           plannedAction: "abort", needsPopUpgrade: false, signerFreeBalance,
         };
+      }
+
+      // Issue #1185: decide Reserved (and the trailing-digit/hyphen-base
+      // rules) by OWNERSHIP now that the chain has told us who owns the name.
+      // existingOwner here is always null (unregistered) or selfAddress
+      // (owned by us) — the owned-by-someone-else case for ANY label,
+      // registrable or not, already returned above. A registrable label
+      // falls through untouched; a non-registrable label the signer already
+      // owns proceeds too (registerReserved bypasses PopRules on-chain, so
+      // ownership is the authorization); a non-registrable, unregistered
+      // label aborts here, before ever reaching the canRegister/PoP-guidance
+      // path below (which would give actively misleading NoStatus advice for
+      // a governance-reserved name).
+      if (!registrability.registrable) {
+        const decision = decideRegistrabilityOutcome({ label: validated, registrability, existingOwner, selfAddress, tld: this._tld });
+        if (!decision.canProceed) {
+          // existingOwner is always null here (the owned-by-someone-else
+          // branch above already returned; owned-by-us takes the
+          // canProceed:true path). isAvailable follows the same convention
+          // as the "reserved by a different Lite registrant" abort below
+          // (isReserved && reservationOwner !== selfAddress): it reflects
+          // whether the domain TOKEN is unregistered, independent of
+          // whether this deploy can proceed.
+          return {
+            label: validated, classification, userStatus, trailingDigits, baselength,
+            isAvailable: true, existingOwner, isBaseNameReserved: isReserved, reservationOwner,
+            isTestnet, canProceed: false,
+            reason: decision.reason!,
+            plannedAction: "abort", needsPopUpgrade: false, signerFreeBalance,
+          };
+        }
+        // decision.canProceed === true means already-owned-by-us; fall
+        // through to the existing owned-by-us branch below, which returns
+        // via gateOnFeeBalance — do not duplicate that call here.
       }
 
       // Quote the transfer fee ONCE when a recipient is supplied (no-op otherwise).
@@ -3444,7 +4549,7 @@ export class DotNS {
             }
 
             if (reproveSucceeded) {
-              console.log(`   Continuing with registration of ${validated}.dot.`);
+              console.log(`   Continuing with registration of ${validated}.${this._tld}.`);
               return this._preflightInternal(label, true, transferRecipientH160);
             }
             // Fall through to manual remediation below.
@@ -3457,7 +4562,7 @@ export class DotNS {
             label: validated, classification, userStatus, trailingDigits, baselength,
             isAvailable: true, existingOwner: null, isBaseNameReserved: isReserved, reservationOwner,
             isTestnet, canProceed: false,
-            reason: `${validated}.dot requires ${requiredName}, but this signer is ${currentName}. ${remediationMessage}`,
+            reason: `${validated}.${this._tld} requires ${requiredName}, but this signer is ${currentName}. ${remediationMessage}`,
             plannedAction: "abort", needsPopUpgrade: false, targetPopStatus, signerFreeBalance,
           };
         }
@@ -3471,7 +4576,8 @@ export class DotNS {
             label: validated, requiredName, currentName,
             isTestnet, environmentId: this._environmentId, popSelfServe: this._popSelfServe,
             aliasState: null,
-            exampleNoStatusLabel: exampleNoStatusLabel(validated),
+            exampleNoStatusLabel: exampleNoStatusLabel(validated, this._tld),
+            tld: this._tld,
           }),
           plannedAction: "abort", needsPopUpgrade: false, targetPopStatus, signerFreeBalance,
         };
@@ -3499,16 +4605,19 @@ export class DotNS {
     transferFeeNative = 0n,
   ): Promise<DotnsPreflightResult> {
     // Register deposit is tier-resolved and read live (issue #884): a verified
-    // (Lite/Full) signer is charged 0; a NoStatus signer pays PopRules.startingPrice,
-    // which is owner-updatable per env. Already-owned (setContenthash-only) and
-    // verified-register paths add nothing here.
+    // (Lite/Full) signer is charged 0; a NoStatus signer pays PopRules's live
+    // deposit read, which is owner-updatable per env. Already-owned
+    // (setContenthash-only) and verified-register paths add nothing here.
+    // Which view function resolves the deposit is protocol-version-dependent
+    // (v1: startingPrice(); v2: price(label) — see adapter.depositCall()).
     let rentPriceNative = 0n;
     if (candidate.plannedAction === "register" && candidate.userStatus === ProofOfPersonhoodStatus.NoStatus) {
-      const startingPriceWei = (await withTimeout(
-        this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "startingPrice", []),
-        30000, "startingPrice",
+      const deposit = this._adapter.depositCall(candidate.label);
+      const depositWei = (await withTimeout(
+        this.contractCall(this._contracts.POP_RULES, this._adapter.popRulesAbi, deposit.functionName, deposit.args),
+        30000, deposit.functionName,
       )) as bigint;
-      rentPriceNative = bufferedWeiToNative(startingPriceWei, this._nativeToEthRatio);
+      rentPriceNative = bufferedWeiToNative(depositWei, this._nativeToEthRatio);
     }
     const feeFloor = feeFloorFor(candidate.plannedAction, this._registerStorageDeposit, rentPriceNative, transferFeeNative);
     let effectiveBalance = signerFreeBalance;
@@ -3564,15 +4673,25 @@ export class DotNS {
     label: string,
     options: DotNSConnectOptions & { status?: string; reverse?: boolean } = {},
   ): Promise<{ label: string; owner: string }> {
-    return withSpan("deploy.dotns.register", `2a. register ${label}.dot`, {}, async () => {
+    return withSpan("deploy.dotns.register", `2a. register ${label}.${this._tld}`, {}, async () => {
       if (!this.connected) await this.connect(options);
       label = validateDomainLabel(label);
 
-      const preClassification = classifyDotnsLabel(label);
-      const preRequiredStatus = preClassification.status;
-
-      if (preRequiredStatus === ProofOfPersonhoodStatus.Reserved) {
-        throw new Error(preClassification.message);
+      // Issue #1185: register() must not attempt a doomed registration now
+      // that validateDomainLabel no longer refuses non-registrable labels
+      // itself. A library caller can invoke deploy() without preflight, so
+      // register() needs its own guard here — using the SAME
+      // formatUnregistrableReason preflight uses (via decideRegistrabilityOutcome
+      // with existingOwner forced to null, since register() has no ownership
+      // context of its own), so the two texts cannot drift. This also
+      // subsumes the old classifyDotnsLabel-only Reserved check that used to
+      // live here (that check never caught a hyphen-base label at all, and
+      // is now provably unreachable — every label it would have caught is
+      // also caught by classifyRegistrability, which fires first).
+      const registrability = classifyRegistrability(label);
+      if (!registrability.registrable) {
+        const decision = decideRegistrabilityOutcome({ label, registrability, existingOwner: null, selfAddress: this.evmAddress!.toLowerCase(), tld: this._tld });
+        throw new NonRetryableError(decision.reason!);
       }
 
       const isTestnet = await this.isTestnet();
@@ -3588,7 +4707,8 @@ export class DotNS {
             label, requiredName: popStatusName(statusRequired), currentName: popStatusName(userStatus),
             isTestnet, environmentId: this._environmentId, popSelfServe: this._popSelfServe,
             aliasState: registerAliasState,
-            exampleNoStatusLabel: exampleNoStatusLabel(label),
+            exampleNoStatusLabel: exampleNoStatusLabel(label, this._tld),
+            tld: this._tld,
           })
         );
       };
@@ -3600,10 +4720,18 @@ export class DotNS {
         this.ensureNotRegistered(label),
       ]);
 
+      // No Reserved check needed here (code review finding on #1185): the
+      // classifyRegistrability guard above is the ONLY entry into this
+      // function's body (register() has no other internal call path), runs
+      // unconditionally before this point, and covers a strict superset of
+      // what classifyName's Reserved bucket can ever return (same
+      // deterministic length/trailing-digit formula, PLUS the hyphen-base
+      // rule classifyName has no concept of). So `requiredStatus` can never
+      // be Reserved here — provably, not just empirically. Contrast with
+      // getPriceAndValidate's OWN Reserved check just below in the call
+      // graph: that method is ALSO independently public, so its check stays
+      // (a direct caller could reach it without ever calling register()).
       const requiredStatus = classification.requiredStatus;
-      if (requiredStatus === ProofOfPersonhoodStatus.Reserved) {
-        throw new Error(classification.message);
-      }
 
       const userStatus = await this.getUserPopStatus();
 
@@ -3612,10 +4740,22 @@ export class DotNS {
       }
 
       const doCommitAndRegister = async (): Promise<void> => {
-        const { commitment, registration } = await this.generateCommitment(label, reverse);
+        // v2 (needsPricingBeforeCommit): maxPrice + pricingVersion are part of
+        // the COMMITTED tuple, so pricing must be resolved before
+        // makeCommitment/commit — moved ahead of the commitment here. v1:
+        // pricingEarly stays null, so the call order below is byte-for-byte
+        // identical to before this change (generate → submit → wait → price →
+        // finalize) — this is the global constraint that v1 must never change.
+        const pricingEarly = this._adapter.needsPricingBeforeCommit
+          ? await withSpan("deploy.dotns.price-validation", "2a-0. price-validation", {}, () => this.getPriceAndValidate(label))
+          : null;
+        const { commitment, registration } = await this.generateCommitment(
+          label, reverse,
+          pricingEarly ? { priceWei: pricingEarly.priceWei, pricingVersion: pricingEarly.pricingVersion } : undefined,
+        );
         await withSpan("deploy.dotns.submit-commitment", "2a-i. submit-commitment", {}, () => this.submitCommitment(commitment));
         await withSpan("deploy.dotns.wait-commitment-age", "2a-ii. wait-commitment-age", {}, () => this.waitForCommitmentAge(commitment));
-        const pricing = await withSpan("deploy.dotns.price-validation", "2a-iii. price-validation", {}, () => this.getPriceAndValidate(label));
+        const pricing = pricingEarly ?? await withSpan("deploy.dotns.price-validation", "2a-iii. price-validation", {}, () => this.getPriceAndValidate(label));
         await withSpan("deploy.dotns.finalize-registration", "2a-iv. finalize-registration", {}, () => this.finalizeRegistration(registration, pricing.priceWei));
       };
 
@@ -3742,13 +4882,18 @@ export class DotNS {
    *   in-process).
    * After the gate resolves, fires onPhoneSigningRequired (the "check your
    * phone" notification) so the user knows the request is now being sent.
+   *
+   * `reason` (#194): passed straight through to confirmPhoneReady's context so
+   * the consumer can distinguish a watcher-silence re-arm ("silence") from the
+   * pre-existing verifyEffect-false-negative re-sign case (undefined/"resign",
+   * which keeps rendering off `attempt` as before).
    */
-  private async _awaitPhoneReady(label: string): Promise<void> {
+  private async _awaitPhoneReady(label: string, reason?: "resign" | "silence"): Promise<void> {
     if (!this._isPhoneSigner) return; // only phone/session signers need the gate; local workers (transfer mode) do not
     const attempt = (this._phoneSignatureAttempts.get(label) ?? 0) + 1;
     this._phoneSignatureAttempts.set(label, attempt);
     if (this._confirmPhoneReady) {
-      await this._confirmPhoneReady({ label, attempt, total: this._phoneSignatureTotal });
+      await this._confirmPhoneReady({ label, attempt, total: this._phoneSignatureTotal, approvalBudgetMs: PHONE_APPROVAL_MS, reason });
     }
     // No hook → proceed; in-process external signers (injected PolkadotSigner,
     // mnemonic) need no human gate. Phone signers must supply confirmPhoneReady.

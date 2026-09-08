@@ -16,8 +16,15 @@ import {
   loadProductConfig,
   preflightProductConfig,
   checkProductConfigFilesExist,
+  publishManifest,
+  formatConfigLoadError,
 } from "../dist/index.js";
+import { registerOrEnsureResolver } from "../dist/manifest/publish.js";
 import { NonRetryableError } from "../dist/errors.js";
+import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints } from "../dist/deploy.js";
+import { KNOWN_TLDS as DOTNS_KNOWN_TLDS } from "../dist/dotns.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 describe("validateRootManifest", () => {
   test("accepts a well-formed v1 root manifest", () => {
@@ -143,6 +150,51 @@ describe("validateExecutableManifest — widget", () => {
   });
 });
 
+describe("validateExecutableManifest — funding", () => {
+  test("accepts funding with a single recognised mode", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "funding", appVersion: [1, 0, 0], modes: ["CARD"],
+    });
+    assert.equal(result.ok, true);
+  });
+
+  test("accepts funding with all three modes", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "funding", appVersion: [1, 0, 0], modes: ["CARD", "BANK", "CRYPTO"],
+    });
+    assert.equal(result.ok, true);
+  });
+
+  test("rejects funding with missing modes", () => {
+    const result = validateExecutableManifest({ $v: 1, kind: "funding", appVersion: [1, 0, 0] });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes("modes")));
+  });
+
+  test("rejects funding with empty modes", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "funding", appVersion: [1, 0, 0], modes: [],
+    });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes("non-empty")));
+  });
+
+  test("rejects funding with an unrecognised mode (strict on the publishing side)", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "funding", appVersion: [1, 0, 0], modes: ["CARD", "PAYPAL"],
+    });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes("PAYPAL")));
+  });
+
+  test("rejects funding with lowercase mode values", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "funding", appVersion: [1, 0, 0], modes: ["card"],
+    });
+    assert.equal(result.ok, false);
+  });
+});
+
 describe("validateExecutableManifest — worker", () => {
   test("accepts worker with chat=true, pocket=false", () => {
     const result = validateExecutableManifest({
@@ -204,6 +256,7 @@ const VALID_CONFIG = {
       kind: "widget", path: "./dist/widget", appVersion: [1, 0, 0],
       dimensions: { height: [2, 4], width: 1 },
     },
+    { kind: "funding", path: "./dist/funding", appVersion: [1, 0, 0], modes: ["CARD", "BANK"] },
     {
       kind: "worker", path: "./dist/worker", appVersion: [1, 0, 0],
       entrypoint: "index.js", includes: { chat: true, pocket: false },
@@ -212,7 +265,7 @@ const VALID_CONFIG = {
 };
 
 describe("validateProductConfig", () => {
-  test("accepts a full three-variant config", () => {
+  test("accepts a full four-variant config", () => {
     const result = validateProductConfig(VALID_CONFIG);
     assert.equal(result.ok, true);
   });
@@ -221,6 +274,37 @@ describe("validateProductConfig", () => {
     const result = validateProductConfig({ ...VALID_CONFIG, domain: "demoapp" });
     assert.equal(result.ok, false);
     assert.ok(result.errors.some(e => e.includes("domain")));
+  });
+
+  // #paseo-tld: DotNS's TLD is per-environment (paseo-next-v2: "paseo") —
+  // a config domain ending in .paseo must validate, not be rejected as if
+  // ".dot" were the only legal suffix.
+  test("accepts a domain with .paseo suffix (paseo-next-v2)", () => {
+    const result = validateProductConfig({ ...VALID_CONFIG, domain: "demoapp.paseo" });
+    assert.equal(result.ok, true,
+      `>> FAIL: validateProductConfig .paseo: expected ok:true, got errors: ${JSON.stringify(result.ok ? [] : result.errors)}`);
+  });
+
+  test("still rejects a domain ending in an unknown TLD", () => {
+    const result = validateProductConfig({ ...VALID_CONFIG, domain: "demoapp.example" });
+    assert.equal(result.ok, false,
+      ">> FAIL: validateProductConfig unknown TLD: 'demoapp.example' must still be rejected — only KNOWN_TLDS suffixes are valid");
+  });
+
+  // Keeps src/manifest/schema.ts's hand-copied KNOWN_TLDS list (documented as
+  // "kept in sync with dotns.ts's KNOWN_TLDS by hand") from silently drifting
+  // — schema.ts deliberately doesn't import dotns.ts (stays free of the
+  // polkadot-api dep), so nothing else would catch a divergence.
+  test("schema.ts's KNOWN_TLDS list stays in sync with dotns.ts's KNOWN_TLDS", () => {
+    const schemaSrc = readFileSync(fileURLToPath(new URL("../src/manifest/schema.ts", import.meta.url)), "utf8");
+    const m = schemaSrc.match(/const KNOWN_TLDS = \[([^\]]+)\] as const;/);
+    assert.ok(m, ">> FAIL: could not find schema.ts's KNOWN_TLDS declaration to compare");
+    const schemaTlds = m[1].split(",").map((s) => s.trim().replace(/^"|"$/g, "")).filter(Boolean);
+    assert.deepEqual(
+      schemaTlds.sort(),
+      [...DOTNS_KNOWN_TLDS].sort(),
+      `>> FAIL: KNOWN_TLDS drift: src/manifest/schema.ts has ${JSON.stringify(schemaTlds)} but src/dotns.ts has ${JSON.stringify(DOTNS_KNOWN_TLDS)} — a config domain valid on-chain could now fail schema validation, or vice versa`,
+    );
   });
 
   test("rejects empty executables array", () => {
@@ -246,11 +330,12 @@ describe("validateProductConfig", () => {
       ...VALID_CONFIG,
       executables: [
         { kind: "widget", path: "./w", appVersion: [1, 0, 0] }, // missing dimensions
+        { kind: "funding", path: "./f", appVersion: [1, 0, 0], modes: [] }, // empty modes
         { kind: "worker", path: "./wk", appVersion: [1, 0, 0] }, // missing entrypoint + includes
       ],
     });
     assert.equal(result.ok, false);
-    assert.ok(result.errors.length >= 2);
+    assert.ok(result.errors.length >= 3);
   });
 });
 
@@ -258,7 +343,7 @@ test("defineConfig returns its input unchanged", () => {
   assert.equal(defineConfig(VALID_CONFIG), VALID_CONFIG);
 });
 
-const EXEC_PATHS = ["dist/app", "dist/widget", "dist/worker"];
+const EXEC_PATHS = ["dist/app", "dist/widget", "dist/funding", "dist/worker"];
 async function mkTmp(prefix) { return await fs.mkdtemp(path.join(os.tmpdir(), prefix)); }
 async function seedFiles(dir, { icon = true, execs = EXEC_PATHS } = {}) {
   if (icon) await fs.writeFile(path.join(dir, "icon.png"), "x");
@@ -282,10 +367,11 @@ describe("checkProductConfigFilesExist", () => {
 
   test("flags each missing executable path", async () => {
     const dir = await mkTmp("pcfg-noexec-");
-    await seedFiles(dir, { execs: ["dist/app"] }); // widget + worker missing
+    await seedFiles(dir, { execs: ["dist/app"] }); // widget + funding + worker missing
     const errs = await checkProductConfigFilesExist(VALID_CONFIG, dir);
-    assert.equal(errs.length, 2, errs.join("; "));
+    assert.equal(errs.length, 3, errs.join("; "));
     assert.ok(errs.some(e => e.includes("widget")));
+    assert.ok(errs.some(e => e.includes("funding")));
     assert.ok(errs.some(e => e.includes("worker")));
   });
 
@@ -392,8 +478,8 @@ describe("pessimisticSizePreflight", () => {
   test("passes for a typical config under default budget", () => {
     const report = pessimisticSizePreflight(VALID_CONFIG);
     assert.equal(report.ok, true);
-    // root + 3 executables
-    assert.equal(report.checks.length, 4);
+    // root + 4 executables
+    assert.equal(report.checks.length, 5);
   });
 
   test("flags root manifest exceeding a tiny budget", () => {
@@ -424,7 +510,7 @@ describe("loadProductConfig — auto-discovery", () => {
     const { config, sourcePath } = await loadProductConfig({ cwd: dir });
     assert.equal(sourcePath, configPath);
     assert.equal(config.domain, "demoapp.dot");
-    assert.equal(config.executables.length, 3);
+    assert.equal(config.executables.length, 4);
   });
 
   test("loads a .mjs config natively", async (t) => {
@@ -456,6 +542,256 @@ describe("loadProductConfig — auto-discovery", () => {
     await assert.rejects(
       () => loadProductConfig({ cwd: dir }),
       err => err.message.includes("domain"),
+    );
+  });
+
+  test("#1103: a config that throws '<VAR> is required' surfaces a friendly NonRetryableError with an env-var hint, preserving the original message", async (t) => {
+    const dir = await tmpDir(t, "product-config-throws-required-");
+    const configPath = path.join(dir, "polkadot-app-deploy.config.ts");
+    await fs.writeFile(
+      configPath,
+      `if (!process.env.APP_DOTNS_DOMAIN) throw new Error("APP_DOTNS_DOMAIN is required");\nexport default ${JSON.stringify(VALID_CONFIG, null, 2)};\n`,
+    );
+    await assert.rejects(
+      () => loadProductConfig({ cwd: dir }),
+      err => {
+        assert.equal(err.name, "NonRetryableError", `>> FAIL: config-throws-required: expected NonRetryableError, got ${err.name}`);
+        assert.match(err.message, /threw while loading: APP_DOTNS_DOMAIN is required/, `>> FAIL: config-throws-required: friendly wrapper missing or original message not preserved (got "${err.message}")`);
+        assert.match(err.message, /Hint: set the APP_DOTNS_DOMAIN environment variable\./, `>> FAIL: config-throws-required: expected env-var hint (got "${err.message}")`);
+        return true;
+      },
+    );
+  });
+
+  test("#1103: a config that throws a non-'required' shape surfaces the friendly wrapper with no false hint", async (t) => {
+    const dir = await tmpDir(t, "product-config-throws-other-");
+    const configPath = path.join(dir, "polkadot-app-deploy.config.ts");
+    await fs.writeFile(
+      configPath,
+      `throw new Error("Cannot read properties of undefined (reading 'foo')");\nexport default ${JSON.stringify(VALID_CONFIG, null, 2)};\n`,
+    );
+    await assert.rejects(
+      () => loadProductConfig({ cwd: dir }),
+      err => {
+        assert.equal(err.name, "NonRetryableError", `>> FAIL: config-throws-other: expected NonRetryableError, got ${err.name}`);
+        assert.match(err.message, /threw while loading: Cannot read properties of undefined \(reading 'foo'\)/, `>> FAIL: config-throws-other: friendly wrapper missing or original message not preserved (got "${err.message}")`);
+        assert.ok(!/Hint:/.test(err.message), `>> FAIL: config-throws-other: unexpected env-var hint on a non-required-shape message (got "${err.message}")`);
+        return true;
+      },
+    );
+  });
+});
+
+describe("formatConfigLoadError — pure helper", () => {
+  test("'<VAR> is required' shape produces the friendly wrapper + hint, preserving the original message", () => {
+    const message = formatConfigLoadError(
+      "/proj/polkadot-app-deploy.config.ts",
+      new Error("APP_DOTNS_DOMAIN is required"),
+    );
+    assert.match(message, /^Your polkadot-app-deploy\.config\.ts threw while loading: APP_DOTNS_DOMAIN is required\. Check its required env vars \/ inputs\./, `>> FAIL: formatConfigLoadError required-shape: unexpected message shape (got "${message}")`);
+    assert.match(message, /Hint: set the APP_DOTNS_DOMAIN environment variable\.$/, `>> FAIL: formatConfigLoadError required-shape: missing hint (got "${message}")`);
+  });
+
+  test("'missing env var X' shape also produces a hint", () => {
+    const message = formatConfigLoadError(
+      "/proj/polkadot-app-deploy.config.js",
+      new Error("missing env var API_KEY"),
+    );
+    assert.match(message, /Hint: set the API_KEY environment variable\.$/, `>> FAIL: formatConfigLoadError missing-env-var shape: expected API_KEY hint (got "${message}")`);
+  });
+
+  test("a non-'required' shape produces the wrapper with no hint", () => {
+    const message = formatConfigLoadError(
+      "/proj/polkadot-app-deploy.config.mjs",
+      new Error("Cannot read properties of undefined (reading 'foo')"),
+    );
+    assert.equal(
+      message,
+      "Your polkadot-app-deploy.config.mjs threw while loading: Cannot read properties of undefined (reading 'foo'). Check its required env vars / inputs.",
+      `>> FAIL: formatConfigLoadError non-required-shape: unexpected message (got "${message}")`,
+    );
+  });
+
+  test("a thrown non-Error value is stringified, not [object Object]", () => {
+    const message = formatConfigLoadError("/proj/polkadot-app-deploy.config.ts", "plain string throw");
+    assert.match(message, /threw while loading: plain string throw\./, `>> FAIL: formatConfigLoadError non-Error throw: expected stringified value (got "${message}")`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Perf win: registerSubdomain already sets a fresh subname's resolver to the
+// content resolver atomically (setSubnodeOwner + setResolver, batched via
+// Utility.batch_all — see dotns.ts registerSubdomain). The manifest publish
+// loop used to call ensureContentResolver unconditionally right after the
+// register-or-not branch, wasting one chain read per executable on every
+// fresh deploy. registerOrEnsureResolver is the extracted decision (only the
+// already-owned branch still calls ensureContentResolver — a pre-existing
+// subname can have a stale/unset resolver) — pulled out of publishManifest
+// and given an injectable dotns-like interface specifically so this
+// call-count regression can be pinned without a live chain connection
+// (publishManifest itself always calls it with a real DotNS instance, which
+// needs one).
+// ---------------------------------------------------------------------------
+describe("registerOrEnsureResolver (resolver-read skip)", () => {
+  function mockDotns() {
+    const calls = { registerSubdomain: 0, ensureContentResolver: 0 };
+    return {
+      calls,
+      async registerSubdomain(sublabel, parentLabel) {
+        calls.registerSubdomain++;
+        return { sublabel, parentLabel, owner: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY" };
+      },
+      async ensureContentResolver(domainName) {
+        calls.ensureContentResolver++;
+        return { changed: true };
+      },
+    };
+  }
+
+  test("fresh register (owned:false, no owner): calls registerSubdomain, does NOT call ensureContentResolver", async () => {
+    const dotns = mockDotns();
+    const result = await registerOrEnsureResolver(dotns, { owned: false, owner: null }, "app", "demoapp", "demoapp.dot");
+    assert.equal(result.registered, true, ">> FAIL: registerOrEnsureResolver fresh-register: expected registered:true");
+    assert.equal(dotns.calls.registerSubdomain, 1, ">> FAIL: registerOrEnsureResolver fresh-register: registerSubdomain must be called exactly once");
+    assert.equal(dotns.calls.ensureContentResolver, 0, ">> FAIL: registerOrEnsureResolver fresh-register: ensureContentResolver must NOT be called — registerSubdomain already batches setResolver atomically (dotns.ts), calling it again is exactly the redundant chain read this port removes");
+  });
+
+  test("already owned (owned:true): calls ensureContentResolver, does NOT call registerSubdomain", async () => {
+    const dotns = mockDotns();
+    const result = await registerOrEnsureResolver(dotns, { owned: true, owner: "5FexistingOwner" }, "widget", "demoapp", "demoapp.dot");
+    assert.equal(result.registered, false, ">> FAIL: registerOrEnsureResolver already-owned: expected registered:false");
+    assert.equal(dotns.calls.ensureContentResolver, 1, ">> FAIL: registerOrEnsureResolver already-owned: ensureContentResolver must be called exactly once — a pre-existing subname can have a stale/unset resolver");
+    assert.equal(dotns.calls.registerSubdomain, 0, ">> FAIL: registerOrEnsureResolver already-owned: registerSubdomain must NOT be called for an already-owned subname");
+  });
+
+  test("owned by someone else (owned:false, owner set): throws NonRetryableError, calls neither", async () => {
+    const dotns = mockDotns();
+    await assert.rejects(
+      () => registerOrEnsureResolver(dotns, { owned: false, owner: "5FconflictingOwner" }, "worker", "demoapp", "demoapp.dot"),
+      (e) => {
+        assert.ok(e instanceof NonRetryableError, ">> FAIL: registerOrEnsureResolver owner-conflict: expected NonRetryableError");
+        assert.match(e.message, /worker\.demoapp\.dot is owned by 5FconflictingOwner/, ">> FAIL: registerOrEnsureResolver owner-conflict: error message must name the conflicting owner and subname");
+        return true;
+      },
+    );
+    assert.equal(dotns.calls.registerSubdomain, 0, ">> FAIL: registerOrEnsureResolver owner-conflict: registerSubdomain must NOT be called");
+    assert.equal(dotns.calls.ensureContentResolver, 0, ">> FAIL: registerOrEnsureResolver owner-conflict: ensureContentResolver must NOT be called");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1094: manifest publish uploaded the icon/executables to the DEFAULT
+// Bulletin RPC, ignoring the deploy's --env/--rpc — storeFile/storeDirectory
+// are called with no client of their own, so they fall back to whatever
+// getProvider() reads off the module-level BULLETIN_ENDPOINTS. Asserting
+// BULLETIN_ENDPOINTS directly after publishManifest is not a hollow proxy:
+// storeFile/storeDirectory connect to exactly BULLETIN_ENDPOINTS[0] (verified
+// live against the real chain while fixing this issue — pre-fix connected to
+// DEFAULT_BULLETIN_RPC despite env:"paseo-next-v2"; post-fix connected to
+// paseo-next-v2's own wss://paseo-bulletin-next-rpc.polkadot.io).
+//
+// Each test seeds BULLETIN_ENDPOINTS at the module-default seed first — this
+// is the state any *standalone* publishManifest() call starts from (a fresh
+// process, or any library caller that didn't run deploy() first in-process;
+// see the module's own JSDoc: "on top of an already-completed legacy
+// deploy"). A broken icon path makes publishManifest throw immediately after
+// resolving+setting the endpoint (readFileOrThrow), before any real
+// network/chain call — keeps this a fast, deterministic unit test.
+//
+// "devnet" is used as the non-default env below (this twin's assets/
+// environments.json only defines paseo-next-v2 and devnet — bulletin's
+// equivalent test used a "paseo-review" env that has no counterpart here).
+describe("publishManifest — Bulletin endpoint resolution (#1094)", () => {
+  test("resolves the given env's Bulletin endpoint before storeFile/storeDirectory run, not the module default", async (t) => {
+    const before = BULLETIN_ENDPOINTS;
+    t.after(() => setBulletinEndpoints(before));
+    setBulletinEndpoints([DEFAULT_BULLETIN_RPC]);
+
+    const dir = await tmpDir(t, "product-manifest-rpc-");
+    const loaded = {
+      config: {
+        ...VALID_CONFIG,
+        domain: "manifestrpctest.dot",
+        icon: { path: "./missing-icon.png", format: "png" },
+        executables: [],
+      },
+      sourcePath: path.join(dir, "polkadot-app-deploy.config.mjs"),
+    };
+
+    await assert.rejects(
+      () => publishManifest({ loaded, domain: "manifestrpctest.dot", env: "devnet" }),
+      err => err.name === "NonRetryableError" && /Cannot read icon/.test(err.message),
+      ">> FAIL: publishManifest #1094 setup: expected the icon read to fail (fixture icon is intentionally missing) — check the fixture path, not the fix",
+    );
+
+    // devnet's Bulletin endpoint(s) (assets/environments.json), distinct
+    // from BOTH the module-default seed AND paseo-next-v2's own endpoint —
+    // this assertion cannot pass by accident.
+    assert.deepStrictEqual(
+      BULLETIN_ENDPOINTS,
+      ["wss://bulletin-paseo.tservices.es:8443", "wss://bullet.sik.rocks"],
+      ">> FAIL: publishManifest #1094: BULLETIN_ENDPOINTS must be set to the resolved env's ('devnet') Bulletin endpoint before storeFile/storeDirectory run — it was left at DEFAULT_BULLETIN_RPC, which is exactly what storeFile/storeDirectory would connect to (getProvider() has no client of its own)",
+    );
+  });
+
+  test("an --rpc override wins even against a non-default env, with the env endpoint kept as fail-over backup", async (t) => {
+    const before = BULLETIN_ENDPOINTS;
+    t.after(() => setBulletinEndpoints(before));
+    setBulletinEndpoints([DEFAULT_BULLETIN_RPC]);
+
+    const dir = await tmpDir(t, "product-manifest-rpc-override-");
+    const loaded = {
+      config: {
+        ...VALID_CONFIG,
+        domain: "manifestrpctest.dot",
+        icon: { path: "./missing-icon.png", format: "png" },
+        executables: [],
+      },
+      sourcePath: path.join(dir, "polkadot-app-deploy.config.mjs"),
+    };
+
+    await assert.rejects(
+      () => publishManifest({ loaded, domain: "manifestrpctest.dot", env: "devnet", rpc: "wss://custom-override.example" }),
+      err => err.name === "NonRetryableError" && /Cannot read icon/.test(err.message),
+      ">> FAIL: publishManifest #1094 rpc-override setup: expected the icon read to fail (fixture icon is intentionally missing) — check the fixture path, not the fix",
+    );
+
+    assert.deepStrictEqual(
+      BULLETIN_ENDPOINTS,
+      ["wss://custom-override.example", "wss://bulletin-paseo.tservices.es:8443", "wss://bullet.sik.rocks"],
+      ">> FAIL: publishManifest #1094 rpc-override: an explicit --rpc must win over the resolved env's own endpoint, with the env endpoint kept behind it as a fail-over backup",
+    );
+  });
+
+  test("default env (no --env/--rpc passed) resolves to the SAME endpoint deploy() itself would use — non-regression", async (t) => {
+    const before = BULLETIN_ENDPOINTS;
+    t.after(() => setBulletinEndpoints(before));
+    setBulletinEndpoints([DEFAULT_BULLETIN_RPC]);
+
+    const dir = await tmpDir(t, "product-manifest-rpc-default-");
+    const loaded = {
+      config: {
+        ...VALID_CONFIG,
+        domain: "manifestrpctest.dot",
+        icon: { path: "./missing-icon.png", format: "png" },
+        executables: [],
+      },
+      sourcePath: path.join(dir, "polkadot-app-deploy.config.mjs"),
+    };
+
+    await assert.rejects(
+      () => publishManifest({ loaded, domain: "manifestrpctest.dot" }),
+      err => err.name === "NonRetryableError" && /Cannot read icon/.test(err.message),
+      ">> FAIL: publishManifest #1094 default-env setup: expected the icon read to fail (fixture icon is intentionally missing) — check the fixture path, not the fix",
+    );
+
+    // Fork: devnet is DEFAULT_ENV_ID (environments.ts) and the CLI's implicit
+    // default when --env is omitted — must resolve to devnet's OWN Bulletin
+    // endpoints, NOT the DEFAULT_BULLETIN_RPC seed constant (see #1094).
+    assert.deepStrictEqual(
+      BULLETIN_ENDPOINTS,
+      ["wss://bulletin-paseo.tservices.es:8443", "wss://bullet.sik.rocks"],
+      ">> FAIL: publishManifest #1094 default-env: omitting --env must still resolve to devnet's OWN Bulletin endpoints, not the unrelated DEFAULT_BULLETIN_RPC seed constant",
     );
   });
 });

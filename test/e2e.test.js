@@ -21,8 +21,7 @@ import {
   assertStdoutMatches,
   parseLineOrExplain,
   assertOnChainMatches,
-  failWith,
-} from "./helpers/e2e-failure.js";
+  failWith, classifyFixtureState } from "./helpers/e2e-failure.js";
 
 // The CLI prints "CID: bafy..." at the end of a successful deploy. We parse
 // that — not a client-side recomputation — so we verify "what the CLI said
@@ -283,11 +282,23 @@ function buildArgs(fixtureDir, label) {
   // load-bearing for coverage (s1 happy-path, s-inc incremental). Running it
   // unconditionally on every @HEAD scenario added ~70 extra Asset Hub txs per
   // run on Alice's shared nonce stream, evicting sibling jobs from the mempool
-  // and blowing through the 3-attempt × 180s retry budget — observed as the
-  // S9/S6/S4 chain-progress failures on v0.7.28-rc.1 ([run 26410360929]).
+  // and blowing through the 3-attempt × 180s retry budget.
   const MANIFEST_SCENARIOS = new Set(["s1", "s-inc"]);
   if (MANIFEST_SCENARIOS.has(SCENARIO)) {
-    const { configPath } = buildManifestSidecar({ buildDir: fixtureDir, label });
+    // Every caller passes an already-suffixed domain (`${label}.${tld}`), so the
+    // env's TLD is recoverable from the argument itself — buildArgs is sync and
+    // resolveE2eTld() is async, so re-resolving here isn't an option. A bare
+    // label (no dot) falls back to "dot", matching the historical default.
+    // Without this the sidecar appended a second ".dot" to "e2epoolns01.paseo"
+    // and the CLI rejected the config/deploy domain mismatch (#1244).
+    // Every caller passes an already-suffixed domain (`${label}.${tld}`), so the
+    // env's TLD is recoverable from the argument itself — buildArgs is sync and
+    // resolveE2eTld() is async, so re-resolving here isn't an option. A bare
+    // label (no dot) falls back to "dot", matching the historical default.
+    // Without this the sidecar appended a second ".dot" to "e2epoolns01.paseo"
+    // and the CLI rejected the config/deploy domain mismatch (#1244).
+    const sidecarTld = label.includes(".") ? label.slice(label.lastIndexOf(".") + 1) : "dot";
+    const { configPath } = buildManifestSidecar({ buildDir: fixtureDir, label, tld: sidecarTld });
     args.push("--config", configPath);
   }
   return args;
@@ -317,7 +328,21 @@ async function resolveDotnsEnvConnectOptions() {
     autoAccountMapping: resolved.autoAccountMapping,
     contracts: Object.keys(resolved.contracts).length > 0 ? resolved.contracts : undefined,
     nativeToEthRatio: resolved.nativeToEthRatio,
+    tld: resolved.tld,
   };
+}
+
+// #paseo-tld: DotNS's TLD is per-environment (paseo-next-v2 following its
+// redeploy: "paseo" — see src/environments.ts's per-env `tld` field). Every
+// `.dot`-suffixed label/target in this file below must resolve through this
+// helper instead of hardcoding the old suffix, or deploys/assertions
+// silently target the wrong on-chain node once PAD_ENV=paseo-next-v2 runs
+// against the redeployed chain. Mirrors resolveE2eBulletinRpc's "no env
+// selected -> legacy default" fallback.
+async function resolveE2eTld() {
+  if (!PAD_ENV) return "dot";
+  const { doc } = await loadEnvironments();
+  return resolveEndpoints(doc, PAD_ENV).tld ?? "dot";
 }
 
 async function resolveE2eGateway() {
@@ -353,10 +378,11 @@ describe("e2e", { skip: !ENABLED }, () => {
   describe("S1 — happy path, stable label", { skip: SCENARIO !== "s1" }, () => {
     test(`deploy ${SIGNER}/${MERKLE} to stable label`, { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
       const label = pickStableLabel();
+      const tld = await resolveE2eTld();
       const { fixtureDir } = await mutateFixture(RUN_TAG);
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
-          args: buildArgs(fixtureDir, `${label}.dot`),
+          args: buildArgs(fixtureDir, `${label}.${tld}`),
           env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
@@ -375,10 +401,11 @@ describe("e2e", { skip: !ENABLED }, () => {
   describe("S1-SMOKE — happy path, per-run fresh label", { skip: SCENARIO !== "s1-smoke" }, () => {
     test(`smoke ${SIGNER}/${MERKLE} on fresh label`, { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
       const label = pickFreshRunLabel("e2esmoke");
+      const tld = await resolveE2eTld();
       const { fixtureDir } = await mutateFixture(RUN_TAG);
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
-          args: buildArgs(fixtureDir, `${label}.dot`),
+          args: buildArgs(fixtureDir, `${label}.${tld}`),
           env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
@@ -401,10 +428,11 @@ describe("e2e", { skip: !ENABLED }, () => {
       // need a base length >= 9 with exactly two trailing digits so v2 does not
       // require Personhood status that the signer does not already have.
       const label = pickFreshRunLabel("e2e-fresh");
+      const tld = await resolveE2eTld();
       const { fixtureDir } = await mutateFixture(RUN_TAG);
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
-          args: buildArgs(fixtureDir, `${label}.dot`),
+          args: buildArgs(fixtureDir, `${label}.${tld}`),
           env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
@@ -484,142 +512,227 @@ describe("e2e", { skip: !ENABLED }, () => {
     });
   });
 
-  describe("S4 — gh-pages mirror serves the deployed CAR", { skip: SCENARIO !== "s4" }, () => {
-    // GitHub Pages builds usually land within ~1-2 minutes of the push, but
-    // first-time branch creation can take longer and a busy queue bumps it
-    // further. 5 minutes is enough in practice without parking the test
-    // indefinitely on a broken Pages build.
-    const PAGES_WAIT_MS = 5 * 60 * 1000;
-    const PAGES_POLL_INTERVAL_MS = 10_000;
+  // S-TRANSFER-SUBNAME — the `transfer` command's subname path (port of
+  // bulletin-deploy PR #150/#151: the `app.<name>` subnames deploy itself
+  // creates could not be moved by `transfer` at all — a subname argument
+  // failed validateDomainLabel's "Invalid domain label" check on the `.`, and
+  // even past that transferName only moves base names as ERC-721 tokens, so
+  // there was no code path for a subname at all). No E2E coverage of this
+  // path existed anywhere before this scenario.
+  //
+  // Two legs under fresh-per-run parents (mirrors S-SUBDOMAIN's before()):
+  //   handover          — register app.<parent> as Alice, hand it to a
+  //                        recipient via the CLI, verify the on-chain subnode
+  //                        owner actually changed, then re-run for idempotency
+  //   not-parent-owner  — attempt to transfer a subname whose parent is owned
+  //                        by Alice, but signed as an account that is NOT
+  //                        Alice; must fail with the actionable
+  //                        parent-ownership error, never the old misleading
+  //                        "Invalid domain label"
+  describe("S-TRANSFER-SUBNAME — transfer a subname via setSubnodeOwner", { skip: SCENARIO !== "s-transfer-subname", concurrency: false }, () => {
+    const RECIPIENT_H160 = "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01";
+    let freshParent = "";
+    let otherParent = "";
 
-    function parseMirrorUrl(stdout) {
-      return parseLineOrExplain(stdout, {
-        pattern: /Mirror:\s+(https:\/\/\S+\.car)\b/,
-        scenario: "S4",
-        what: "gh-pages mirror URL",
-        hint: "S4 expects '--gh-pages-mirror' to print a 'Mirror: https://...car' line. Missing means the mirror step didn't execute (check the gh-pages push log).",
-      })[1];
-    }
-
-    async function pollUntil200(url, timeoutMs) {
-      const deadline = Date.now() + timeoutMs;
-      let lastStatus = 0;
-      while (Date.now() < deadline) {
-        const res = await fetch(url, { redirect: "follow" });
-        if (res.status === 200) return res;
-        lastStatus = res.status;
-        await new Promise((r) => setTimeout(r, PAGES_POLL_INTERVAL_MS));
-      }
-      throw new Error(`${url} never served 200 within ${timeoutMs}ms (last status ${lastStatus})`);
-    }
-
-    // Pages is CDN-backed; a fresh commit can return 200 for several seconds
-    // while the edge still serves stale bytes. Poll the manifest (which the
-    // CLI writes atomically alongside the CAR) until its `cid` field matches
-    // this deploy's CID — at that point the edge has picked up our commit
-    // and a subsequent CAR fetch is guaranteed fresh. Cache-busting via a
-    // query string is used for the CAR fetch too as a second line of defence.
-    async function pollUntilManifestCidMatches(url, expectedCid, timeoutMs) {
-      const deadline = Date.now() + timeoutMs;
-      let lastCid = null;
-      let lastStatus = 0;
-      while (Date.now() < deadline) {
-        const res = await fetch(url, { redirect: "follow", cache: "no-store" });
-        if (res.status === 200) {
-          const m = await res.json();
-          if (m.cid === expectedCid) return m;
-          lastCid = m.cid;
-        } else {
-          lastStatus = res.status;
-        }
-        await new Promise((r) => setTimeout(r, PAGES_POLL_INTERVAL_MS));
-      }
-      throw new Error(`${url} manifest CID never reached ${expectedCid} within ${timeoutMs}ms (last seen cid=${lastCid ?? "n/a"}, last status=${lastStatus})`);
-    }
-
-    test(`deploy ${SIGNER}/${MERKLE} with --gh-pages-mirror and fetch via Pages`, { timeout: DEPLOY_TIMEOUT_MS + PAGES_WAIT_MS + 60_000 }, async () => {
-      const label = pickStableLabel();
-      const { fixtureDir } = await mutateFixture(RUN_TAG);
-      // Reference copy of the exact bytes the CLI sends to Bulletin. We
-      // can't HTTP-GET from Bulletin directly (content lives in the
-      // TransactionStorage pallet split into chunks; there's no gateway
-      // that ships with Paseo), so we ask the CLI to save the pre-upload
-      // CAR via PAD_DUMP_CAR and compare that file against the
-      // mirror download. Dump is post-encryption, so the bytes match
-      // exactly what Bulletin receives AND what the mirror publishes —
-      // same bytes, same content-hash, same object.
-      const dumpPath = path.join(os.tmpdir(), `e2e-s4-car-${Date.now()}.bin`);
+    before(async () => {
+      freshParent = pickFreshRunLabel("e2exfersub");
+      otherParent = pickFreshRunLabel("e2exfernop");
+      const connectOpts = await resolveDotnsEnvConnectOptions();
+      const reg = new DotNS();
+      await reg.connect({ mnemonic: DEFAULT_MNEMONIC, ...connectOpts });
       try {
-        const { code, stdout, stderr } = await runBulletinDeploy({
-          args: [...buildArgs(fixtureDir, `${label}.dot`), "--gh-pages-mirror"],
-          env: { ...rpcEnv(), PAD_DUMP_CAR: dumpPath },
-          timeoutMs: DEPLOY_TIMEOUT_MS,
-        });
-        assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S4" });
-
-        assert.ok(fs.existsSync(dumpPath), `CLI should have dumped the pre-upload CAR to ${dumpPath}`);
-        const bulletinBytes = new Uint8Array(fs.readFileSync(dumpPath));
-
-        // Mirror URL comes from the CLI output; trusting the CLI's own claim
-        // means a mis-wired Mirror: log line (wrong owner/repo) would fail
-        // the subsequent fetch rather than silently passing.
-        const mirrorUrl = parseMirrorUrl(stdout);
-        const manifestUrl = mirrorUrl.replace(/\.car$/, ".json");
-        const deployedCid = parseDeployedCid(stdout, "S4");
-
-        // Wait for Pages to serve THIS deploy's manifest (CID-matched), then
-        // fetch the CAR with a cache-busting query string. Without this,
-        // the CDN can return 200 while still serving a prior deploy's CAR
-        // for seconds-to-minutes, surfacing as a spurious byte mismatch.
-        const manifest = await pollUntilManifestCidMatches(manifestUrl, deployedCid, PAGES_WAIT_MS);
-        assert.strictEqual(manifest.domain, `${label}.dot`);
-        assert.strictEqual(manifest.encrypted, false);
-
-        const carResp = await fetch(`${mirrorUrl}?v=${deployedCid}`, { redirect: "follow", cache: "no-store" });
-        assert.strictEqual(carResp.status, 200, `CAR URL must serve 200 once manifest is fresh`);
-        const pagesBytes = new Uint8Array(await carResp.arrayBuffer());
-
-        assert.strictEqual(pagesBytes.length, bulletinBytes.length,
-          `Pages CAR is ${pagesBytes.length} bytes; Bulletin CAR is ${bulletinBytes.length} bytes`);
-        assert.ok(Buffer.from(pagesBytes).equals(Buffer.from(bulletinBytes)),
-          `Pages and Bulletin CAR bytes differ (same length ${pagesBytes.length} but content mismatch)`);
+        // freshParent: registered AND given an "app" subname, both owned by
+        // Alice — the handover leg transfers app.<freshParent> to the recipient.
+        await reg.register(freshParent);
+        await reg.registerSubdomain("app", freshParent);
+        // otherParent: registered by Alice only. No subname needed — the
+        // not-parent-owner leg must fail at the parent-ownership check
+        // before transferSubname ever reads the subnode.
+        await reg.register(otherParent);
       } finally {
-        fs.rmSync(fixtureDir, { recursive: true, force: true });
-        fs.rmSync(dumpPath, { force: true });
+        reg.disconnect();
       }
+    });
+
+    test("handover — register app.<parent> as Alice, transfer to a recipient, verify on-chain, idempotent re-run", { timeout: DEPLOY_TIMEOUT_MS + 60_000 }, async () => {
+      const tld = await resolveE2eTld();
+      const target = `app.${freshParent}.${tld}`;
+      const envArgs = PAD_ENV ? ["--env", PAD_ENV] : [];
+
+      const t1 = await runBulletinDeploy({
+        args: ["transfer", target, "--to", RECIPIENT_H160, ...envArgs],
+        env: rpcEnv(),
+        timeoutMs: DEPLOY_TIMEOUT_MS,
+      });
+      assert.equal(
+        t1.code, 0,
+        `>> FAIL: S-TRANSFER-SUBNAME handover: transfer command exited ${t1.code}: ${(t1.stderr || t1.stdout).split("\n").slice(-3).join(" ")}`,
+      );
+      assert.match(
+        t1.stdout, /Transferred .* to 0x41dccbd4/i,
+        ">> FAIL: S-TRANSFER-SUBNAME handover: transfer command did not report a successful handover to the recipient",
+      );
+
+      // On-chain proof the subnode owner actually changed. Any connected
+      // account can read it — checkSubdomainOwnership returns the raw
+      // registry owner regardless of which account is connected; only its
+      // `owned` field is relative to the connected signer, and we don't use
+      // that here.
+      const verifier = new DotNS();
+      await verifier.connect({ mnemonic: DEFAULT_MNEMONIC, ...(await resolveDotnsEnvConnectOptions()) });
+      let onChainOwner;
+      try {
+        ({ owner: onChainOwner } = await verifier.checkSubdomainOwnership("app", freshParent));
+      } finally {
+        verifier.disconnect();
+      }
+      assert.equal(
+        onChainOwner?.toLowerCase(), RECIPIENT_H160.toLowerCase(),
+        `>> FAIL: S-TRANSFER-SUBNAME handover: on-chain subnode owner is ${onChainOwner}, expected the recipient ${RECIPIENT_H160} — the CLI reported success but the registry disagrees`,
+      );
+
+      // Re-run: idempotent no-op (recipient already owns it).
+      const t2 = await runBulletinDeploy({
+        args: ["transfer", target, "--to", RECIPIENT_H160, ...envArgs],
+        env: rpcEnv(),
+        timeoutMs: DEPLOY_TIMEOUT_MS,
+      });
+      assert.equal(
+        t2.code, 0,
+        `>> FAIL: S-TRANSFER-SUBNAME handover: idempotent re-run exited ${t2.code}: ${(t2.stderr || t2.stdout).split("\n").slice(-3).join(" ")}`,
+      );
+      assert.match(
+        t2.stdout, /already owned by/i,
+        ">> FAIL: S-TRANSFER-SUBNAME handover: second transfer should be a no-op (already-owned), not a re-transfer",
+      );
+    });
+
+    // Regression guard for the ORIGINAL bug this scenario exists to cover: a
+    // subname argument must never fall through to validateDomainLabel's
+    // "Invalid domain label" rejection, and the real failure mode (signer
+    // isn't the parent owner) must be reported actionably.
+    test("not-parent-owner — transferring a subname under a parent you don't own fails with the actionable ownership error, not 'Invalid domain label'", { timeout: DEPLOY_TIMEOUT_MS + 60_000 }, async () => {
+      const tld = await resolveE2eTld();
+      const target = `app.${otherParent}.${tld}`;
+      const envArgs = PAD_ENV ? ["--env", PAD_ENV] : [];
+
+      // otherParent is owned by Alice (root, DEFAULT_MNEMONIC). Sign this
+      // attempt as the well-known dev account //Bob instead — a real, funded
+      // account on this testnet (see attemptTestnetTopUp in src/dotns.ts) but
+      // NOT the parent owner. DOTNS_KEY_URI is read directly by
+      // DotNS.connect() and takes precedence over the CLI's default mnemonic;
+      // unlike --mnemonic (which transfer.ts doesn't expose a
+      // --derivation-path for), it's parsed as a full Substrate URI (phrase +
+      // derivation), giving us a distinct signer identity with zero CLI
+      // plumbing changes.
+      const t = await runBulletinDeploy({
+        args: ["transfer", target, "--to", RECIPIENT_H160, ...envArgs],
+        env: { ...rpcEnv(), DOTNS_KEY_URI: `${DEFAULT_MNEMONIC}//Bob` },
+        timeoutMs: DEPLOY_TIMEOUT_MS,
+      });
+      assert.notEqual(
+        t.code, 0,
+        `>> FAIL: S-TRANSFER-SUBNAME not-parent-owner: expected a non-zero exit (signer //Bob does not own ${otherParent}.${tld}), got exit 0 — the parent-ownership guard did not fire`,
+      );
+      assert.match(
+        t.stderr, /only the owner of the parent/i,
+        `>> FAIL: S-TRANSFER-SUBNAME not-parent-owner: expected the actionable parent-ownership error, got: ${t.stderr.split("\n").slice(-5).join(" ")}`,
+      );
+      assert.doesNotMatch(
+        t.stderr, /Invalid domain label/i,
+        ">> FAIL: S-TRANSFER-SUBNAME not-parent-owner: got the OLD misleading 'Invalid domain label' rejection instead — the subname argument fell through to validateDomainLabel rather than being routed to transferSubname (this is the exact bug #150/#151 fixed)",
+      );
     });
   });
 
   describe("S3 — domain owned by different account", { skip: SCENARIO !== "s3" }, () => {
     test(`deploy to pre-owned label rejects with exit 78`, { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
       const { fixtureDir } = await mutateFixture(RUN_TAG);
+      const tld = await resolveE2eTld();
+      // Env-conditional: the two fixtures are provisioned separately, so a
+      // failure must name which one it actually used — otherwise the operator
+      // repairs the wrong label.
+      // Label is e2eownedns03 (not e2eownedns02) on paseo-next-v2: the Asset
+      // Hub re-genesis emptied the .paseo namespace, and by the time this
+      // fixture was (re-)provisioned a third party had already registered
+      // e2eownedns02.paseo (owner 0x237a2b18…, neither Bob nor the funder) —
+      // it can't be repaired, the name simply isn't ours on this chain.
+      // Verified live 2026-08-22 via checkOwnership: e2eownedns02.paseo owner
+      // 0x237a2b1824AC4a87095c25EC30e1431060725909 (squatter), e2eownedns03.paseo
+      // owner 0x41dCCBD49b26c50d34355Ed86ff0FA9E489d1e01 (Bob, BOB_H160 below).
+      const ownedLabel = PAD_ENV === "paseo-next-v2"
+        ? `e2eownedns03.${tld}`
+        : `e2eownedns01.${tld}`;
+      const envLabel = PAD_ENV ?? "paseo-next-v2";
       try {
-        const { code, stderr } = await runBulletinDeploy({
+        const { code, stdout, stderr } = await runBulletinDeploy({
           // S3 needs a label owned by a DIFFERENT account from the deploy signer.
           // `e2eowned.dot` was the historical fixture for PopFull signers but its
           // chain ownership drifted to Alice (see e2e run 26648857693 / v0.7.30-rc.1
           // S3 failure — `transferFrom` reverts with a custom error so we can't easily
-          // restore it). Both `e2eownedns01.dot` and `e2eownedns02.dot` are
+          // restore it). Both `e2eownedns01.<tld>` and `e2eownedns03.<tld>` are
           // PoP-class-compatible with all signers (≥9-char NoStatus, accepts Full
-          // signers fine) and are stable-owned by Bob on both paseo-next-v2 and
-          // preview — use the same env-conditional for every PoP status.
-          args: buildArgs(fixtureDir, PAD_ENV === "paseo-next-v2" ? "e2eownedns02.dot" : "e2eownedns01.dot"),
+          // signers fine) and are stable-owned by Bob on both envs — use the same
+          // env-conditional for every PoP status.
+          args: buildArgs(fixtureDir, ownedLabel),
           env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
+        // Bob's H160 (from docs/e2e-bootstrap.md).
+        const BOB_H160 = "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01";
+        const combined = `${stdout}\n${stderr}`;
+
+        // Distinguish FIXTURE DRIFT from a product regression before asserting
+        // on the exit code. Both surface as "got 0", but they need completely
+        // different responses — and a bare exit-code mismatch reads like a
+        // product bug, which is how this sat red for a week in bulletin-deploy.
+        const fixture = classifyFixtureState({ output: combined, expectedOwner: BOB_H160 });
+        const fixtureMissing = fixture.kind === "missing";
+        const driftedTo = fixture.kind === "drifted" ? fixture.owner : null;
+
+        if (fixtureMissing || driftedTo) {
+          const observed = fixtureMissing
+            ? `${ownedLabel} is UNREGISTERED (reported "available")`
+            : `${ownedLabel} is owned by ${driftedTo}, not Bob (${BOB_H160})`;
+          failWith({
+            scenario: "S3",
+            message:
+              `fixture drift on env "${envLabel}" — ${observed}. ` +
+              `This is a test-fixture problem, NOT a polkadot-app-deploy regression: ` +
+              `the CLI behaved correctly for the chain state it was given. ` +
+              `Fix: this scenario needs ${ownedLabel} owned by an account OTHER than the deploy signer. Ask the chain admin to register it to a third party on ${envLabel} — this repo ships no fixture-registration tool.`,
+            context: combined,
+            keywords: ["available", "already owned", "Domain"],
+            hint:
+              "A testnet re-genesis wipes registrations; the next S3 run then finds the label free " +
+              "and the deploy signer registers it to ITSELF, so every later run exits 0 instead of 78. " +
+              "register-test-fixture is idempotent and repairs both cases.",
+          });
+        }
+
         if (code !== 78) {
           failWith({
             scenario: "S3",
-            message: `expected EXIT_CODE_NO_RETRY (78), got ${code}`,
-            context: stderr,
+            message: `expected EXIT_CODE_NO_RETRY (78), got ${code} for ${ownedLabel} on env "${envLabel}"`,
+            context: combined,
             keywords: ["Error", "already owned", "domain"],
             hint: "S3 deploys to a domain owned by a DIFFERENT account; the CLI must refuse with exit 78 (no-retry).",
           });
         }
-        // Bob's H160 (from docs/e2e-bootstrap.md). Pinning to this specific
-        // owner rather than a generic pattern catches regressions where the
-        // preflight rejects for the wrong reason (e.g. network error).
-        assert.match(stderr, /is already owned by 0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01/i);
+
+        // Pinning to Bob specifically (not a generic pattern) catches a reject
+        // that happened for the wrong reason — e.g. a network error.
+        if (!new RegExp(`is already owned by ${BOB_H160}`, "i").test(stderr)) {
+          failWith({
+            scenario: "S3",
+            message:
+              `exited 78 but the rejection did not name Bob (${BOB_H160}) as owner of ${ownedLabel} ` +
+              `on env "${envLabel}" — the deploy was refused for the wrong reason`,
+            context: combined,
+            keywords: ["already owned", "Error", "Domain"],
+            hint: "Exit 78 is also used for other non-retryable refusals; S3 must fail specifically on ownership.",
+          });
+        }
       } finally {
         fs.rmSync(fixtureDir, { recursive: true, force: true });
       }
@@ -653,10 +766,11 @@ describe("e2e", { skip: !ENABLED }, () => {
       // (where the retry path lives in src/dotns.ts), not setContenthash.
       // Mirrors the .github/workflows/e2e.yml nightly-s5 fix from #205.
       const label = pickFreshRunLabel("e2e-s5");
+      const tld = await resolveE2eTld();
       const { fixtureDir } = await mutateFixture(RUN_TAG);
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
-          args: buildArgs(fixtureDir, `${label}.dot`),
+          args: buildArgs(fixtureDir, `${label}.${tld}`),
           env: { ...rpcEnv(), DOTNS_COMMITMENT_BUFFER: "0" },
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
@@ -689,10 +803,11 @@ describe("e2e", { skip: !ENABLED }, () => {
   describe("S6 — primary RPC unreachable, papi rotates to backup", { skip: SCENARIO !== "s6" }, () => {
     test(`deploy ${SIGNER}/${MERKLE} with unroutable primary RPC succeeds via failover`, { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
       const label = pickStableLabel();
+      const tld = await resolveE2eTld();
       const { fixtureDir } = await mutateFixture(RUN_TAG);
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
-          args: buildArgs(fixtureDir, `${label}.dot`),
+          args: buildArgs(fixtureDir, `${label}.${tld}`),
           env: { BULLETIN_RPC: "ws://127.0.0.1:1/" },
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
@@ -771,6 +886,7 @@ describe("e2e", { skip: !ENABLED }, () => {
     // getSlotSignerProvider was selected over pool fallback.
     test(`full deploy() routes Bulletin storage through storageSigner when provided`, { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
       const label = signerPopStatus >= 2 ? "e2epool" : "e2epoolns01";
+      const tld = await resolveE2eTld();
 
       await cryptoWaitReady();
       const keyring = new Keyring({ type: "sr25519" });
@@ -798,7 +914,7 @@ describe("e2e", { skip: !ENABLED }, () => {
         // CLI's --env does — pass `env`, NOT a partial mix of rpc + contracts,
         // so the bulletin RPC and the DotNS contract addresses stay consistent.
         const bulletinRpc = await resolveE2eBulletinRpc();
-        await deploy(fixtureDir, `${label}.dot`, {
+        await deploy(fixtureDir, `${label}.${tld}`, {
           signer: polkadotSigner,
           signerAddress: account.address,
           // S7b contract: programmatic callers pass storageSigner explicitly.
@@ -833,12 +949,13 @@ describe("e2e", { skip: !ENABLED }, () => {
   describe("S-INC-ROUNDTRIP — gateway readback integrity", { skip: SCENARIO !== "s-inc-roundtrip" }, () => {
     test(`manifest embedded in deployed CAR matches local manifest.json`, { timeout: (DEPLOY_TIMEOUT_MS + 30_000) * 2 }, async () => {
       const label = pickIncLabel();
+      const tld = await resolveE2eTld();
       const gateway = await resolveE2eGateway();
       const fix1 = fs.mkdtempSync(path.join(os.tmpdir(), "e2einc-rt-"));
       buildIncrementalFixture({ targetDir: fix1, seed: "s-inc-roundtrip", runTag: RUN_TAG + "-rt" });
       try {
         const r1 = await runBulletinDeploy({
-          args: buildArgs(fix1, `${label}.dot`),
+          args: buildArgs(fix1, `${label}.${tld}`),
           env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
@@ -886,13 +1003,14 @@ describe("e2e", { skip: !ENABLED }, () => {
   describe("S-INC-PORTABILITY — cross-workspace dedup", { skip: SCENARIO !== "s-inc-portability" }, () => {
     test(`second deploy from a fresh workspace gets ≥ 95 % chunk-skip rate`, { timeout: (DEPLOY_TIMEOUT_MS + 30_000) * 2 }, async () => {
       const label = pickIncLabel();
+      const tld = await resolveE2eTld();
       const fix1 = fs.mkdtempSync(path.join(os.tmpdir(), "e2einc-port-A-"));
       const fix2 = fs.mkdtempSync(path.join(os.tmpdir(), "e2einc-port-B-"));
       buildIncrementalFixture({ targetDir: fix1, seed: "s-inc-portability", runTag: RUN_TAG + "-port" });
       try {
         // Deploy from workspace A
         const r1 = await runBulletinDeploy({
-          args: buildArgs(fix1, `${label}.dot`),
+          args: buildArgs(fix1, `${label}.${tld}`),
           env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
@@ -912,7 +1030,7 @@ describe("e2e", { skip: !ENABLED }, () => {
 
         // Deploy from workspace B (same content, manifest imported from A)
         const r2 = await runBulletinDeploy({
-          args: buildArgs(fix2, `${label}.dot`),
+          args: buildArgs(fix2, `${label}.${tld}`),
           env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
@@ -959,6 +1077,7 @@ describe("e2e", { skip: !ENABLED }, () => {
   describe("S-INC-ASSET-ROTATION — realistic Vite rebuild", { skip: SCENARIO !== "s-inc-asset-rotation" }, () => {
     test(`bundle filename rotation re-uploads only the changed file`, { timeout: (DEPLOY_TIMEOUT_MS + 30_000) * 2 }, async () => {
       const label = pickRotLabel();
+      const tld = await resolveE2eTld();
       const fixtureRoot = path.resolve("test/fixtures/realistic-vite");
       const fix1 = fs.mkdtempSync(path.join(os.tmpdir(), "e2erot-"));
       // Stage v1 of the build into the deploy workspace.
@@ -967,7 +1086,7 @@ describe("e2e", { skip: !ENABLED }, () => {
         // First deploy: 9.6 MB site, all chunks new (or already on chain from
         // a prior test run — we don't assert on first-deploy chunk-skip rate).
         const r1 = await runBulletinDeploy({
-          args: buildArgs(fix1, `${label}.dot`),
+          args: buildArgs(fix1, `${label}.${tld}`),
           env: { ...rpcEnv(), NODE_OPTIONS: "--max-old-space-size=512" },
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
@@ -987,7 +1106,7 @@ describe("e2e", { skip: !ENABLED }, () => {
         // Second deploy: only the rotated bundle + HTML should be new.
         // Same heap bump for the redeploy — phase B re-merkleizes the same site.
         const r2 = await runBulletinDeploy({
-          args: buildArgs(fix1, `${label}.dot`),
+          args: buildArgs(fix1, `${label}.${tld}`),
           env: { ...rpcEnv(), NODE_OPTIONS: "--max-old-space-size=512" },
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
@@ -1020,6 +1139,7 @@ describe("e2e", { skip: !ENABLED }, () => {
   describe("S-INC — incremental upload v2 (chunk reuse on re-deploy)", { skip: SCENARIO !== "s-inc" }, () => {
     test(`re-deploy identical content reuses chunks via gateway probe`, { timeout: (DEPLOY_TIMEOUT_MS + 30_000) * 2 }, async () => {
       const label = pickIncLabel();
+      const tld = await resolveE2eTld();
       // 5MB fixture so chunks > 1 — gives the incremental path actual chunk
       // reuse to exercise. The mutated SPA fixture (~500B) fits in a single
       // chunk; a single chunk always changes between deploys because the
@@ -1028,7 +1148,7 @@ describe("e2e", { skip: !ENABLED }, () => {
       buildIncrementalFixture({ targetDir: fix1, seed: "s-inc", runTag: RUN_TAG + "-inc" });
       try {
         const r1 = await runBulletinDeploy({
-          args: buildArgs(fix1, `${label}.dot`),
+          args: buildArgs(fix1, `${label}.${tld}`),
           env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
@@ -1062,7 +1182,7 @@ describe("e2e", { skip: !ENABLED }, () => {
         buildIncrementalFixture({ targetDir: fix2, seed: "s-inc", runTag: RUN_TAG + "-inc" });
         try {
           const r2 = await runBulletinDeploy({
-            args: buildArgs(fix2, `${label}.dot`),
+            args: buildArgs(fix2, `${label}.${tld}`),
             env: rpcEnv(),
             timeoutMs: DEPLOY_TIMEOUT_MS,
           });
@@ -1185,7 +1305,8 @@ describe("e2e", { skip: !ENABLED }, () => {
         upstream: await resolveE2eBulletinRpc(),
       });
       try {
-        const args = buildArgs(fixtureDir, `${label}.dot`);
+        const tld = await resolveE2eTld();
+        const args = buildArgs(fixtureDir, `${label}.${tld}`);
         const { code, stdout, stderr } = await runBulletinDeploy({
           args,
           env: { BULLETIN_RPC: proxy.url },
@@ -1232,7 +1353,8 @@ describe("e2e", { skip: !ENABLED }, () => {
         upstream: await resolveE2eBulletinRpc(),
       });
       try {
-        const args = buildArgs(fixtureDir, `${label}.dot`);
+        const tld = await resolveE2eTld();
+        const args = buildArgs(fixtureDir, `${label}.${tld}`);
         const { code, stdout, stderr } = await runBulletinDeploy({
           args,
           env: { BULLETIN_RPC: proxy.url },
@@ -1269,11 +1391,12 @@ describe("e2e", { skip: !ENABLED }, () => {
       // sanitizer and rejected (see e2e run 26648857693 / v0.7.30-rc.1 S9).
       const labelA = pickFreshRunLabel("s9racea");
       const labelB = pickFreshRunLabel("s9raceb");
+      const tld = await resolveE2eTld();
 
       function s9Args(fixtureDir, label) {
         return [
           fixtureDir,
-          `${label}.dot`,
+          `${label}.${tld}`,
           "--tag", process.env.DEPLOY_TAG,
           "--mnemonic", ALICE_MNEMONIC,
           ...(MERKLE === "js" ? ["--js-merkle"] : []),
@@ -1354,9 +1477,10 @@ describe("e2e", { skip: !ENABLED }, () => {
       const { fixtureDir } = await makeMultiChunkFixture(`s-grandpa-reupload-${RUN_TAG}`);
       try {
         const label = pickFreshRunLabel("sgreupload");
+        const tld = await resolveE2eTld();
         const args = [
           fixtureDir,
-          `${label}.dot`,
+          `${label}.${tld}`,
           "--tag", process.env.DEPLOY_TAG,
           "--mnemonic", ALICE_MNEMONIC,
           ...(directSignerDerivationPath() ? ["--derivation-path", directSignerDerivationPath()] : []),
@@ -1436,11 +1560,12 @@ describe("e2e", { skip: !ENABLED }, () => {
     // triggering expiry on slower batches.
     test("forced chunk expiry engages the retry path", { timeout: DEPLOY_TIMEOUT_MS + 3 * 60 * 1000 }, async () => {
       const label = noStatusRunLabel("smortality");
+      const tld = await resolveE2eTld();
       const { fixtureDir } = await makeMultiChunkFixture(`s-mortality-${RUN_TAG}`);
       try {
         const args = [
           fixtureDir,
-          `${label}.dot`,
+          `${label}.${tld}`,
           "--tag", process.env.DEPLOY_TAG,
           "--mnemonic", ALICE_MNEMONIC,
           ...(MERKLE === "js" ? ["--js-merkle"] : []),
@@ -1515,10 +1640,11 @@ describe("e2e", { skip: !ENABLED }, () => {
       // Register a fresh parent name for this run so legs don't depend on
       // persistent fixture state. Mirrors exactly how S2 does fresh registration.
       freshParent = pickFreshRunLabel("e2esub");
+      const tld = await resolveE2eTld();
       const { fixtureDir } = await mutateFixture(RUN_TAG);
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
-          args: buildArgs(fixtureDir, `${freshParent}.dot`),
+          args: buildArgs(fixtureDir, `${freshParent}.${tld}`),
           env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
@@ -1529,8 +1655,9 @@ describe("e2e", { skip: !ENABLED }, () => {
     });
 
     // Leg 1: basic happy-path subdomain deploy.
-    test("basic — app.<parent>.dot deploys and resolves on-chain", { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
-      const target = `app.${freshParent}.dot`;
+    test("basic — app.<parent>.<tld> deploys and resolves on-chain", { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
+      const tld = await resolveE2eTld();
+      const target = `app.${freshParent}.${tld}`;
       const { fixtureDir } = await mutateFixture(RUN_TAG + "-sub-basic");
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
@@ -1554,11 +1681,14 @@ describe("e2e", { skip: !ENABLED }, () => {
     });
 
     // Leg 2: long-digits regression guard (#654 trailing-digit sanitiser bug).
-    // parseDomainName now uses skipSanitize:true for sublabels, so "pr265" is
-    // preserved as-is. This leg MUST pass on current main; the assertion at the
-    // subnode "pr265.<parent>" would return empty if the digit suffix was stripped.
-    test("long-digits — pr265.<parent>.dot sublabel preserved (regression guard #654)", { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
-      const target = `pr265.${freshParent}.dot`;
+    // parseDomainName's subname branch never applies any digit-count rule to
+    // a sublabel (validateDomainLabel is contract-syntax-only there), so
+    // "pr265" is preserved as-is. This leg MUST pass on current main; the
+    // assertion at the subnode "pr265.<parent>" would return empty if the
+    // digit suffix was stripped.
+    test("long-digits — pr265.<parent>.<tld> sublabel preserved (regression guard #654)", { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
+      const tld = await resolveE2eTld();
+      const target = `pr265.${freshParent}.${tld}`;
       const { fixtureDir } = await mutateFixture(RUN_TAG + "-sub-digits");
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
@@ -1585,9 +1715,10 @@ describe("e2e", { skip: !ENABLED }, () => {
     // prevent trailing-digit sanitiser from reducing the uniqueness guarantee).
     // isExpectedError("Cannot deploy ...: parent ....dot is owned by no one") → true
     // → deploy.expected='true', exit 78 (NonRetryableError → EXIT_CODE_NO_RETRY).
-    test("orphan — sub.<nonexistent>.dot rejected with exit 78", { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
+    test("orphan — sub.<nonexistent>.<tld> rejected with exit 78", { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
+      const tld = await resolveE2eTld();
       const orphanParent = noStatusRunLabel("nonexist");
-      const target = `sub.${orphanParent}.dot`;
+      const target = `sub.${orphanParent}.${tld}`;
       const { fixtureDir } = await mutateFixture(RUN_TAG + "-sub-orphan");
       try {
         const { code, stderr } = await runBulletinDeploy({
@@ -1604,10 +1735,12 @@ describe("e2e", { skip: !ENABLED }, () => {
             hint: "S-SUBDOMAIN orphan deploys to a subdomain whose parent does not exist; the CLI must refuse with exit 78 (NonRetryableError). A non-78 exit means either the guard path is broken or the parent was unexpectedly registered.",
           });
         }
+        // #paseo-tld: generalized to accept THIS env's tld, mirroring the
+        // naming.subdomain_orphan regex fix in src/telemetry.ts.
         assert.match(
           stderr,
-          /Cannot deploy\s+[\w.-]+\.dot:\s*parent\s+[\w.-]+\.dot\s+is owned by no one/i,
-          `>> FAIL: S-SUBDOMAIN orphan: expected "Cannot deploy ... parent ....dot is owned by no one" in stderr — naming.subdomain_orphan guard did not fire`,
+          new RegExp(`Cannot deploy\\s+[\\w.-]+\\.${tld}:\\s*parent\\s+[\\w.-]+\\.${tld}\\s+is owned by no one`, "i"),
+          `>> FAIL: S-SUBDOMAIN orphan: expected "Cannot deploy ... parent ....${tld} is owned by no one" in stderr — naming.subdomain_orphan guard did not fire`,
         );
       } finally {
         fs.rmSync(fixtureDir, { recursive: true, force: true });
@@ -1620,7 +1753,8 @@ describe("e2e", { skip: !ENABLED }, () => {
       // Use a fresh per-run label so first deploy hits register() rather than
       // racing with S1 on the stable pool label. Env var LABEL lets the nightly workflow
       // pass a unique per-run label; default falls back to a local stable label.
-      const label = process.env.LABEL ?? (signerPopStatus >= 2 ? "e2escarpool.dot" : "e2escarpool01.dot");
+      const tld = await resolveE2eTld();
+      const label = process.env.LABEL ?? (signerPopStatus >= 2 ? `e2escarpool.${tld}` : `e2escarpool01.${tld}`);
       const { fixtureDir } = await mutateFixture(RUN_TAG);
       const dumpPath = path.join(os.tmpdir(), `e2e-s-car-${Date.now()}.car`);
       try {
@@ -1651,12 +1785,166 @@ describe("e2e", { skip: !ENABLED }, () => {
 
         // On-chain DotNS contenthash must reflect the --input-car deploy.
         const expectedHash = ("0x" + encodeContenthash(cid2)).toLowerCase();
-        const labelBare = label.replace(/\.dot$/, "");
+        const labelBare = label.replace(new RegExp(`\\.${tld}$`), "");
         const onChain = await readContenthashWithRetry(labelBare, expectedHash, 6, 10_000);
         assertOnChainMatches(onChain.toLowerCase(), expectedHash, { scenario: "S-CAR", label: labelBare });
       } finally {
         fs.rmSync(fixtureDir, { recursive: true, force: true });
         fs.rmSync(dumpPath, { force: true });
+      }
+    });
+  });
+
+  // #1163: --no-manifest (--content-only) must take the content-only path even
+  // when a product config is discoverable — proving shouldPublishManifest()'s
+  // short-circuit actually fires in the real CLI, not just in unit tests.
+  // The per-leg pool domain (BULLETIN_POOL_ACCOUNT_INDEX, #1054) dedicated to
+  // this scenario never sees a manifest publish, so "manifest text record
+  // empty" / "app subname absent" hold across every re-run, not just the first.
+  describe("S-CONTENT-ONLY — --no-manifest skips manifest publishing despite a discoverable config (#1163)", { skip: SCENARIO !== "s-content-only" }, () => {
+    test(`deploy ${SIGNER}/${MERKLE} with --no-manifest takes the content-only path`, { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
+      const label = perLegPoolLabel() ?? pickFreshRunLabel("e2enomani");
+      const tld = await resolveE2eTld();
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+      const { configPath, sidecarDir } = buildManifestSidecar({ buildDir: fixtureDir, label: `${label}.${tld}`, tld });
+      try {
+        const args = [...buildArgs(fixtureDir, `${label}.${tld}`), "--config", configPath, "--no-manifest"];
+        const { code, stdout, stderr } = await runBulletinDeploy({
+          args,
+          env: rpcEnv(),
+          timeoutMs: DEPLOY_TIMEOUT_MS,
+        });
+        assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-CONTENT-ONLY" });
+
+        // The plain content deploy must still have succeeded and resolve
+        // on-chain — --no-manifest changes ONLY the manifest-publish decision.
+        const deployedCid = parseDeployedCid(stdout, "S-CONTENT-ONLY");
+        const expected = ("0x" + encodeContenthash(deployedCid)).toLowerCase();
+        const onChain = await readContenthashWithRetry(label, expected);
+        assertOnChainMatches(onChain, expected, { scenario: "S-CONTENT-ONLY", label });
+
+        // #1163: assert the manifest path never ran, despite the config at
+        // configPath being genuinely discoverable (tryLoadProductConfig still
+        // loads it — shouldPublishManifest() is what must gate the skip).
+        const connectOpts = await resolveDotnsEnvConnectOptions();
+        const dotns = new DotNS();
+        await dotns.connect({ mnemonic: ALICE_MNEMONIC, ...connectOpts });
+        try {
+          const manifestText = await dotns.getTextRecord(label, "manifest");
+          if (manifestText !== "") {
+            failWith({
+              scenario: "S-CONTENT-ONLY",
+              message: `root 'manifest' text record must be empty with --no-manifest set, got ${manifestText.length} B`,
+              context: manifestText,
+              hint: "a non-empty record means --no-manifest did not short-circuit shouldPublishManifest() (#1163) even though a config was discoverable.",
+            });
+          }
+
+          const appSub = await dotns.checkSubdomainOwnership("app", label);
+          if (appSub.owner !== null) {
+            failWith({
+              scenario: "S-CONTENT-ONLY",
+              message: `app.${label}.${tld} subname must not exist with --no-manifest set (owner=${appSub.owner})`,
+              hint: "manifest publish (which registers per-executable subnames) must never run when --no-manifest is set.",
+            });
+          }
+        } finally {
+          dotns.disconnect();
+        }
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+        fs.rmSync(sidecarDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // #1094: publishManifest must resolve ITS OWN Bulletin endpoint from the
+  // deploy's --env/--rpc (via resolveBulletinEndpoints/setBulletinEndpoints —
+  // the same precedence deploy() itself uses) before uploading the icon,
+  // otherwise the icon lands on the module's hardcoded DEFAULT_BULLETIN_RPC
+  // regardless of which chain the rest of the deploy targeted.
+  //
+  // This exercises that resolution against a REAL non-default env end-to-end.
+  // Every e2eEligible env in environments.json (paseo-next-v2, devnet) has a
+  // Bulletin endpoint that differs from DEFAULT_BULLETIN_RPC, and
+  // nightly-pr-coverage always sets PAD_ENV via select-env, so this
+  // scenario is "non-default" by construction in CI.
+  //
+  // Note: the exact standalone-call regression #1094 fixed (publishManifest()
+  // invoked without a preceding in-process deploy() in the same process) can't
+  // be reproduced through the CLI, because the CLI always calls deploy()
+  // before publishManifest() in one process, and deploy() sets the
+  // module-level Bulletin endpoint as a side effect either way. That exact
+  // standalone-call shape is unit-tested directly in
+  // test/product-manifest.test.js. This E2E scenario instead proves the real
+  // end-to-end behavior a unit test (which mocks the network) cannot: the
+  // icon actually lands on, and is fetchable from, the resolved env's own
+  // gateway.
+  describe("S-MANIFEST-ENV — manifest publish honors --env for icon Bulletin storage on a non-default env (#1094)", { skip: SCENARIO !== "s-manifest-env" }, () => {
+    test(`deploy ${SIGNER}/${MERKLE} with a manifest lands the icon on the resolved env's Bulletin chain`, { timeout: DEPLOY_TIMEOUT_MS + 5 * 60 * 1000 + 30_000 }, async () => {
+      assert.ok(PAD_ENV,
+        ">> FAIL: S-MANIFEST-ENV: requires PAD_ENV set to a non-default env (e.g. paseo-next-v2) — this scenario specifically exercises publishManifest's --env-aware Bulletin storage (#1094).");
+
+      const label = perLegPoolLabel() ?? pickFreshRunLabel("e2emanenv");
+      const tld = await resolveE2eTld();
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+      const { configPath, iconPath, sidecarDir } = buildManifestSidecar({ buildDir: fixtureDir, label: `${label}.${tld}`, tld });
+      try {
+        const args = [...buildArgs(fixtureDir, `${label}.${tld}`), "--config", configPath];
+        const { code, stdout, stderr } = await runBulletinDeploy({
+          args,
+          env: rpcEnv(),
+          timeoutMs: DEPLOY_TIMEOUT_MS,
+        });
+        assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-MANIFEST-ENV" });
+
+        const deployedCid = parseDeployedCid(stdout, "S-MANIFEST-ENV");
+        const expected = ("0x" + encodeContenthash(deployedCid)).toLowerCase();
+        const onChain = await readContenthashWithRetry(label, expected);
+        assertOnChainMatches(onChain, expected, { scenario: "S-MANIFEST-ENV", label });
+
+        const iconCid = parseLineOrExplain(stdout, {
+          // The icon is a single small file → a raw-codec CIDv1 ("bafk…"), NOT
+          // the dag-pb "bafy…" of a directory/root. Match any CIDv1 base32
+          // (baf…) so both codecs are accepted (the earlier bafy-only pattern
+          // false-failed S-MANIFEST-ENV on the real bafk icon CID).
+          pattern: /Icon CID:\s+(baf\S+)/,
+          scenario: "S-MANIFEST-ENV",
+          what: "manifest icon CID",
+          hint: "publishManifest logs 'Icon CID: bafk...' right after uploading the icon (src/manifest/publish.ts). Missing means manifest publish either didn't run or failed before reaching the icon upload — check for a preceding 'Manifest publish failed' line.",
+        })[1];
+
+        // Poll the RESOLVED env's own gateway (not the module default) —
+        // gateway indexing lags the on-chain write by a few seconds (same
+        // tolerance pattern as S-INC's root-URL poll above).
+        const gatewayBase = await resolveE2eGateway();
+        const iconUrl = `${gatewayBase}/ipfs/${iconCid}`;
+        const wantBytes = fs.readFileSync(iconPath);
+        let gotBytes = null;
+        let lastStatus = null;
+        const deadline = Date.now() + 5 * 60 * 1000;
+        while (Date.now() < deadline) {
+          try {
+            const res = await fetch(iconUrl, { cache: "no-store" });
+            lastStatus = res.status;
+            if (res.status === 200) {
+              gotBytes = Buffer.from(await res.arrayBuffer());
+              if (gotBytes.equals(wantBytes)) break;
+            }
+          } catch { /* network blips OK — same tolerance as S-INC's poll */ }
+          await new Promise((r) => setTimeout(r, 10_000));
+        }
+
+        if (!gotBytes || !gotBytes.equals(wantBytes)) {
+          failWith({
+            scenario: "S-MANIFEST-ENV",
+            message: `icon CID ${iconCid} not retrievable (byte-identical) from ${PAD_ENV}'s own gateway (${iconUrl}) within 5 min (last HTTP status ${lastStatus})`,
+            hint: "publishManifest may have uploaded the icon to the wrong Bulletin chain (DEFAULT_BULLETIN_RPC instead of the resolved env) — the #1094 regression this scenario guards against.",
+          });
+        }
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+        fs.rmSync(sidecarDir, { recursive: true, force: true });
       }
     });
   });

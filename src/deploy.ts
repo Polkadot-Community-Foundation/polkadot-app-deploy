@@ -8,7 +8,7 @@ import { statementSigningAccount } from "./sss-allowance.js";
 import { preflightSssAllowance } from "./sss-allowance-cache.js";
 import { sha256 } from "@noble/hashes/sha256";
 import { blake2b } from "@noble/hashes/blake2b";
-import { createClient as createPolkadotClient, Enum } from "polkadot-api";
+import { createClient as createPolkadotClient } from "polkadot-api";
 import { getWsProvider, WsEvent } from "polkadot-api/ws";
 import { CID } from "multiformats/cid";
 import { create as createMultihash } from "multiformats/hashes/digest";
@@ -22,15 +22,13 @@ import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "./ma
 import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManifest, type ManifestFileEntry, type ManifestChunkEntry } from "./manifest.js";
 import { probeChunks, probeFinalityGap, getBestBlockNumber } from "./chunk-probe.js";
 import { computeStats, telemetryAttributes, renderSummary } from "./incremental-stats.js";
-import { mirrorToGitHubPages, MirrorSkipped, pollMirrorFreshness } from "./gh-pages-mirror.js";
-import type { MirrorResult } from "./gh-pages-mirror.js";
 import { keccak256, toBytes } from "viem";
-import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, PublisherNotSupportedError, PUBLISHER_ABI } from "./dotns.js";
-import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep } from "./dotns.js";
+import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, PublisherNotSupportedError, PUBLISHER_ABI, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD } from "./dotns.js";
+import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep, DotNSConnectOptions } from "./dotns.js";
 export type { PhoneSignatureStep };
 import { cryptoWaitReady } from "@polkadot/util-crypto";
-import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, detectTestnet } from "./pool.js";
-import type { PoolAuthorization } from "./pool.js";
+import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet } from "./pool.js";
+import type { BulletinAuthorization, PoolAuthorization } from "./pool.js";
 import { initTelemetry, withSpan, withDeploySpan, setDeployAttribute, setDeploySentryTag, sampleMemory, setDeployReportContext, captureWarning, flush, VERSION, resolveRunner, resolveRunnerType, truncateAddress } from "./telemetry.js";
 import { loadEnvironments, resolveEndpoints, getPopSelfServeConfig, DEFAULT_ENV_ID } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
@@ -102,6 +100,38 @@ export const DEFAULT_POOL_SIZE = 10;
 // backups here once the Bulletin team publishes them (no code change needed).
 export let BULLETIN_ENDPOINTS: string[] = [DEFAULT_BULLETIN_RPC];
 let POOL_SIZE = DEFAULT_POOL_SIZE;
+
+/**
+ * Bulletin RPC override precedence, shared by every caller that resolves an
+ * env's Bulletin endpoint(s): an explicit `rpcOverride` (CLI `--rpc`) wins,
+ * falling back to the `BULLETIN_RPC` env var, else the env-resolved
+ * candidate list is used unchanged. The override is placed first (primary)
+ * with the rest of the env's candidates kept as fail-over backups, minus any
+ * duplicate of the override itself.
+ *
+ * Extracted from `deploy()`'s own resolution so `manifest/publish.ts` can
+ * compute the exact same endpoint `deploy()` would for a given env/--rpc,
+ * instead of inventing a second resolution mechanism.
+ */
+export function resolveBulletinEndpoints(envBulletin: string[], rpcOverride?: string): string[] {
+  const userRpc = rpcOverride ?? process.env.BULLETIN_RPC;
+  return userRpc ? [userRpc, ...envBulletin.filter(e => e !== userRpc)] : envBulletin;
+}
+
+/**
+ * Set the module-level Bulletin endpoint list that `getProvider()` (and
+ * therefore `storeFile`/`storeDirectory` when called without an explicit
+ * client) connects to. `deploy()` sets this from the resolved env/--rpc at
+ * the top of every run. Exported so callers outside this module — namely
+ * `manifest/publish.ts`'s `publishManifest`, which can run without a
+ * preceding in-process `deploy()` call — can point their own storage
+ * uploads at the same env instead of silently defaulting to
+ * `DEFAULT_BULLETIN_RPC`. ESM named imports are read-only bindings, so a
+ * setter is the only way for another module to update this `let`.
+ */
+export function setBulletinEndpoints(endpoints: string[]): void {
+  BULLETIN_ENDPOINTS = endpoints;
+}
 // Module-level flag: flipped by getWsProvider's onStatusChanged if papi
 // connects to a non-primary endpoint. Flushed into the deploy span at the end
 // of deploy() so the attribute always lands even if the callback fires late
@@ -258,18 +288,38 @@ export function isConnectionError(error: any): boolean {
 
 /**
  * True for benign teardown noise that must NOT fail a deploy/command. Covers:
- *  - connection errors (recoverable via the storage reconnect path), and
+ *  - connection errors (recoverable via the storage reconnect path) — this already
+ *    includes papi's raw "Not connected" via isConnectionError above;
  *  - "DestroyedError: Client destroyed" — orphaned pending-response promises the
  *    SSO/papi client rejects while a session adapter is torn down AFTER the work
- *    is done (e.g. the owner-signs update path destroying its re-acquired session).
+ *    is done (e.g. the owner-signs update path destroying its re-acquired session);
+ *  - the `@novasamatech/sdk-statement` `getStatements` TDZ crash: `const unsubscribe`
+ *    is initialised from `api.subscribeStatement(...)`, and both the next/error
+ *    callbacks close over it. If that observable settles SYNCHRONOUSLY (a poll
+ *    firing after the WS client was already destroyed — hit on Ctrl+C/teardown
+ *    during an active pairing poll), the callback runs before the binding is
+ *    initialised, throwing `ReferenceError: Cannot access 'unsubscribe' before
+ *    initialization`, which rxjs rethrows as an uncaughtException.
+ *    `patches/@novasamatech+sdk-statement+0.6.0.patch` is the PRIMARY fix (it also
+ *    closes a subscription leak this guard cannot undo) — this only prevents an
+ *    unpatched consumer (e.g. npm blocking install scripts) from crashing outright.
+ *    Deliberately narrow: matches only this exact binding name, so an unrelated
+ *    ReferenceError still crashes the process.
  * The CLI's crash handlers use this so a successful deploy isn't marked killed
  * (exit 2) by late teardown noise. Checks name+message so DestroyedError matches
  * even when its message differs.
  */
 export function isBenignTeardownError(error: any): boolean {
   if (isConnectionError(error)) return true;
-  const s = error instanceof Error ? `${error.name ?? ""} ${error.message ?? ""}` : String(error);
-  return /DestroyedError|Client destroyed/.test(s);
+  const isErr = error instanceof Error;
+  const s = isErr ? `${error.name ?? ""} ${error.message ?? ""}` : String(error);
+  // Case-insensitive on purpose: login.ts's own regex was /client destroyed|destroyederror/i, so
+  // matching case-sensitively here would silently shrink its swallow set on delegation.
+  if (/DestroyedError|Client destroyed|Not connected/i.test(s)) return true;
+  // `instanceof Error` + exact name, so a plain object claiming to be a ReferenceError doesn't
+  // qualify; the binding name is pinned so an unrelated TDZ error still crashes.
+  return isErr && error.name === "ReferenceError"
+    && /cannot access 'unsubscribe' before initialization/i.test(error.message ?? "");
 }
 
 // Multihash codes accepted by createCID + toHashingEnum. Exported so callers
@@ -407,15 +457,15 @@ export async function getDirectProvider(mnemonic: string, derivationPath: string
   console.log(`   Using direct signer: ${ss58}${derivationPath ? ` (path: ${derivationPath})` : ""}`);
 
   let [auth, currentBlock] = await Promise.all([
-    unsafeApi.query.TransactionStorage.Authorizations.getValue(Enum("Account", ss58)),
+    readAccountAuthorization(unsafeApi, ss58),
     client.getFinalizedBlock(),
   ]);
   let now = currentBlock.number;
-  if (!auth || Number(auth.expiration ?? 0) <= now) {
+  if (!isAuthorizationSufficient(auth, now)) {
     try {
       await ensureAuthorized(unsafeApi, ss58 as string, "direct signer");
       [auth, currentBlock] = await Promise.all([
-        unsafeApi.query.TransactionStorage.Authorizations.getValue(Enum("Account", ss58)),
+        readAccountAuthorization(unsafeApi, ss58),
         client.getFinalizedBlock(),
       ]);
       now = currentBlock.number;
@@ -424,7 +474,7 @@ export async function getDirectProvider(mnemonic: string, derivationPath: string
       throw new NonRetryableError(`Account ${ss58} is not authorized for Bulletin storage and auto-authorization failed: ${e.message}`);
     }
   }
-  console.log(`   Authorization: expires at block ${Number(auth?.expiration ?? 0)} (current: ${now})`);
+  console.log(`   Authorization: expires at block ${auth?.expiration ?? 0} (current: ${now})`);
 
   setDeployAttribute("deploy.signer.mode", "direct");
   setDeployAttribute("deploy.signer.address", truncateAddress(ss58) as string);
@@ -443,15 +493,15 @@ async function getSignerProvider(signer: PolkadotSigner, ss58: string): Promise<
   console.log(`   Using external signer: ${ss58}`);
 
   let [auth, currentBlock] = await Promise.all([
-    unsafeApi.query.TransactionStorage.Authorizations.getValue(Enum("Account", ss58)),
+    readAccountAuthorization(unsafeApi, ss58),
     client.getFinalizedBlock(),
   ]);
   let now = currentBlock.number;
-  if (!auth || Number(auth.expiration ?? 0) <= now) {
+  if (!isAuthorizationSufficient(auth, now)) {
     try {
       await ensureAuthorized(unsafeApi, ss58, "external signer");
       [auth, currentBlock] = await Promise.all([
-        unsafeApi.query.TransactionStorage.Authorizations.getValue(Enum("Account", ss58)),
+        readAccountAuthorization(unsafeApi, ss58),
         client.getFinalizedBlock(),
       ]);
       now = currentBlock.number;
@@ -460,11 +510,80 @@ async function getSignerProvider(signer: PolkadotSigner, ss58: string): Promise<
       throw new NonRetryableError(`Account ${ss58} is not authorized for Bulletin storage and auto-authorization failed: ${e.message}`);
     }
   }
-  console.log(`   Authorization: expires at block ${Number(auth?.expiration ?? 0)} (current: ${now})`);
+  console.log(`   Authorization: expires at block ${auth?.expiration ?? 0} (current: ${now})`);
 
   setDeployAttribute("deploy.signer.mode", "external");
   setDeployAttribute("deploy.signer.address", truncateAddress(ss58) as string);
   return { client, unsafeApi, signer, ss58 };
+}
+
+/**
+ * Resolve the mnemonic the CLI should act with, in precedence order:
+ * `--mnemonic` flag > `MNEMONIC` env var > `DOTNS_MNEMONIC` env var.
+ *
+ * Exists so the bin's flag/env resolution is unit-testable and so the two
+ * env vars are forwarded consistently: previously the bin only forwarded
+ * `flags.mnemonic` into `options.mnemonic`, so an env-only mnemonic never
+ * reached `chooseSignerInput` and a persisted session silently won instead —
+ * even though `chooseSignerInput` already prefers mnemonic first.
+ */
+export function resolveEffectiveMnemonic(opts: {
+  flagMnemonic: string | undefined;
+  envMnemonic: string | undefined;
+  envDotnsMnemonic: string | undefined;
+}): string | undefined {
+  return opts.flagMnemonic ?? opts.envMnemonic ?? opts.envDotnsMnemonic;
+}
+
+/**
+ * Resolve the environment id the CLI should target, in precedence order:
+ * `--env` flag > `PAD_ENV` env var. Returns `undefined` when neither is
+ * set — callers (deploy(), the bin's other flag sites) already fall back to
+ * `DEFAULT_ENV_ID` themselves, so this helper doesn't bake that default in;
+ * it only resolves the flag/env-var precedence (mirrors
+ * `resolveEffectiveMnemonic`'s pattern so the bin's session default is
+ * unit-testable).
+ */
+export function resolveEnvId(opts: {
+  flagEnv: string | undefined;
+  envVar: string | undefined;
+}): string | undefined {
+  return opts.flagEnv ?? opts.envVar;
+}
+
+/**
+ * Decide whether the deploy should publish product-config manifest records
+ * (subname registration + resolver + contenthash + text records), independent
+ * of whether `tryLoadProductConfig` found a config on disk. Exists so the
+ * bin's `--no-manifest` / `--content-only` short-circuit is unit-testable:
+ * with the flag set, manifest publishing is skipped even when a
+ * `polkadot-app-deploy.config.*` is discoverable, producing the same
+ * content-only deploy as when no config exists at all.
+ */
+export function shouldPublishManifest(opts: {
+  configFound: boolean;
+  noManifest: boolean;
+}): boolean {
+  return opts.configFound && !opts.noManifest;
+}
+
+/**
+ * Reject the contradictory `--no-manifest`/`--content-only` + `--publish`
+ * combination up front. `--publish` lists the domain in the on-chain
+ * Publisher registry, which reads the manifest's text records (Browse relies
+ * on them) — skipping manifest publishing while also asking to list the
+ * domain would silently publish a domain with no manifest data. Returns an
+ * error message string to print + exit on, or `null` when the combination is
+ * fine. Exported for unit testing.
+ */
+export function validateNoManifestFlags(opts: {
+  noManifest: boolean;
+  publish: boolean;
+}): string | null {
+  if (opts.noManifest && opts.publish) {
+    return "Error: --no-manifest (--content-only) and --publish are mutually exclusive — --publish requires the manifest records that --no-manifest skips.";
+  }
+  return null;
 }
 
 /** storageSigner > signer > mnemonic > pool precedence for storage routing. Exported for unit testing. */
@@ -898,18 +1017,22 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
   // (the allowance fields are no longer the gate). Deploy no longer
   // self-authorizes (#745); fail fast if there is no active authorization —
   // it must be granted out-of-band (testnet faucet / personhood / pool bootstrap).
+  //
+  // Arm order matters: the raw papi read can throw *synchronously* on a destroyed
+  // client, so it goes first — readAccountAuthorization only rejects. Reversed, that
+  // sync throw would orphan the in-flight auth read as an unhandled rejection.
   const readUploadAuthorization = () => Promise.all([
-    unsafeApi.query.TransactionStorage.Authorizations.getValue(Enum("Account", ss58)),
     unsafeApi.query.System.Number.getValue(),
+    readAccountAuthorization(unsafeApi, ss58 as string),
   ]);
-  let uploadAuth: any;
-  let currentBlockNum: any;
+  let uploadAuth: BulletinAuthorization | null = null;
+  let currentBlockNum = 0;
   try {
-    [uploadAuth, currentBlockNum] = await readUploadAuthorization();
+    [currentBlockNum, uploadAuth] = await readUploadAuthorization();
   } catch (e: any) {
     if (existingClient && reconnect && isConnectionError(e)) {
       await refreshExistingClient("authorization preflight hit a stale chainHead");
-      [uploadAuth, currentBlockNum] = await readUploadAuthorization();
+      [currentBlockNum, uploadAuth] = await readUploadAuthorization();
     } else {
       throw e;
     }
@@ -1472,8 +1595,8 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     // resolved via nonce-advance (3-min timeout) before the subscription error
     // could trigger doReconnect, the current client is the original destroyed
     // one. The stale-client probe at phase-B entry may not reliably detect this
-    // (System.Number can resolve on a destroyed client while
-    // TransactionStorage.Authorizations fails with "ChainHead disjointed").
+    // (System.Number can resolve on a destroyed client while the
+    // account_authorization runtime call fails with "ChainHead disjointed").
     // Reconnect here so liveProvider carries a healthy client.
     // ownsClient is reset to false: the fresh client is handed off via
     // liveProvider, not destroyed below.
@@ -1524,12 +1647,10 @@ export async function merkleize(directoryPath: string, outputCarPath: string): P
 }
 
 // Pure, synchronous. Mirrors the root-CID compute inside storeChunkedContent
-// so callers (notably the gh-pages mirror) can predict the deploy's final
-// storage CID from the CAR bytes alone — no chain round-trip required. This
-// lets the mirror push fire in parallel with the Bulletin upload: by the
-// time Bulletin + DotNS complete the mirror has long since landed and
-// Pages has built/propagated, eliminating the "deploy then hit a stale CDN"
-// window that plagues sequential publication.
+// so callers can predict the deploy's final storage CID from the CAR bytes
+// alone — no chain round-trip required. This lets onCarReady-driven side
+// effects fire in parallel with the (slow) Bulletin upload instead of
+// waiting for it to finish.
 export function computeStorageCid(chunks: Uint8Array[]): string {
   const hashCode = 0x12;
   const chunkInfo = chunks.map(c => ({
@@ -1549,10 +1670,10 @@ export interface StoreDirectoryOptions {
   /**
    * Fires exactly once, right after the CAR has been merkleized + encrypted
    * and the final storage CID is known, but BEFORE the chunk upload to
-   * Bulletin starts. Use to kick off parallel side-effects (e.g. the
-   * gh-pages mirror) that can run concurrently with the slow upload. The
-   * returned promise is awaited at the end of the deploy; errors are passed
-   * through to the caller so they can decide fatal / non-fatal policy.
+   * Bulletin starts. Use to kick off parallel side-effects that can run
+   * concurrently with the slow upload. The returned promise is awaited at
+   * the end of the deploy; errors are passed through to the caller so they
+   * can decide fatal / non-fatal policy.
    */
   onCarReady?: (carBytes: Uint8Array, storageCid: string) => Promise<void> | void;
   /**
@@ -1577,8 +1698,6 @@ export interface StoreDirectoryOptions {
   reproducibleSource?: string;
   /**
    * DotNS domain label being deployed (without the `.dot` suffix, e.g. `"myapp"`).
-   * When provided, `fetchPreviousManifest` also tries the GitHub Pages mirror
-   * before falling through to the IPFS gateway.
    */
   domain?: string;
   /**
@@ -1649,8 +1768,8 @@ export async function storeDirectory(directoryPath: string, providerOrOptions: E
   }
   const carChunks = chunk(carContent, CHUNK_SIZE);
   // Predicted storage CID, available without any chain round-trip. Lets the
-  // onCarReady callback fire a parallel mirror push with the final CID in
-  // the manifest. Verified against Bulletin's own rootCid computation below.
+  // onCarReady callback act on the final CID before the chain upload lands.
+  // Verified against Bulletin's own rootCid computation below.
   const predictedStorageCid = computeStorageCid(carChunks);
   if (opts.onCarReady) await opts.onCarReady(carContent, predictedStorageCid);
   // Enrich the threshold-triggered memory report with deploy shape. No-op
@@ -1704,9 +1823,22 @@ export async function storeDirectory(directoryPath: string, providerOrOptions: E
 // string for the incremental-upload-v2 manifest fetcher. Best-effort: returns
 // null on first deploy ("0x"), unreadable bytes, or any error. Mirrors the
 // decode logic in dotns.ts:setContenthash without throwing.
-async function readPreviousContenthashSafe(dotns: DotNS, domainName: string): Promise<string | null> {
+//
+// `bareLabel` MUST NOT include the TLD: DotNS.getContenthash() derives the
+// on-chain node as namehash(`${domainName}.${this._tld}`) itself, so passing
+// an already-suffixed name (e.g. ParsedDomainName.fullName, which is always
+// `${label}.${tld}`) makes it read namehash("sub.parent.paseo.paseo") — a
+// node that doesn't exist. That's a *different* instance of the exact bug
+// class documented above computeDomainTokenId in dotns.ts (registering
+// namehash("ssoqedtuwf.paseo") but then querying namehash("ssoqedtuwf.dot")
+// after an 11 PAS mint had already succeeded). Here it's caught by the
+// try/catch below, so it only silently defeats the incremental-deploy
+// optimisation rather than reverting a paid call — but the parameter name
+// is deliberately "bareLabel", not "domainName" or "fullName", so a future
+// caller can't reach for the wrong field again. Exported for unit tests.
+export async function readPreviousContenthashSafe(dotns: DotNS, bareLabel: string): Promise<string | null> {
   try {
-    const hex = await dotns.getContenthash(domainName);
+    const hex = await dotns.getContenthash(bareLabel);
     if (!hex || hex === "0x") return null;
     const bytes = Buffer.from(hex.slice(2), "hex");
     if (bytes[0] !== 0xe3 || bytes.length < 4) return null;
@@ -2114,7 +2246,7 @@ export async function storeDirectoryV2(
     }
   }
   // computeStorageCid is the predicted root CID; published via onCarReady so
-  // the gh-pages mirror can fire concurrently with the Phase B upload.
+  // callers can react before the Phase B upload completes.
   const predictedStorageCid = computeStorageCid(carChunksB);
   if (opts.onCarReady) await opts.onCarReady(phaseB.carBytes, predictedStorageCid);
 
@@ -2467,14 +2599,6 @@ export interface DeployOptions {
   tag?: string;
   /** Custom telemetry attributes, merged into the deploy span. Overrides auto-detected values. */
   attributes?: Record<string, string>;
-  /**
-   * Opt-in: after a successful deploy, push the CAR to the current repo's
-   * `gh-pages` branch under `bulletin/<domain>.dot.car` so hosts can fetch it
-   * via `https://<owner>.github.io/<repo>/bulletin/<domain>.dot.car` as a
-   * fast-path cache. Non-fatal on failure. See docs/… for the discoverability
-   * caveat.
-   */
-  ghPagesMirror?: boolean;
   /** Skip the 500 MiB abort guard and allow oversized deploys. */
   allowLargeDeploy?: boolean;
   /**
@@ -2547,8 +2671,17 @@ export interface DeployOptions {
    * resolves. `attempt` >= 2 means a re-sign.
    * Absent + non-TTY → fail fast (NonRetryableError).
    * Absent + TTY → CLI bin must supply the hook; core does not readline.
+   *
+   * `approvalBudgetMs` and `reason` (#194): widened to match dotns.ts's
+   * ConnectOptions.confirmPhoneReady, which this field is passed straight
+   * through to unchanged (see resolveDotnsConnectOptions call sites below).
+   * `approvalBudgetMs` discloses the phone-approval silence deadline so the
+   * CLI prompt never hardcodes a number that can drift from the constant that
+   * actually governs it. `reason: "silence"` marks a watcher-silence re-arm
+   * (re-prompt after no response) as distinct from the pre-existing re-sign
+   * case (undefined/"resign").
    */
-  confirmPhoneReady?: (ctx: { label: string; attempt: number; total: number }) => Promise<void>;
+  confirmPhoneReady?: (ctx: { label: string; attempt: number; total: number; approvalBudgetMs: number; reason?: "resign" | "silence" }) => Promise<void>;
 }
 
 // Resolve the DeployOptions that affect DotNS authentication into the shape
@@ -2569,7 +2702,22 @@ export function resolveDotnsConnectOptions(
   environmentId?: string,
   popSelfServe?: PopSelfServeConfig | null,
   registerStorageDeposit?: bigint,
-): { signer?: PolkadotSigner; signerAddress?: string; mnemonic?: string; derivationPath?: string; assetHubEndpoints?: string[]; autoAccountMapping?: boolean; contracts?: Record<string, string>; nativeToEthRatio?: bigint; environmentId?: string; popSelfServe?: PopSelfServeConfig | null; registerStorageDeposit?: bigint } {
+  tld?: string,
+): Pick<
+  DotNSConnectOptions,
+  | "signer"
+  | "signerAddress"
+  | "mnemonic"
+  | "derivationPath"
+  | "assetHubEndpoints"
+  | "autoAccountMapping"
+  | "contracts"
+  | "nativeToEthRatio"
+  | "environmentId"
+  | "popSelfServe"
+  | "registerStorageDeposit"
+  | "tld"
+> {
   const tail = assetHubEndpoints && assetHubEndpoints.length > 0 ? { assetHubEndpoints } : {};
   const mappingTail = autoAccountMapping ? { autoAccountMapping } : {};
   const contractsTail = contracts && Object.keys(contracts).length > 0 ? { contracts } : {};
@@ -2577,10 +2725,11 @@ export function resolveDotnsConnectOptions(
   const envTail = environmentId ? { environmentId } : {};
   const popTail = popSelfServe !== undefined ? { popSelfServe } : {};
   const storageTail = registerStorageDeposit !== undefined ? { registerStorageDeposit } : {};
+  const tldTail = tld !== undefined ? { tld } : {};
   if (options.signer && options.signerAddress) {
-    return { signer: options.signer, signerAddress: options.signerAddress, ...tail, ...mappingTail, ...contractsTail, ...ratioTail, ...envTail, ...popTail, ...storageTail };
+    return { signer: options.signer, signerAddress: options.signerAddress, ...tail, ...mappingTail, ...contractsTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail };
   }
-  return { mnemonic: options.mnemonic, derivationPath: options.derivationPath, ...tail, ...mappingTail, ...contractsTail, ...ratioTail, ...envTail, ...popTail, ...storageTail };
+  return { mnemonic: options.mnemonic, derivationPath: options.derivationPath, ...tail, ...mappingTail, ...contractsTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail };
 }
 
 // Upper-bound estimate of how many bytes this deploy will push to Bulletin.
@@ -2623,13 +2772,42 @@ export function assertSubdomainOwnerMatchesSigner(
   signerEvmAddress: string | null | undefined,
   sublabel: string,
   parentLabel: string,
+  tld: string = DEFAULT_TLD,
 ): void {
   if (result.owned && result.owner?.toLowerCase() !== signerEvmAddress?.toLowerCase()) {
     throw new NonRetryableError(
-      `Subdomain ${sublabel}.${parentLabel}.dot is already owned by ${result.owner} (signer is ${signerEvmAddress}). ` +
+      `Subdomain ${sublabel}.${parentLabel}.${tld} is already owned by ${result.owner} (signer is ${signerEvmAddress}). ` +
       `Use a fresh subdomain label, or release the existing registration.`
     );
   }
+}
+
+/**
+ * An unregistered, non-registrable parent (a governance-reserved name) used
+ * to yield "parent game.dot is owned by no one, not by this signer" —
+ * awkward, and silent about the only route forward. When the parent is
+ * non-registrable per classifyRegistrability AND unowned, this additionally
+ * teaches the dotns-cli whitelisted-registration route, via the SAME
+ * formatUnregistrableReason preflight/register() use, so the texts cannot
+ * drift. Owned-by-another-account keeps the original message unchanged —
+ * that case is about ownership, not registrability, and must NOT suggest
+ * registering a name someone else already holds.
+ */
+export function formatSubdomainParentError(
+  fullName: string,
+  parentLabel: string,
+  parentOwner: string | null,
+  selfAddress: string,
+  tld: string = DEFAULT_TLD,
+): string {
+  if (parentOwner !== null) {
+    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by ${parentOwner}, not by this signer.`;
+  }
+  const registrability = classifyRegistrability(parentLabel);
+  if (registrability.registrable) {
+    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by no one, not by this signer.`;
+  }
+  return `Cannot deploy ${fullName}: parent ${formatUnregistrableReason({ label: parentLabel, registrability, existingOwner: null, selfAddress, tld })}`;
 }
 
 // Publish step. Subdomains are not supported by the Publisher contract (it only
@@ -2674,13 +2852,17 @@ export async function unpublish(
   const { doc } = await loadEnvironments();
   const resolved = resolveEndpoints(doc, envId);
   const popSelfServe = getPopSelfServeConfig(doc, envId);
-  const parsed = parseDomainName(domainName);
+  const tld = resolved.tld ?? DEFAULT_TLD;
+  const parsed = parseDomainName(domainName, tld);
   if (parsed.isSubdomain) {
-    throw new Error(`Subdomains are not supported by the Publisher registry. To unpublish ${parsed.parentLabel}.dot (which controls ${domainName}), pass that label directly.`);
+    throw new Error(`Subdomains are not supported by the Publisher registry. To unpublish ${parsed.parentLabel}.${tld} (which controls ${domainName}), pass that label directly.`);
   }
   const label = parsed.label;
   const dotns = new DotNS();
   try {
+    // Pass resolved.tld (undefined-preserving), NOT the defaulted `tld` above
+    // — otherwise connect()'s on-chain tld() read never fires for an env that
+    // genuinely configures none (see the envConfiguredTld comment in deploy()).
     await dotns.connect(resolveDotnsConnectOptions(
       { mnemonic: options.mnemonic, derivationPath: options.derivationPath },
       resolved.assetHub,
@@ -2690,27 +2872,36 @@ export async function unpublish(
       envId,
       popSelfServe,
       resolved.registerStorageDeposit,
+      resolved.tld,
     ));
     const result = await dotns.unpublishLabel(label);
-    return { domainName: `${label}.dot`, status: result.status, txHash: result.txHash };
+    // Adopt the authoritative, chain-resolved TLD for the returned domain name.
+    return { domainName: `${label}.${dotns.tld}`, status: result.status, txHash: result.txHash };
   } finally {
     try { dotns.disconnect(); } catch {}
   }
 }
 
 /**
- * Returns the dot.li browser URL for the given domain name, optionally
- * suffixed with a network query parameter so the SPA opens the right chain.
- * The public products devnet is served by its own gateway (dev-dot.li), so
- * the "devnet" env resolves to that host instead of the prod dot.li.
+ * Returns the browser URL for the given domain name, optionally suffixed
+ * with a network query parameter so the SPA opens the right chain.
  * Currently only the "preview" env needs a suffix — the SPA defaults to
  * paseo-next-v2 which would show "no content" for preview deployments.
+ *
+ * The gateway host defaults to "dot.li" (issue #142: devnet-family names are
+ * NOT resolvable via dot.li — they're served by a different gateway, e.g.
+ * "dev-dot.li" — so callers must pass the resolved env's `webGateway` when
+ * one is set; otherwise the link loads but resolves the name against the
+ * wrong network).
  * @param name - the DotNS label (e.g. "myapp")
  * @param envId - the environment id from options.env ?? DEFAULT_ENV_ID
+ * @param webGateway - the resolved env's `webGateway`, if any (defaults to "dot.li")
  */
-export function browserUrlFor(name: string, envId: string | undefined): string {
-  const gatewayHost = envId === "devnet" ? "dev-dot.li" : "dot.li";
-  const base = `https://${name}.${gatewayHost}`;
+export function browserUrlFor(name: string, envId: string | undefined, webGateway?: string): string {
+  // Fork: the public products devnet is served by dev-dot.li; keep that default when the
+  // environment carries no explicit webGateway.
+  const host = webGateway ?? (envId === "devnet" ? "dev-dot.li" : "dot.li");
+  const base = `https://${name}.${host}`;
   return envId === "preview" ? `${base}?network=previewnet` : base;
 }
 
@@ -2806,11 +2997,23 @@ export async function deploy(content: DeployContent, domainName: string | null =
   let envNetwork: string | undefined;
   let envName: string | undefined;
   let envIpfs: string | undefined;
+  let envWebGateway: string | undefined;
   let envAutoAccountMapping = false;
   let envContracts: Record<string, string> = {};
   let envNativeToEthRatio: bigint | undefined;
   let envRegisterStorageDeposit: bigint | undefined;
   let envPopSelfServe: PopSelfServeConfig | null = null;
+  let envTld: string = DEFAULT_TLD;
+  // Undefined-preserving twin of envTld: unlike envTld (defaulted to "dot"
+  // for display/pre-connect parsing), this is what actually reaches
+  // DotNS.connect()'s `tld` option below. If it were defaulted here too,
+  // connect()'s `if (options.tld === undefined)` on-chain-read branch would
+  // NEVER fire for an env that genuinely configures no tld (e.g. devnet) —
+  // the whole point of the dotns PR #218 resolution order (env config >
+  // on-chain read > DEFAULT_TLD) would be dead code. Keep this
+  // `string | undefined` all the way to every resolveDotnsConnectOptions()
+  // call site; never apply `?? DEFAULT_TLD` to it.
+  let envConfiguredTld: string | undefined;
   if (options.bulletinEndpoints && options.bulletinEndpoints.length > 0) {
     envBulletin = options.bulletinEndpoints;
     envAssetHub = options.assetHubEndpoints;
@@ -2824,10 +3027,13 @@ export async function deploy(content: DeployContent, domainName: string | null =
       envNetwork = resolved.network;
       envName = resolved.envName;
       envIpfs = resolved.ipfs;
+      envWebGateway = resolved.webGateway;
       envAutoAccountMapping = resolved.autoAccountMapping;
       envContracts = resolved.contracts;
       envNativeToEthRatio = resolved.nativeToEthRatio;
       envRegisterStorageDeposit = resolved.registerStorageDeposit;
+      envTld = resolved.tld ?? DEFAULT_TLD;
+      envConfiguredTld = resolved.tld;
       envPopSelfServe = getPopSelfServeConfig(doc, envId);
     } catch (e) {
       if (e instanceof NonRetryableError) throw e;
@@ -2840,10 +3046,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   if (options.contracts && Object.keys(options.contracts).length > 0) {
     envContracts = { ...envContracts, ...options.contracts };
   }
-  const userRpc = options.rpc ?? process.env.BULLETIN_RPC;
-  BULLETIN_ENDPOINTS = userRpc
-    ? [userRpc, ...envBulletin.filter(e => e !== userRpc)]
-    : envBulletin;
+  BULLETIN_ENDPOINTS = resolveBulletinEndpoints(envBulletin, options.rpc);
   _deployRpcFailedOver = false;
   POOL_SIZE = options.poolSize ?? parseInt(process.env.BULLETIN_POOL_SIZE ?? String(DEFAULT_POOL_SIZE), 10);
 
@@ -2852,9 +3055,20 @@ export async function deploy(content: DeployContent, domainName: string | null =
   // Injected signer (options.signer) and mnemonic paths are also unchanged.
 
   // Validate the label up-front (parseDomainName runs the pure, chain-free
-  // validateDomainLabel) so an invalid one — e.g. a Reserved <=5-char base name —
-  // fails before we print a signer plan that can never matter.
-  const parsed: ParsedDomainName | null = domainName ? parseDomainName(domainName) : null;
+  // validateDomainLabel) so a syntactically-invalid one — bad charset, wrong
+  // length, or an edge hyphen — fails before we print a signer plan that can
+  // never matter. A Reserved/PopRules-shaped label (e.g. a <=5-char base name)
+  // is NOT rejected here: parseDomainName always succeeds for those now,
+  // since the signer might legitimately own the name (registerReserved
+  // bypasses PopRules on-chain). That decision moved to ownership-aware
+  // preflight — see classifyRegistrability/decideRegistrabilityOutcome in
+  // src/dotns.ts.
+  // `let`, not `const`: refreshed once the preflight connect resolves the
+  // AUTHORITATIVE on-chain TLD (see the `parsed = { ...parsed, fullName: ... }`
+  // reassignment below) — `fullName` embeds whichever `envTld` was current at
+  // THIS parse, which on an env with no configured tld is still the
+  // pre-connect DEFAULT_TLD guess, not necessarily the real one.
+  let parsed: ParsedDomainName | null = domainName ? parseDomainName(domainName, envTld) : null;
 
   let sessionCleanup: (() => void) | undefined;
   // Cheap session-file probe — does NOT load the SSO stack. A logged-in user has
@@ -2867,6 +3081,14 @@ export async function deploy(content: DeployContent, domainName: string | null =
     hasInjectedSigner: !!(options.signer && options.signerAddress),
     hasSession,
   });
+  // An explicit mnemonic (from --mnemonic OR the MNEMONIC/DOTNS_MNEMONIC env
+  // vars) always wins over a persisted login session — chooseSignerInput
+  // already encodes that precedence. Surface it so the override is visible
+  // instead of silent: without this, a signed-in user setting MNEMONIC for a
+  // one-off deploy would see no indication their session was bypassed.
+  if (signerChoice === "mnemonic" && hasSession) {
+    console.error("Using the provided mnemonic; the persisted login session will be ignored for this deploy.");
+  }
   // userSession is set when the resolve path finds a session — used below for
   // slot-key allocation which is available to any caller, not just the resolve path.
   // Typed as any to avoid importing UserSession from @parity/product-sdk-terminal here.
@@ -3026,18 +3248,18 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
     let cid: string | undefined;
     let ipfsCid: string | undefined;
-    // Parallel mirror push: fires from storeDirectory's onCarReady the moment
-    // the CAR is ready, runs concurrently with the (typically slow) Bulletin
-    // upload + DotNS. By the time we reach the final-checks section below,
-    // Pages has usually long since built and propagated the CDN, so the
-    // "freshness" poll at the end completes almost immediately for small
-    // apps and well within timeout for larger ones.
-    let mirrorPromise: Promise<MirrorResult | MirrorSkipped | Error | null> = Promise.resolve(null);
     console.log("\n" + "=".repeat(60));
     console.log(`DEPLOYING TO TESTNET                    v${VERSION}`);
     console.log("=".repeat(60));
     if (envName) console.log(`   Environment: ${envName}`);
-    console.log(`   Domain: ${name}.dot`);
+    // NOT printed here: on an env with no configured `tld`, envTld at this
+    // point is still the pre-connect DEFAULT_TLD guess, not the real
+    // on-chain value — printing it now could show "name.dot" for a
+    // paseo-next-v2-shaped env whose actual TLD is ".paseo". The "Domain:"
+    // line prints below, right after the preflight connect resolves the
+    // AUTHORITATIVE tld (see `envTld = preflight.tld` in the Preflight
+    // section) — no user-visible line ever renders the domain with a
+    // not-yet-confirmed TLD.
     if (deployTag) console.log(`   Tag: ${deployTag}`);
     if (options.inputCar) console.log(`   Input CAR: ${path.resolve(options.inputCar)}`);
     else if (typeof content === "string") console.log(`   Build dir: ${path.resolve(content)}`);
@@ -3066,9 +3288,29 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
 
       const preflight = new DotNS();
-      await preflight.connect(resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit));
+      await preflight.connect(resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld));
       // connect() now guarantees the account is mapped before returning — no
       // post-connect mapping wait needed here. See DotNS.connect() in dotns.ts.
+      // Adopt the authoritative, chain-resolved TLD for everything downstream
+      // (display strings, the two later resolveDotnsConnectOptions() calls'
+      // pre-connect siblings, etc.) — envTld before this point may still be
+      // DEFAULT_TLD even on an env whose real on-chain TLD differs, because
+      // it was set before connect() had a chance to read the chain.
+      envTld = preflight.tld;
+      // `fullName` was computed by the pre-connect parseDomainName() call
+      // using whatever envTld was current THEN — refresh it now that envTld
+      // is authoritative, so no downstream message (subdomain ownership
+      // errors, previous-contenthash lookups, etc.) can embed a stale TLD.
+      // `fullName` is always `${label}.${tld}` for both the top-level and
+      // subdomain shapes (see parseDomainName), so this is a safe, complete
+      // recomputation without re-invoking the parser (which could spuriously
+      // re-trigger its wrong-TLD guard on an input that already parsed
+      // successfully once).
+      if (parsed) parsed = { ...parsed, fullName: `${parsed.label}.${envTld}` };
+      // First point in this deploy where the domain's REAL TLD is known — see
+      // the comment at the earlier (now TLD-less) banner print above for why
+      // this line doesn't fire any sooner.
+      console.log(`   Domain: ${name}.${envTld}`);
 
       // Subdomain deploys use a different on-chain path (setSubnodeOwner on
       // the Registry, no commit-reveal or PoP). Skip the TLD preflight and
@@ -3077,23 +3319,28 @@ export async function deploy(content: DeployContent, domainName: string | null =
       if (parsed?.isSubdomain) {
         try {
           const subResult = await preflight.checkSubdomainOwnership(parsed.sublabel!, parsed.parentLabel!);
-          assertSubdomainOwnerMatchesSigner(subResult, preflight.evmAddress, parsed.sublabel!, parsed.parentLabel!);
+          assertSubdomainOwnerMatchesSigner(subResult, preflight.evmAddress, parsed.sublabel!, parsed.parentLabel!, envTld);
           if (!subResult.owned) {
             const { owned: parentOwned, owner: parentOwner } = await preflight.checkOwnership(parsed.parentLabel!);
             if (!parentOwned) {
               throw new NonRetryableError(
-                `Cannot deploy ${parsed.fullName}: parent ${parsed.parentLabel}.dot is owned by ${parentOwner ?? "no one"}, not by this signer.`
+                formatSubdomainParentError(parsed.fullName, parsed.parentLabel!, parentOwner ?? null, preflight.evmAddress ?? "", envTld)
               );
             }
           }
           // Best-effort: read the existing contenthash so the storage phase
           // can drive incremental upload. Non-fatal — first deploy returns "0x".
-          previousContenthashCid = await readPreviousContenthashSafe(preflight, parsed.fullName);
+          // NOTE: readPreviousContenthashSafe wants the bare `sub.parent` label
+          // (no TLD) — it appends `.${tld}` itself. `parsed.label` is that bare
+          // form for a subdomain (see parseDomainName); `parsed.fullName` already
+          // carries the TLD and would double-suffix it (see the function's doc
+          // comment for the historical incident this class of bug caused).
+          previousContenthashCid = await readPreviousContenthashSafe(preflight, parsed.label);
           setDeployAttribute("deploy.incremental", previousContenthashCid ? "true" : "false");
         } finally {
           preflight.disconnect();
         }
-        console.log(`   Mode: subdomain (parent ${parsed.parentLabel}.dot owned by signer)`);
+        console.log(`   Mode: subdomain (parent ${parsed.parentLabel}.${envTld} owned by signer)`);
       } else {
         // Full DotNS readiness check — runs every view-only rule we know
         // (classification, ownership, reservation, PoP gate) BEFORE touching
@@ -3143,7 +3390,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
         const alreadyOwned = dotnsPreflight.plannedAction === "already-owned-by-us"
           || dotnsPreflight.plannedAction === "already-owned-by-recipient";
         const reqSuffix = alreadyOwned ? " (already owned, requirement not enforced)" : "";
-        console.log(`   DotNS: ${name}.dot requires ${popStatusName(dotnsPreflight.classification.status)}${reqSuffix}`);
+        console.log(`   DotNS: ${name}.${envTld} requires ${popStatusName(dotnsPreflight.classification.status)}${reqSuffix}`);
         if (dotnsPreflight.canProceed) {
           const fromName = popStatusName(dotnsPreflight.userStatus);
           console.log(`   Your PoP: ${fromName}`);
@@ -3155,7 +3402,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
           // content-updated, signed by the owner's phone (no transfer, an extra
           // phone tap). Only meaningful in transfer mode (recipient set).
           if (options.transferTo) {
-            console.log(formatTransferModeDotnsLine(alreadyOwned, `${name}.dot`, options.transferTo));
+            console.log(formatTransferModeDotnsLine(alreadyOwned, `${name}.${envTld}`, options.transferTo));
           }
         }
 
@@ -3238,18 +3485,6 @@ export async function deploy(content: DeployContent, domainName: string | null =
               carChunks = chunk(carContent, CHUNK_SIZE);
             }
           }
-          const predictedStorageCid = computeStorageCid(carChunks);
-          if (options.ghPagesMirror) {
-            mirrorPromise = mirrorToGitHubPages({
-              domain: name,
-              carBytes: carContent,
-              cid: predictedStorageCid,
-              toolVersion: VERSION,
-              bulletinRpc: BULLETIN_ENDPOINTS[0],
-              encrypted: Boolean(options.password),
-              repoPath: process.env.PAD_GH_PAGES_REPO || undefined,
-            }).catch((err: unknown) => (err instanceof Error ? err : new Error(String(err))));
-          }
           cid = (await storeChunkedContent(carChunks, providerWithReconnect)).storageCid;
         } else if (process.env.IPFS_CID) {
           setDeployAttribute("deploy.content_type", "ipfsCid");
@@ -3285,7 +3520,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
             if (previousContenthashCid) console.log(`   Incremental: previous contenthash ${previousContenthashCid}`);
             else console.log(`   Incremental: first deploy (no previous contenthash)`);
             // Destructure so carBytes (the third field on the return) isn't
-            // pinned through DotNS + mirror wait. Route through storeDirectoryV2
+            // pinned through the DotNS phase below. Route through storeDirectoryV2
             // for the incremental-upload-v2 flow when not encrypted; encrypted
             // deploys fall through to the legacy path inside storeDirectoryV2.
             if (options.password) setDeployAttribute("deploy.encrypted", "true");
@@ -3300,24 +3535,6 @@ export async function deploy(content: DeployContent, domainName: string | null =
               domain: name,
               gateway: envIpfs,
               dumpCar: options.dumpCar,
-              onCarReady: (carBytes, predictedCid) => {
-                // Kick off the gh-pages mirror the instant the CAR is ready
-                // so it overlaps with the Bulletin chunk upload. The Bulletin
-                // upload is minutes; the mirror push + Pages build is ~1–2 min.
-                // Running them in parallel means the final-checks URL probe
-                // at the end of the deploy usually passes immediately.
-                if (options.ghPagesMirror) {
-                  mirrorPromise = mirrorToGitHubPages({
-                    domain: name,
-                    carBytes,
-                    cid: predictedCid,
-                    toolVersion: VERSION,
-                    bulletinRpc: BULLETIN_ENDPOINTS[0],
-                    encrypted: Boolean(options.password),
-                    repoPath: process.env.PAD_GH_PAGES_REPO || undefined,
-                  }).catch((err: unknown) => (err instanceof Error ? err : new Error(String(err))));
-                }
-              },
             });
             cid = sCid;
             ipfsCid = iCid;
@@ -3376,7 +3593,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
         // preflight branch). The worker can't update its content — only the owner
         // is authorised — so re-acquire the session signer and sign as the OWNER.
         if (dotnsPreflight?.plannedAction === "already-owned-by-recipient") {
-          console.log(`   You already own ${name}.dot — updating its content needs your signature.`);
+          console.log(`   You already own ${name}.${envTld} — updating its content needs your signature.`);
           const { getAuthClient } = await import("./auth-config.js");
           const { resolveSigner } = await import("./auth/index.js");
           const authClient = await getAuthClient(envId);
@@ -3395,7 +3612,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
             try { owner.destroy(); } catch { /* best-effort */ }
           };
           await ownerDotns.connect({
-            ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit),
+            ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld),
             confirmPhoneReady: options.confirmPhoneReady,
             phoneSigner: true, // owner path is always a real phone/session signer
           });
@@ -3413,7 +3630,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
         const dotns = new DotNS();
         await dotns.connect({
-          ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit),
+          ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld),
           confirmPhoneReady: options.confirmPhoneReady,
           // Transfer mode: phoneSigner=false (local worker signs in-process, no phone gate).
           // Genuine phone/session signer: phoneSigner=true (gate enabled). Fixes #50.
@@ -3436,7 +3653,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
             throw new Error(`Subdomain ${parsed.fullName} is owned by ${owner}, not ${dotns.evmAddress}`);
           } else {
             const parentOwnership = await dotns.checkOwnership(parsed.parentLabel!);
-            if (!parentOwnership.owned) throw new Error(`You must own ${parsed.parentLabel}.dot to register subdomains under it`);
+            if (!parentOwnership.owned) throw new Error(`You must own ${parsed.parentLabel}.${envTld} to register subdomains under it`);
             console.log(`   Status: Registering subdomain...`);
             await dotns.registerSubdomain(parsed.sublabel!, parsed.parentLabel!);
             registeredFresh = true;
@@ -3474,7 +3691,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
         // #928: only hand over a name THIS run freshly registered — re-deploying
         // (updating content of) a pre-existing name must not change its owner.
         if (options.transferTo && !registeredFresh) {
-          console.log(`   ${name}.dot already existed — updated content only; ownership unchanged (not transferred to ${options.transferTo}).`);
+          console.log(`   ${name}.${envTld} already existed — updated content only; ownership unchanged (not transferred to ${options.transferTo}).`);
           // Actionable, because this also fires when a retry re-ran the whole
           // deploy after attempt 1 freshly registered + then flaked on
           // setContenthash/publish: attempt 2 sees "Already owned", so the
@@ -3485,14 +3702,14 @@ export async function deploy(content: DeployContent, domainName: string | null =
         }
         if (shouldHandoverName({ transferTo: options.transferTo, registeredFresh })) {
           const transferTo = options.transferTo!;
-          await withSpan("deploy.transfer", `3. transfer ${name}.dot`, { "deploy.transfer.to": transferTo }, async () => {
+          await withSpan("deploy.transfer", `3. transfer ${name}.${envTld}`, { "deploy.transfer.to": transferTo }, async () => {
             setDeployAttribute("deploy.transfer.worker", truncateAddress(options.signerAddress ?? "") as string);
             setDeployAttribute("deploy.transfer.to", transferTo);
             try {
               const transferRes = await dotns.transferName(name, transferTo, (s) => console.log(`   ${s}`));
               setDeployAttribute("deploy.transfer.status", transferRes.status);
               if (transferRes.feeWei != null) setDeployAttribute("deploy.transfer.fee_wei", transferRes.feeWei.toString());
-              console.log(`   Handed ${name}.dot to ${transferTo} (${transferRes.status}${transferRes.txHash ? `, tx ${transferRes.txHash}` : ""}).`);
+              console.log(`   Handed ${name}.${envTld} to ${transferTo} (${transferRes.status}${transferRes.txHash ? `, tx ${transferRes.txHash}` : ""}).`);
             } catch (e) {
               setDeployAttribute("deploy.transfer.status", "failed");
               const recover = `${CLI_NAME} transfer ${name} --env ${envId}` + (options.suri ? ` --mnemonic "<your worker key>"` : "");
@@ -3525,59 +3742,14 @@ export async function deploy(content: DeployContent, domainName: string | null =
         }
       });
 
-      // Final checks: join the mirror push (which has been running in
-      // parallel since onCarReady fired mid-storage) and verify Pages is
-      // actually serving this deploy's bytes. Non-fatal: on-chain state is
-      // authoritative, and a late-blooming Pages build would catch up soon
-      // after the CLI exits — but surfacing the wait here means a user who
-      // immediately opens dot.li / Desktop after the CLI returns sees fresh
-      // content instead of racing against CDN propagation.
-      if (options.ghPagesMirror) {
-        console.log("\n" + "=".repeat(60));
-        console.log("Final checks");
-        console.log("=".repeat(60));
-        await withSpan("deploy.gh-pages-mirror", "4. gh-pages-mirror", { "deploy.domain": name }, async () => {
-          const mirror = await mirrorPromise;
-          if (mirror === null) {
-            console.log("   GitHub Pages mirror: skipped (only directory deploys produce a CAR suitable for mirroring).");
-            return;
-          }
-          if (mirror instanceof MirrorSkipped) {
-            console.log(`   GitHub Pages mirror: skipped — ${mirror.message}`);
-            return;
-          }
-          if (mirror instanceof Error) {
-            console.log(`   GitHub Pages mirror: failed (non-fatal) — ${mirror.message}`);
-            captureWarning("gh-pages mirror failed", { error: mirror.message.slice(0, 200) });
-            return;
-          }
-          console.log(`   Mirror: ${mirror.url}`);
-          console.log(`   Manifest: https://${mirror.owner}.github.io/${mirror.repo}/${mirror.manifestPath}`);
-          setDeployAttribute("deploy.gh_pages_url", mirror.url);
-          process.stdout.write("   Verifying Pages serves this deploy's CAR... ");
-          const freshness = await pollMirrorFreshness(mirror.url, cid as string, { timeoutMs: 3 * 60 * 1000, intervalMs: 10_000 });
-          if (freshness.verified) {
-            console.log(`ok (${freshness.attempts} attempt${freshness.attempts === 1 ? "" : "s"}, ${(freshness.durationMs / 1000).toFixed(0)}s).`);
-            setDeployAttribute("deploy.gh_pages_freshness_verified", "true");
-          } else {
-            // Non-fatal: courtesy poll only. Pages CDN propagation can run past our 3-min budget,
-            // especially on self-hosted runners. Record the outcome as a span attribute (both
-            // values, per ratio-attribute convention) without flipping deploy.sad.
-            console.log(`timed out.`);
-            console.log(`   GitHub Pages last served cid=${freshness.lastCid ?? "n/a"} (expected ${cid}); it should catch up shortly. Non-fatal.`);
-            setDeployAttribute("deploy.gh_pages_freshness_verified", "false");
-          }
-        });
-      }
-
       console.log("\n" + "=".repeat(60));
       console.log("DEPLOYMENT COMPLETE!");
       console.log("=".repeat(60));
       console.log("\nCheck it out here:");
-      console.log(`   ${browserUrlFor(name, envId)}`);
-      console.log(`   ${name}.dot  (in a Polkadot app: mobile or desktop)`);
+      console.log(`   ${browserUrlFor(name, envId, envWebGateway)}`);
+      console.log(`   ${name}.${envTld}  (in a Polkadot app: mobile or desktop)`);
       console.log("\n" + "=".repeat(60) + "\n");
-      return { domainName: name, fullDomain: `${name}.dot`, cid: cid as string, ipfsCid };
+      return { domainName: name, fullDomain: `${name}.${envTld}`, cid: cid as string, ipfsCid };
     } finally {
       // Flush the module-level failover flag in case onStatusChanged fired after
       // the deploy span attribute was already written. Idempotent if already set.

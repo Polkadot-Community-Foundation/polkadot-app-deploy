@@ -21,8 +21,13 @@ on:
   pull_request:
     branches: [main]
     paths-ignore:
-      - package.json
-      - package-lock.json
+      # package.json / package-lock.json deliberately NOT here (see #195):
+      # a pure version bump and a dependency bump both touch only these two
+      # files, and a path filter can't tell them apart — a dependency bump
+      # (e.g. viem, which encodes every DotNS contract call) is exactly the
+      # change class most likely to need chain validation. The
+      # detect-deps-change job below diffs their content and classifies
+      # instead; heavy jobs gate on its output rather than on path membership.
       # Ops scripts under tools/ never participate in the CI deploy paths.
       # Skip E2E when a PR only touches them.
       - tools/**
@@ -42,8 +47,8 @@ on:
   push:
     branches: [main]
     paths-ignore:
-      - package.json
-      - package-lock.json
+      # See the pull_request block above — package.json / package-lock.json
+      # are classified by detect-deps-change, not path-ignored.
       - tools/**
       - '**/*.yml'
       - '**/*.yaml'
@@ -86,12 +91,31 @@ on:
         description: 'Primary E2E environment id (default: paseo-next-v2). Probed first; falls back to other e2eEligible envs if down.'
         type: string
         default: ''
+      # Comma-separated scenario ids for a manual nightly dispatch. Empty (the
+      # default, and the value on every non-dispatch trigger) = run all, so this
+      # is a no-op on schedule/release/PR.
+      # Nonce-chain safety: selecting a chained Alice-pool scenario (e.g. s6)
+      # alone is safe — a filtered-out prerequisite (s5) skips and consumes no
+      # nonces, and the jobs' `if: always()` lets the selected job still run;
+      # when both are selected the existing `needs:` ordering still serializes.
+      # Aggregate verifiers (telemetry / pool-distribution / code-path coverage /
+      # address-drift) deliberately keep no filter — a subset cannot satisfy them.
+      # nightly-pr-coverage and nightly-s-inc are also unfiltered: their scenario
+      # id comes from the matrix, and the `matrix` context is NOT available in a
+      # job-level `if:` (only github / needs / vars / inputs are). Referencing it
+      # there makes the whole workflow invalid — GitHub rejects it at setup and
+      # the run reports failure with zero jobs. A filtered dispatch therefore
+      # still runs both matrices in full.
+      scenarios:
+        description: 'Comma-separated scenario ids to re-run on a manual nightly dispatch (e.g. "s6,s8,s9"). Empty (default) = all. Re-run only the flaky scenarios instead of the whole matrix.'
+        type: string
+        default: ''
 
 permissions:
   # Workflow-level default: read-only. Jobs that need write access carry
-  # an explicit per-job permissions: block below (nightly-s4, pr-report,
-  # nightly-report). All other jobs — including every test-pr matrix leg
-  # — run with contents:read only.
+  # an explicit per-job permissions: block below (pr-report, nightly-report).
+  # All other jobs — including every test-pr matrix leg — run with
+  # contents:read only.
   contents: read
 
 concurrency:
@@ -203,6 +227,133 @@ jobs:
             echo "is_noop=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # ---- Dependency-bump discriminator (#195) -----------------------------
+  #
+  # package.json / package-lock.json are no longer in paths-ignore (see the
+  # `on:` block above): a pure version bump and a dependency bump both touch
+  # only these two files, and a path filter cannot tell them apart even
+  # though a dependency bump (e.g. viem, which encodes every DotNS contract
+  # call — see #190) is exactly the change class most likely to need chain
+  # validation. This job fetches both files' content at the PR/push base and
+  # head SHAs and classifies the diff:
+  #   - version field only (package.json .version, and lockfile .version +
+  #     .packages[""].version) → is_version_only=true. Heavy E2E jobs stay
+  #     gated off — release/RC version bumps stay free, same guarantee the
+  #     old paths-ignore membership used to give.
+  #   - anything else (dependencies/devDependencies/overrides/
+  #     peerDependencies, or the resolved lockfile tree) → is_version_only=
+  #     false. A version bump mixed with a real dependency change in the
+  #     same PR also lands here — mixed is NOT safe to skip.
+  #   - neither file touched at all (the common case: an ordinary source PR)
+  #     → is_version_only=false too, so this job only ever skips the narrow
+  #     release-version-bump shape, never a normal source change.
+  #
+  # Every consumer below gates on is_version_only alone; there is no
+  # separate deps_changed output (it would only ever be that field's trivial
+  # negation — see the classify step's log line for the value if you need it
+  # while debugging a run).
+  #
+  # Uses the Contents API (full file content) rather than the Compare API's
+  # unified diff: GitHub omits `patch` for large files, and a lockfile is
+  # exactly the file most likely to hit that ceiling as the dependency tree
+  # grows. Comparing full content is correct regardless of file size.
+  detect-deps-change:
+    name: Classify package.json/lock diff (version bump vs dependency change)
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    outputs:
+      is_version_only: ${{ steps.classify.outputs.is_version_only }}
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - id: classify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          fetch() {
+            # $1=sha $2=path $3=outfile. Missing/404 → empty outfile, treated
+            # as "file did not exist at that ref" by the classifier below.
+            curl -fsSL -H "Authorization: bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw+json" \
+              "https://api.github.com/repos/$REPO/contents/$2?ref=$1" -o "$3" 2>/dev/null || : > "$3"
+          }
+          if [[ -z "${BASE_SHA:-}" || "$BASE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            echo "No base SHA to diff against (branch creation) — treating as dependency-affecting to be safe."
+            echo "is_version_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          fetch "$BASE_SHA" package.json base_pkg.json
+          fetch "$HEAD_SHA" package.json head_pkg.json
+          fetch "$BASE_SHA" package-lock.json base_lock.json
+          fetch "$HEAD_SHA" package-lock.json head_lock.json
+          cat > classify-deps-change.cjs <<'JSEOF'
+          const fs = require("fs");
+
+          function loadJSON(path) {
+            try {
+              const raw = fs.readFileSync(path, "utf8");
+              if (!raw.trim()) return null;
+              return JSON.parse(raw);
+            } catch (e) {
+              return null;
+            }
+          }
+
+          function stripVersionFields(obj, isLockfile) {
+            if (!obj || typeof obj !== "object") return obj;
+            const clone = JSON.parse(JSON.stringify(obj));
+            delete clone.version;
+            if (isLockfile && clone.packages && typeof clone.packages === "object" &&
+                clone.packages[""] && typeof clone.packages[""] === "object") {
+              delete clone.packages[""].version;
+            }
+            return clone;
+          }
+
+          const basePkgRaw = loadJSON("base_pkg.json");
+          const headPkgRaw = loadJSON("head_pkg.json");
+          const baseLockRaw = loadJSON("base_lock.json");
+          const headLockRaw = loadJSON("head_lock.json");
+
+          // Did either file change at all (including a pure version bump)?
+          const anyPackageFileChanged =
+            JSON.stringify(basePkgRaw) !== JSON.stringify(headPkgRaw) ||
+            JSON.stringify(baseLockRaw) !== JSON.stringify(headLockRaw);
+
+          const basePkg = stripVersionFields(basePkgRaw, false);
+          const headPkg = stripVersionFields(headPkgRaw, false);
+          const baseLock = stripVersionFields(baseLockRaw, true);
+          const headLock = stripVersionFields(headLockRaw, true);
+
+          // Is there any diff left once version fields are stripped out?
+          const nonVersionDiff =
+            JSON.stringify(basePkg) !== JSON.stringify(headPkg) ||
+            JSON.stringify(baseLock) !== JSON.stringify(headLock);
+
+          // version-only iff something changed AND the only thing that
+          // changed was a version field. Neither-file-touched (ordinary
+          // source PR) must NOT count as version-only, or this job would
+          // gate off heavy E2E for every normal source change too.
+          const isVersionOnly = anyPackageFileChanged && !nonVersionDiff;
+
+          console.log(`anyPackageFileChanged=${anyPackageFileChanged}`);
+          console.log(`nonVersionDiff=${nonVersionDiff}`);
+          console.log(`is_version_only=${isVersionOnly}`);
+          console.log(`deps_changed=${!isVersionOnly}`); // trivial negation, logged only — not exposed as a job output (nothing reads it)
+
+          const out = process.env.GITHUB_OUTPUT;
+          fs.appendFileSync(out, `is_version_only=${isVersionOnly}\n`);
+          JSEOF
+          node classify-deps-change.cjs
+
   # ---- Env selector ----------------------------------------------------
   #
   # Probes the primary E2E env (paseo-next-v2 by default, override via
@@ -216,10 +367,11 @@ jobs:
 
   select-env:
     name: Select E2E environment (probe + fallback)
-    needs: detect-noop-push
+    needs: [detect-noop-push, detect-deps-change]
     if: |
       always() &&
       (needs.detect-noop-push.result == 'skipped' || needs.detect-noop-push.outputs.is_noop != 'true') &&
+      (needs.detect-deps-change.result == 'skipped' || needs.detect-deps-change.outputs.is_version_only != 'true') &&
       (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'release' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 3
@@ -240,6 +392,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - id: select
         env:
           PRIMARY_ENV: ${{ inputs.primary-env || 'paseo-next-v2' }}
@@ -303,18 +458,22 @@ jobs:
 
   test-pr:
     name: PR · s1-smoke ${{ matrix.signer }}/${{ matrix.merkle }}
-    needs: [detect-noop-push, select-env]
+    needs: [detect-noop-push, detect-deps-change, select-env]
     # Run when one of the trigger paths fires AND either the noop-detect was
     # skipped (workflow_dispatch path) or it ran and the tree actually changed.
     # `always()` is required so a skipped predecessor doesn't auto-skip us.
     # `select-env.result == 'success'` is required so we skip the matrix
     # when all eligible envs are unhealthy — without it, always() would let
     # test-pr run with an empty PAD_ENV and fall back to the
-    # CLI default (paseo-next-v2), defeating the fallback.
+    # CLI default (paseo-next-v2), defeating the fallback. select-env already
+    # cascades the detect-deps-change gate (a version-only bump skips
+    # select-env, which fails this same check), but the explicit check here
+    # keeps the property directly verifiable on this job too (#195).
     if: |
       always() &&
       needs.select-env.result == 'success' &&
       (needs.detect-noop-push.result == 'skipped' || needs.detect-noop-push.outputs.is_noop != 'true') &&
+      (needs.detect-deps-change.result == 'skipped' || needs.detect-deps-change.outputs.is_version_only != 'true') &&
       (github.event_name == 'pull_request' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'pr'))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 20
@@ -330,6 +489,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - run: npm ci
       - name: Restore Kubo from cache
         if: matrix.merkle == 'kubo'
@@ -383,12 +545,14 @@ jobs:
 
   pr-report:
     name: PR E2E Report
-    needs: [test-pr, detect-noop-push]
-    # Same gate as test-pr: if the push was signature-only, both test-pr and
-    # this report are skipped — the PR keeps its previous green checks.
+    needs: [test-pr, detect-noop-push, detect-deps-change]
+    # Same gate as test-pr: if the push was signature-only OR a release
+    # version-only bump, both test-pr and this report are skipped — the PR
+    # keeps its previous green checks (#195).
     if: |
       always() &&
       (needs.detect-noop-push.result == 'skipped' || needs.detect-noop-push.outputs.is_noop != 'true') &&
+      (needs.detect-deps-change.result == 'skipped' || needs.detect-deps-change.outputs.is_version_only != 'true') &&
       (github.event_name == 'pull_request' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'pr'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -426,6 +590,7 @@ jobs:
 
       - name: Render report body
         env:
+          HEAD_REF_OR_NAME: ${{ github.head_ref || github.ref_name }}
           AGGREGATE: ${{ needs.test-pr.result == 'success' && 'success' || 'failure' }}
         run: |
           emoji() { case "$1" in
@@ -436,7 +601,7 @@ jobs:
             *)         echo "❓ $1";;
           esac; }
 
-          BRANCH="${{ github.head_ref || github.ref_name }}"
+          BRANCH="$HEAD_REF_OR_NAME"
           SHA_SHORT="${GITHUB_SHA:0:7}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
@@ -522,6 +687,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - run: npm ci
       - name: Resolve test-version and deploy-tag from trigger
         id: version
@@ -659,6 +827,55 @@ jobs:
           path: build/
           retention-days: 1
 
+  # ---- Prerequisite: make every E2E signer account ready before the matrix
+  #
+  # v0.16.0-rc.2's gating run was 38 pass / 4 fail; 3 of the 4 failures were
+  # ONE cause — lapsed/missing Bulletin storage authorization for //e2e-s9,
+  # //e2e-sgrandpa, and //e2e-fresh-pool (the last one never authorized at
+  # all because a maintainer provisioning tool's hardcoded signer list didn't
+  # include it — a list-drift bug). Two of the three presented exactly like
+  # this repo's documented retry-eligible flakes (`Invalid::Stale`), so a
+  # rerun would have failed again identically — the real cause is an
+  # off-chain grant, not a chain hiccup. This job fails FAST and LEGIBLY
+  # (naming every affected account) instead of letting that surface 20+
+  # minutes later as a scenario-leg `exit 78` that looks like a flake.
+  #
+  # See scripts/e2e-ensure-authorized.mjs for how the signer list is derived:
+  # it is parsed from THIS file's own derivation-path/poolIndex matrix values
+  # plus test/e2e.test.js's ISOLATED_DIRECT_SIGNERS — no separate hardcoded
+  # list to fall out of sync with the matrix below (the exact drift bug this
+  # job exists to prevent from recurring).
+  #
+  # Scope: runs once against select-env's single `selected_env` — the
+  # release-gating / workflow_dispatch path this bug actually hit. On a
+  # `schedule` multi-env fan-out (healthy_envs), this does NOT pre-authorize
+  # secondary envs, only the primary. Fanning this job out over healthy_envs
+  # too is a reasonable follow-up, intentionally not done here to keep the
+  # wiring simple for the case that matters (release gating is single-env).
+  ensure-e2e-authorized:
+    name: Nightly · Ensure E2E signers authorized
+    needs: select-env
+    if: always() && needs.select-env.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
+      - run: npm ci
+      - run: npm run build
+      - name: Ensure E2E signer accounts are authorized + funded
+        env:
+          PAD_ENV: ${{ needs.select-env.outputs.selected_env }}
+        run: node scripts/e2e-ensure-authorized.mjs --env "$PAD_ENV"
+
   # ---- Nightly @ HEAD: coverage for the 11 scenarios that left the PR matrix
   #
   # Runs on ubuntu-latest (GitHub-hosted, free for public repos). These test
@@ -667,7 +884,7 @@ jobs:
 
   nightly-pr-coverage:
     name: Nightly @ HEAD · ${{ matrix.scenario }} ${{ matrix.signer }}/${{ matrix.merkle }}
-    # Waits for the full Alice-pool nonce chain (s1-pool→s5→s6→s4→s-ext-signer).
+    # Waits for the full Alice-pool nonce chain (s1-pool→s5→s6→s-ext-signer).
     # E2E_POOL_LABEL (below) uses a dedicated domain (e2eprpool01) to avoid domain
     # contention with nightly-s1-pool on e2epoolns01.dot. But the pool accounts all
     # derive from the same Alice mnemonic, so nonces are still shared — sequencing
@@ -676,9 +893,9 @@ jobs:
     # Per-leg pool account pinning (#863): each pool leg is pinned to a disjoint
     # //deploy/N account via BULLETIN_POOL_ACCOUNT_INDEX, eliminating intra-matrix
     # nonce collisions without requiring a separate mnemonic provisioning step.
-    needs: [build-nightly, select-env, nightly-s-ext-signer]
+    needs: [build-nightly, select-env, nightly-s-ext-signer, ensure-e2e-authorized]
     if: |
-      always() &&
+      always() && needs.ensure-e2e-authorized.result == 'success' &&
       needs.build-nightly.result == 'success' &&
       (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ubuntu-latest
@@ -699,12 +916,6 @@ jobs:
           - { scenario: s1,                       signer: pool,   merkle: js,   poolIndex: 0 }
           - { scenario: s1,                       signer: direct, merkle: kubo }
           - { scenario: s3,                       signer: pool,   merkle: js,   poolIndex: 1 }
-          # s4 deliberately omitted from nightly-pr-coverage: its
-          # --gh-pages-mirror step requires `contents: write` to push to
-          # gh-pages, but this matrix runs on ubuntu-latest with the
-          # workflow's default `contents: read` permission. The dedicated
-          # nightly-s4 job (which uses the reusable deploy.yml with the
-          # correct permission scope) already covers the same scenario.
           # s7 is signer-agnostic (SIGINT crash-capture); empty matrix.signer
           # produces artifact name `e2e-log-night-s7--js` — mirrors the PR-tier
           # pattern at line 199, not a typo.
@@ -716,12 +927,28 @@ jobs:
           - { scenario: s-inc-portability,        signer: pool,   merkle: js,   poolIndex: 5 }
           - { scenario: s-inc-asset-rotation,     signer: pool,   merkle: js,   poolIndex: 6 }
           - { scenario: s-subdomain,              signer: pool,   merkle: js,   poolIndex: 7 }
+          - { scenario: s-content-only,           signer: pool,   merkle: js,   poolIndex: 8 }
+          - { scenario: s-manifest-env,           signer: pool,   merkle: js,   poolIndex: 9 }
+          # S-TRANSFER: register-as-worker then hand over via the `transfer`
+          # command, plus idempotent re-run. Existed in test/e2e.test.js and
+          # scripts/e2e-pass.sh since its introduction but was never wired
+          # into any CI job — this is its first nightly coverage.
+          - { scenario: s-transfer,               signer: pool,   merkle: js,   poolIndex: 10 }
+          # S-TRANSFER-SUBNAME (bulletin #150/#151): `transfer`'s subname path
+          # via setSubnodeOwner — handover leg + a negative leg asserting the
+          # actionable parent-ownership error (not the old misleading
+          # "Invalid domain label"). No E2E coverage of this path existed
+          # anywhere before this leg.
+          - { scenario: s-transfer-subname,       signer: pool,   merkle: js,   poolIndex: 11 }
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - name: Restore Kubo from cache
         if: matrix.merkle == 'kubo'
         uses: actions/cache@v5
@@ -778,8 +1005,8 @@ jobs:
 
   nightly-s1-pool:
     name: Nightly S1 pool/${{ matrix.merkle }} on ${{ matrix.runner }} (${{ matrix.env }})
-    needs: [build-nightly, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    needs: [build-nightly, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's1')))
     # No top-level timeout-minutes here: GitHub forbids it on reusable-workflow
     # callers. The cap lives in deploy.yml (timeout-minutes: 30 on the deploy job).
     permissions:
@@ -801,7 +1028,7 @@ jobs:
     uses: ./.github/workflows/deploy.yml
     with:
       artifact-name: e2e-fixture-nightly
-      dotns-domain: e2epoolns01.dot
+      dotns-domain: e2epoolns01
       skip-cache: true
       js-merkle: ${{ matrix.merkle == 'js' }}
       direct-signer: false
@@ -823,8 +1050,8 @@ jobs:
 
   nightly-s1-direct:
     name: Nightly S1 direct/${{ matrix.merkle }} on ${{ matrix.runner }} (${{ matrix.env }})
-    needs: [build-nightly, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    needs: [build-nightly, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's1')))
     # Timeout cap lives in deploy.yml — see nightly-s1-pool note above.
     permissions:
       contents: read
@@ -845,7 +1072,7 @@ jobs:
     uses: ./.github/workflows/deploy.yml
     with:
       artifact-name: e2e-fixture-nightly
-      dotns-domain: e2edirectdp01.dot
+      dotns-domain: e2edirectdp01
       derivation-path: //e2e-direct
       skip-cache: true
       js-merkle: ${{ matrix.merkle == 'js' }}
@@ -876,8 +1103,8 @@ jobs:
 
   nightly-s2-fresh:
     name: Nightly S2 fresh / ${{ matrix.signer }} (${{ matrix.env }})
-    needs: [build-nightly, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    needs: [build-nightly, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's2')))
     # Timeout cap lives in deploy.yml — see nightly-s1-pool note above.
     permissions:
       contents: read
@@ -896,7 +1123,7 @@ jobs:
       artifact-name: e2e-fixture-nightly
       # Ends in the signer name plus 00 so the final label has base length
       # >= 9 and exactly two trailing digits, classifying as NoStatus on both envs.
-      dotns-domain: e2enightly${{ github.run_id }}${{ matrix.signer }}00.dot
+      dotns-domain: e2enightly${{ github.run_id }}${{ matrix.signer }}00
       derivation-path: //e2e-fresh-${{ matrix.signer }}
       skip-cache: true
       js-merkle: true
@@ -914,8 +1141,8 @@ jobs:
 
   nightly-s3:
     name: Nightly S3 owned-elsewhere (${{ matrix.env }})
-    needs: [build-nightly, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    needs: [build-nightly, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's3')))
     # S3 is a negative test: polkadot-app-deploy MUST reject the deploy to
     # e2eowned.dot (Bob's domain) with exit 78 + "is already owned by
     # 0x41dccbd4...". Previously this was two jobs — a reusable deploy.yml
@@ -941,11 +1168,14 @@ jobs:
       MNEMONIC: ${{ secrets.DOTNS_MNEMONIC || 'bottom drive obey lake curtain smoke basket hold race lonely fit walk' }}
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
       PAD_ENV: ${{ matrix.env }}
-      S3_LABEL: e2eownedns02.dot
+      S3_LABEL: e2eownedns03
     steps:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1014,8 +1244,8 @@ jobs:
     # S1-pool use the root Alice mnemonic for DotNS and would otherwise start
     # at the same time, causing Stale tx errors. always() ensures S5 still
     # runs even when S1-pool fails.
-    needs: [build-nightly, nightly-s1-pool, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    needs: [build-nightly, nightly-s1-pool, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's5')))
     # S5 forces the dotns-sdk#105 commit-reveal race by setting buffer=0,
     # which after the isExplicitCommitmentBuffer fix triggers the retry path
     # to escalate to 60s. Validates that the recovery in PR #180 actually
@@ -1041,6 +1271,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1079,7 +1312,7 @@ jobs:
           DOTNS_COMMITMENT_BUFFER: "0"
           # x00 forces NoStatus classification on paseo-next-v2 without
           # depending on POP_RULES self-attestation.
-          LABEL: "e2es5${{ github.run_id }}a${{ github.run_attempt }}x00.dot"
+          LABEL: "e2es5${{ github.run_id }}a${{ github.run_attempt }}x00"
         with:
           timeout_minutes: 15
           max_attempts: 2
@@ -1125,9 +1358,9 @@ jobs:
   nightly-s6:
     name: Nightly S6 RPC failover (${{ matrix.env }})
     # Runs after nightly-s5 (which runs after nightly-s1-pool) to serialize all
-    # Alice-root DotNS jobs: s1-pool → s5 → s6 → s4 → s-ext-signer.
-    needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, nightly-s5, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    # Alice-root DotNS jobs: s1-pool → s5 → s6 → s-ext-signer.
+    needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, nightly-s5, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's6')))
     # S6 forces transport-level failover by pointing BULLETIN_RPC at an
     # unroutable address. src/deploy.ts:811-813 prepends user-rpc to
     # BULLETIN_ENDPOINTS, leaving the public Bulletin endpoint as the backup;
@@ -1155,6 +1388,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1194,7 +1430,7 @@ jobs:
         run: |
           set +e
           set -o pipefail
-          "$PAD_BIN" --js-merkle --tag "$DEPLOY_TAG" --env "$PAD_ENV" build e2epoolns01.dot 2>&1 | tee /tmp/s6.log
+          "$PAD_BIN" --js-merkle --tag "$DEPLOY_TAG" --env "$PAD_ENV" build e2epoolns01 2>&1 | tee /tmp/s6.log
           EXIT=${PIPESTATUS[0]}
           set -e
           echo "---"
@@ -1205,107 +1441,13 @@ jobs:
           fi
           echo "::notice::S6 deploy succeeded — papi rotated past the unroutable primary"
 
-  nightly-s4:
-    name: Nightly S4 gh-pages mirror
-    # Serialized in the Alice-root DotNS chain: s1-pool → s5 → s6 → s4.
-    # s4 deploys e2epoolns01.dot (Alice root) so it must not overlap s5 or s6.
-    # `always()` so s4 runs even when an earlier shard has a partial failure.
-    # S4 does NOT fan out across envs: it pushes to the gh-pages branch of
-    # THIS repo, which is a single shared resource. Running it per-env would
-    # race on the gh-pages push and serve stale CARs for one env. Single-env
-    # (selected_env) is intentional here.
-    needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, nightly-s5, nightly-s6, select-env]
-    # `release` intentionally omitted: release-gating runs install the package
-    # from npm (no source ref), so deploy.yml skips the checkout and the
-    # gh-pages mirror has no git repo to push from (git worktree fails). Tracked
-    # in #11. S4 still runs on schedule/dispatch (which carry a source ref).
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
-    # Timeout cap lives in deploy.yml — see nightly-s1-pool note above.
-    permissions:
-      # contents:write is required by the --gh-pages-mirror flag: deploy.yml
-      # pushes the CAR to the gh-pages branch after deploy.
-      contents: write
-    uses: ./.github/workflows/deploy.yml
-    with:
-      artifact-name: e2e-fixture-nightly
-      dotns-domain: e2epoolns01.dot
-      skip-cache: true
-      js-merkle: true
-      runner: ${{ inputs.runner || 'ubuntu-latest' }}
-      tag: ${{ needs.build-nightly.outputs.deploy-tag }}
-      env: ${{ needs.select-env.outputs.selected_env }}
-      polkadot-app-deploy-version: ${{ needs.build-nightly.outputs.test-version }}
-      polkadot-app-deploy-ref: ${{ needs.build-nightly.outputs.polkadot-app-deploy-ref }}
-      gh-pages-mirror: true
-      # Opt-in to flake-class retry (see nightly-s1-pool comment).
-      max-retries: 2
-    secrets:
-      mnemonic: ${{ secrets.DOTNS_MNEMONIC || 'bottom drive obey lake curtain smoke basket hold race lonely fit walk' }}
-      sentry-dsn: ${{ secrets.SENTRY_DSN }}
-
-  nightly-verify-s4:
-    name: Verify nightly S4 mirror URL serves the CAR
-    needs: nightly-s4
-    # See nightly-s4: `release` omitted (npm-mode mirror has no git repo, #11).
-    if: always() && needs.nightly-s4.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - name: Poll Pages URL until 200
-        timeout-minutes: 12
-        run: |
-          URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/bulletin/e2epoolns01.dot.car"
-          MANIFEST="${URL%.car}.json"
-          # Pages builds typically land within 1-2 min of push; first-time
-          # branch creation or busy queue can stretch this. 10 min is a
-          # conservative hedge — the real failure mode may be geo-cache
-          # inconsistency that extra time won't fix, but this leaves room
-          # for slow CDN propagation under a busy Pages build queue.
-          for i in $(seq 1 60); do
-            code=$(curl -sI -o /dev/null -w "%{http_code}" "$URL")
-            if [ "$code" = "200" ]; then
-              echo "CAR served 200 after ${i} attempts: $URL"
-              break
-            fi
-            if [ $i -eq 60 ]; then
-              echo "::group::Diagnostic headers for $URL (final attempt, status $code)"
-              curl -sI -D /tmp/s4-headers "$URL" -o /dev/null
-              echo "--- full response headers ---"
-              cat /tmp/s4-headers
-              echo "--- last-modified ---"
-              grep -i "^last-modified:" /tmp/s4-headers || echo "(last-modified header not present)"
-              echo "--- http status code ---"
-              echo "$code"
-              echo "::endgroup::"
-              echo "::error::$URL never returned 200 within 10 min (last status $code)"
-              exit 1
-            fi
-            sleep 10
-          done
-          code=$(curl -sI -o /dev/null -w "%{http_code}" "$MANIFEST")
-          if [ "$code" != "200" ]; then
-            echo "::group::Diagnostic headers for $MANIFEST (status $code)"
-            curl -sI -D /tmp/s4-manifest-headers "$MANIFEST" -o /dev/null
-            echo "--- full response headers ---"
-            cat /tmp/s4-manifest-headers
-            echo "--- last-modified ---"
-            grep -i "^last-modified:" /tmp/s4-manifest-headers || echo "(last-modified header not present)"
-            echo "--- http status code ---"
-            echo "$code"
-            echo "::endgroup::"
-            echo "::error::Manifest $MANIFEST returned $code"; exit 1
-          fi
-          echo "Manifest served 200: $MANIFEST"
-
   nightly-s7:
     name: Nightly S7 SIGINT crash-capture (${{ matrix.env }})
     # Runs after nightly-s1 shards complete to avoid contention on e2epoolns01.dot
     # (this scenario kills its own first deploy mid-upload, but the second
     # invocation still talks to chain state).
-    needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's7')))
     # S7 forces a SIGINT mid-chunk-upload and verifies the crash-capture
     # infrastructure (#178) actually ran end-to-end: exit code 130, state
     # file correctly populated, relaunch warning fires on the next
@@ -1337,6 +1479,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1387,8 +1532,8 @@ jobs:
     # Uses the checked-out source so the WS fault proxy and test helpers are
     # available; polkadot-app-deploy binary is built from source (or from the RC
     # ref when BULLETIN_DEPLOY_REF is set).
-    needs: [build-nightly, nightly-s1-direct, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's8')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 25
     permissions:
@@ -1413,6 +1558,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
         run: |
@@ -1454,8 +1602,8 @@ jobs:
     # Two parallel deploys from the same direct-signer key; proves nonce-advance
     # defense works under concurrent chunk-upload contention.
     # Runs after nightly-s1-direct to avoid nonce races on the direct signer label.
-    needs: [build-nightly, nightly-s1-direct, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's9')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 35
     permissions:
@@ -1480,6 +1628,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
         run: |
@@ -1512,8 +1663,8 @@ jobs:
     # Proxy holds stale chain_getFinalizedHead for 15s (> 10s natural wait),
     # forcing the missing-chunk re-upload path to fire and succeed.
     # Runs after nightly-s1-direct to avoid nonce races on the direct signer label.
-    needs: [build-nightly, nightly-s1-direct, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-grandpa-reupload')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 25
     permissions:
@@ -1538,6 +1689,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
         run: |
@@ -1571,8 +1725,8 @@ jobs:
     # to expire before inclusion on congested blocks, exercising the
     # isValid:false → expiry-retry path in storeChunkedContent.
     # Runs after nightly-s1-direct to avoid nonce races on the direct signer label.
-    needs: [build-nightly, nightly-s1-direct, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-mortality')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 35
     permissions:
@@ -1597,6 +1751,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
         run: |
@@ -1633,8 +1790,8 @@ jobs:
     # a dedicated E2E_REPROVE_MNEMONIC account must exist with sufficient balance.
     # Note: the E2E_REPROVE_MNEMONIC fixture account must be provisioned per env;
     # if not provisioned on an env the test will fail (not silently skip).
-    needs: [build-nightly, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    needs: [build-nightly, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-reprove')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 25
     permissions:
@@ -1659,6 +1816,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         run: |
           SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
@@ -1680,8 +1840,8 @@ jobs:
     # Runs after nightly-s1-pool since it deploys a fresh per-run domain
     # (no conflict with e2epoolns01.dot), but we still wait so the pool mnemonic
     # isn't racing S1's Asset Hub transactions.
-    needs: [build-nightly, nightly-s1-pool, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    needs: [build-nightly, nightly-s1-pool, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-car')))
     # Two consecutive deploys (normal + --input-car) to a fresh per-run label.
     # Runs on both paths: source-build uses node --test test/e2e.test.js;
     # npm-install path writes an inline script so test/ is not required.
@@ -1705,6 +1865,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
 
       # ---- source-build path (schedule / dispatch without version) ----------
       - name: Checkout polkadot-app-deploy source
@@ -1728,7 +1891,7 @@ jobs:
           PAD_ENV: ${{ matrix.env }}
           # x00 forces NoStatus classification on both e2eEligible envs without
           # depending on POP_RULES self-attestation.
-          LABEL: e2escar${{ github.run_id }}a${{ github.run_attempt }}x00.dot
+          LABEL: e2escar${{ github.run_id }}a${{ github.run_attempt }}x00
         with:
           timeout_minutes: 40
           max_attempts: 2
@@ -1765,7 +1928,7 @@ jobs:
           const BIN = path.join(__dirname, "node_modules", ".bin", "polkadot-app-deploy");
 
           const PAD_ENV = process.env.PAD_ENV ?? process.env.DOTNS_ENV ?? "paseo-next-v2";
-          const LABEL = process.env.LABEL || "e2escar00default.dot";
+          const LABEL = process.env.LABEL || "e2escar00default";
           const MNEMONIC = process.env.MNEMONIC || "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
           const DEPLOY_TAG = process.env.DEPLOY_TAG || undefined;
           const SENTRY_DSN = process.env.SENTRY_DSN || undefined;
@@ -1838,7 +2001,7 @@ jobs:
           PAD_ENV: ${{ matrix.env }}
           # x00 forces NoStatus classification on both e2eEligible envs without
           # depending on POP_RULES self-attestation.
-          LABEL: e2escar${{ github.run_id }}a${{ github.run_attempt }}x00.dot
+          LABEL: e2escar${{ github.run_id }}a${{ github.run_attempt }}x00
         with:
           timeout_minutes: 38
           max_attempts: 2
@@ -1852,8 +2015,8 @@ jobs:
     # max-parallel: 1 serializes the 5 matrix legs against each other since all
     # legs deploy to the same stable pool labels (e2einc.dot / e2erot.dot or
     # e2eincpool01.dot / e2erotpool01.dot) — concurrent legs would collide.
-    needs: [build-nightly, nightly-s1-pool, nightly-s-car, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    needs: [build-nightly, nightly-s1-pool, nightly-s-car, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     # Only runs from source (BULLETIN_DEPLOY_REF path); npm-install path does
     # not carry test/e2e.test.js so the run step is skipped.
     # Short-term scope: source-build path only (issue #349 defers npm-install rewrite).
@@ -1887,6 +2050,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - name: Checkout polkadot-app-deploy source
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: actions/checkout@v6
@@ -1917,11 +2083,11 @@ jobs:
 
   nightly-s-ext-signer:
     name: Nightly S-ext-signer external PolkadotSigner → in-process Revive (${{ matrix.env }})
-    # Last in the Alice-root DotNS chain: s1-pool → s5 → s6 → s4 → s-ext-signer.
+    # Last in the Alice-root DotNS chain: s1-pool → s5 → s6 → s-ext-signer.
     # All these jobs deploy e2epoolns01.dot (Alice root); running any two concurrently
     # causes Stale tx errors from nonce collisions.
-    needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, nightly-s6, nightly-s4, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, nightly-s6, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-ext-signer')))
     # Verifies the in-process Revive transaction path restored by PR #237.
     # playground-cli uses this path when the user authenticates with a phone
     # signer: it passes a PolkadotSigner object to DotNS.connect() instead of
@@ -1945,6 +2111,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
 
       # ---- source-build path (schedule / dispatch without version) ----------
       - name: Checkout polkadot-app-deploy source
@@ -1987,7 +2156,19 @@ jobs:
           echo "Installing @parity/polkadot-app-deploy@$V into /tmp/bd-s-ext"
           mkdir -p /tmp/bd-s-ext
           echo '{"type":"module"}' > /tmp/bd-s-ext/package.json
-          cd /tmp/bd-s-ext && npm install "@parity/polkadot-app-deploy@${V}" @polkadot/keyring polkadot-api
+          # Install the product FIRST, then pin polkadot-api to whatever version it
+          # actually resolved. A bare `polkadot-api` here takes the registry's latest,
+          # which drifted ahead of our dependency range the moment polkadot-api 3.0.0
+          # shipped (2026-08-18) and DROPPED the `./signer` subpath — so this scenario's
+          # `import { getPolkadotSigner } from "polkadot-api/signer"` dies with
+          # ERR_PACKAGE_PATH_NOT_EXPORTED against papi 3 while the product itself is fine
+          # on its nested 2.x. Pinning to the resolved version also makes the test honest:
+          # an "external PolkadotSigner" must come from the SAME papi instance the product
+          # uses, not a different major.
+          cd /tmp/bd-s-ext && npm install "@parity/polkadot-app-deploy@${V}" @polkadot/keyring
+          PAPI=$(node -p "require('/tmp/bd-s-ext/node_modules/polkadot-api/package.json').version")
+          echo "@parity/polkadot-app-deploy@${V} resolved polkadot-api ${PAPI} — pinning the scenario to it"
+          cd /tmp/bd-s-ext && npm install "polkadot-api@${PAPI}"
       - name: Write external signer test script
         if: env.BULLETIN_DEPLOY_REF == ''
         run: |
@@ -2061,7 +2242,7 @@ jobs:
 
   nightly-report:
     name: Nightly E2E Report
-    needs: [build-nightly, select-env, nightly-s1-pool, nightly-s1-direct, nightly-s2-fresh, nightly-s3, nightly-s4, nightly-verify-s4, nightly-s5, nightly-s6, nightly-s7, nightly-s8, nightly-s9, nightly-s-grandpa-reupload, nightly-s-mortality, nightly-s-reprove, nightly-s-car, nightly-s-inc, nightly-s-ext-signer, nightly-verify-telemetry, nightly-verify-pool-distribution, nightly-pr-coverage, nightly-code-path-coverage]
+    needs: [build-nightly, select-env, ensure-e2e-authorized, nightly-s1-pool, nightly-s1-direct, nightly-s2-fresh, nightly-s3, nightly-s5, nightly-s6, nightly-s7, nightly-s8, nightly-s9, nightly-s-grandpa-reupload, nightly-s-mortality, nightly-s-reprove, nightly-s-car, nightly-s-inc, nightly-s-ext-signer, nightly-verify-telemetry, nightly-verify-pool-distribution, nightly-pr-coverage, nightly-code-path-coverage]
     if: always() && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -2074,6 +2255,7 @@ jobs:
       - name: Fetch per-leg job results
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SELECTED_ENV: ${{ needs.select-env.outputs.selected_env }}
         # Same robustness fix as pr-report: use curl + pipefail so a
         # missing-gh-binary regression on the runner can't silently
         # produce empty TSVs and a headerless report.
@@ -2096,9 +2278,61 @@ jobs:
             /tmp/jobs.json > /tmp/s1-legs.tsv
           jq -r '.jobs[] | select(.name | startswith("Nightly S2 fresh ")) | "\(.name)\t\(.conclusion)"' \
             /tmp/jobs.json > /tmp/s2-legs.tsv
-          # Per-env breakdown: group any "Nightly …" jobs by the env suffix in parentheses.
-          jq -r '.jobs[] | select(.name | test("^Nightly ")) | "\(.name)\t\(.conclusion)"' \
-            /tmp/jobs.json > /tmp/all-nightly-legs.tsv
+          # Per-env breakdown (issue #1055): classify every "Nightly …" job
+          # ONCE, here, into a 3rd column — the env parsed from its "(<env>)"
+          # name suffix, $SELECTED_ENV for the env-fixed scenarios (S-INC,
+          # PR-coverage) that carry no suffix, or META for jobs that aren't
+          # scoped to a single env (telemetry/pool-dist/code-path/DotNS-drift/
+          # this report job itself). Computed once and reused downstream by
+          # the render step (env filter = exact match on this column) instead
+          # of re-deriving env/meta from the name string in multiple places.
+          jq -r '.jobs[] | select(.name | test("^Nightly ")) | "\(.name)\t\(.conclusion)"' /tmp/jobs.json |
+          awk -F'\t' -v selected="$SELECTED_ENV" '
+            BEGIN { OFS="\t" }
+            {
+              name = $1; conclusion = $2
+              meta = (index(name,"telemetry assertions")>0) || (index(name,"pool selection")>0) || \
+                     (index(name,"code-path")>0) || (index(name,"E2E Report")>0) || (index(name,"DotNS address drift")>0)
+              env_tag = "META"
+              if (!meta) {
+                env_tag = selected
+                n = length(name)
+                if (substr(name, n, 1) == ")") {
+                  for (i = n; i >= 1; i--) {
+                    if (substr(name, i, 1) == "(") {
+                      env_tag = substr(name, i + 1, n - i - 1)
+                      break
+                    }
+                  }
+                }
+              }
+              print name, conclusion, env_tag
+            }' > /tmp/all-nightly-legs.tsv
+
+          # One-line failure signature per failing leg (issue #1055): fetch each
+          # failing job's raw log and grab the last `>> FAIL: …` / `Deployment
+          # failed: …` line — the convention test/CLAUDE.md requires assertions
+          # to end with. Lets triage read the cause from the issue body alone,
+          # without opening the Actions run. Capped at 20 jobs: a broad outage
+          # can fail/cancel most of the matrix at once, and this loop is
+          # sequential — 20 raw-log downloads is enough for any real triage
+          # without risking the job's own 10-minute timeout budget.
+          : > /tmp/fail-signatures.tsv
+          jq -r '.jobs[] | select(.name | test("^Nightly ")) | select(.conclusion == "failure" or .conclusion == "cancelled") | "\(.id)\t\(.name)"' \
+            /tmp/jobs.json | head -n 20 |
+          while IFS=$'\t' read -r job_id job_name; do
+            SIG=$(curl -fsSL \
+              -H "Authorization: bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "${{ github.api_url }}/repos/${{ github.repository }}/actions/jobs/${job_id}/logs" 2>/dev/null \
+              | grep -aE '>> FAIL:|Deployment failed:' \
+              | tail -n 1 \
+              | tr -d '\r' \
+              | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z[[:space:]]*//' \
+              || true)
+            SIG="${SIG:-(no failure signature found in logs — open the run)}"
+            printf '%s\t%s\n' "$job_name" "$SIG" >> /tmp/fail-signatures.tsv
+          done
 
       - name: Render report body
         env:
@@ -2106,7 +2340,6 @@ jobs:
           NIGHTLY_S1_DIRECT:      ${{ needs.nightly-s1-direct.result }}
           NIGHTLY_S2:             ${{ needs.nightly-s2-fresh.result }}
           VERIFY_S3:              ${{ needs.nightly-s3.result }}
-          VERIFY_S4:              ${{ needs.nightly-verify-s4.result }}
           NIGHTLY_S5:             ${{ needs.nightly-s5.result }}
           NIGHTLY_S6:             ${{ needs.nightly-s6.result }}
           NIGHTLY_S7:             ${{ needs.nightly-s7.result }}
@@ -2150,9 +2383,43 @@ jobs:
             echo ""
             echo "Tag: \`$TAG\` · Run: [${{ github.run_id }}]($RUN_URL)"
             echo ""
-            # Show which envs the nightly ran on
-            HEALTHY_LIST=$(echo "$HEALTHY_ENVS" | python3 -c "import json,sys; envs=json.load(sys.stdin); print(', '.join(envs))" 2>/dev/null || echo "$HEALTHY_ENVS")
+            # Show which envs the nightly ran on. ENV_LIST is the source list;
+            # HEALTHY_LIST just reformats it — one JSON parse, not two.
+            ENV_LIST=$(echo "$HEALTHY_ENVS" | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin)))" 2>/dev/null || echo "$SELECTED_ENV")
+            HEALTHY_LIST=$(printf '%s\n' "$ENV_LIST" | paste -sd ',' - | sed 's/,/, /g')
             echo "Environments: $HEALTHY_LIST | Fixed scenarios (S-INC, PR-coverage) on: $SELECTED_ENV"
+            echo ""
+            # Per-environment status header (issue #1055): /tmp/all-nightly-legs.tsv
+            # already carries a 3rd column classifying each row's env — either
+            # the "(<env>)" name suffix, $SELECTED_ENV for the env-fixed
+            # scenarios (S-INC, PR-coverage), or META for jobs that aren't
+            # scoped to a single env (telemetry, pool distribution, code-path,
+            # DotNS drift, this report job itself). That classification is
+            # computed once, upstream in the Fetch step; here we only filter
+            # and count — no re-parsing of job names, so it can't drift out of
+            # sync with the failing-legs table below (which reads the same
+            # column). META failures get their own line so a global failure
+            # there can never render as "all green".
+            join_semi() { paste -sd '|' - | sed 's/|/; /g'; }
+            echo "Environment status:"
+            while IFS= read -r env; do
+              [ -z "$env" ] && continue
+              MATCHING=$(awk -F'\t' -v env="$env" '$3==env' /tmp/all-nightly-legs.tsv)
+              TOTAL=$(printf '%s\n' "$MATCHING" | grep -c . || true)
+              FAILS=$(printf '%s\n' "$MATCHING" | awk -F'\t' '$2=="failure"||$2=="cancelled"{print $1}')
+              FAIL_COUNT=$(printf '%s\n' "$FAILS" | grep -c . || true)
+              if [ "$FAIL_COUNT" -gt 0 ]; then
+                NAMES=$(printf '%s\n' "$FAILS" | sed -E 's/ *\([^()]*\)$//' | sort -u | join_semi)
+                echo "- ${env}: ❌ ${FAIL_COUNT} scenario(s) red (${NAMES})"
+              else
+                echo "- ${env}: ✅ all green (${TOTAL} legs)"
+              fi
+            done <<< "$ENV_LIST"
+            META_FAILS=$(awk -F'\t' '$3=="META" && ($2=="failure"||$2=="cancelled"){print $1}' /tmp/all-nightly-legs.tsv)
+            if [ -n "$META_FAILS" ]; then
+              META_NAMES=$(printf '%s\n' "$META_FAILS" | sort -u | join_semi)
+              echo "- process-level (non-env): ❌ ${META_NAMES}"
+            fi
             echo ""
             echo "## Aggregate results"
             echo ""
@@ -2162,7 +2429,6 @@ jobs:
             echo "| S1 direct shard (4 legs) | $(emoji "$NIGHTLY_S1_DIRECT") |"
             echo "| S2 fresh (pool + direct) | $(emoji "$NIGHTLY_S2") |"
             echo "| S3 owned-elsewhere | $(emoji "$VERIFY_S3") |"
-            echo "| S4 gh-pages mirror | $(emoji "$VERIFY_S4") |"
             echo "| S5 commit-reveal race + retry | $(emoji "$NIGHTLY_S5") |"
             echo "| S6 RPC failover | $(emoji "$NIGHTLY_S6") |"
             echo "| S7 SIGINT crash-capture | $(emoji "$NIGHTLY_S7") |"
@@ -2195,26 +2461,39 @@ jobs:
               echo "| $name | $(emoji "$conclusion") |"
             done < /tmp/s2-legs.tsv
             echo ""
-            # Per-env breakdown: extract env ids from job names (suffix in parentheses)
-            # and group failing/cancelled legs by env so readers can tell which env hit.
-            FAIL_LEGS=$(grep -E $'\tfailure$|\tcancelled$' /tmp/all-nightly-legs.tsv || true)
+            # Per-env breakdown: group failing/cancelled legs so readers can
+            # tell which env hit. Reads the same env_tag column the header
+            # above does, so a leg's env label can't disagree between the
+            # two sections.
+            FAIL_LEGS=$(awk -F'\t' '$2=="failure"||$2=="cancelled"' /tmp/all-nightly-legs.tsv || true)
             if [ -n "$FAIL_LEGS" ]; then
               echo "## Failing legs by env"
               echo ""
               echo "| Leg | Result |"
               echo "|-----|--------|"
-              while IFS=$'\t' read -r name conclusion; do
-                # Annotate legs without env suffix (S-INC, PR-coverage run on selected_env only)
-                case "$name" in
-                  *paseo-next-v2*|*preview*|*"telemetry assertions"*|*"pool selection"*|*"code-path"*|*"E2E Report"*)
-                    ;;  # already has env info or is a meta-job
-                  *)
-                    name="$name (on ${SELECTED_ENV})"
-                    ;;
-                esac
-                echo "| $name | $(emoji "$conclusion") |"
+              while IFS=$'\t' read -r name conclusion env_tag; do
+                # Annotate legs whose name doesn't already show an env (the
+                # env-fixed scenarios — S-INC, PR-coverage); META and
+                # already-tagged names are left as-is.
+                display_name="$name"
+                if [ "$env_tag" != "META" ] && [[ "$name" != *"($env_tag)" ]]; then
+                  display_name="$name (on ${env_tag})"
+                fi
+                echo "| $display_name | $(emoji "$conclusion") |"
               done <<< "$FAIL_LEGS"
               echo ""
+              # One-line failure signature per failing leg (issue #1055),
+              # looked up by the raw (un-annotated) job name so it matches
+              # what the Fetch step keyed /tmp/fail-signatures.tsv on.
+              if [ -f /tmp/fail-signatures.tsv ] && [ -s /tmp/fail-signatures.tsv ]; then
+                echo "### Failure signatures"
+                echo ""
+                while IFS=$'\t' read -r name conclusion env_tag; do
+                  SIG=$(awk -F'\t' -v n="$name" '$1==n{print $2; exit}' /tmp/fail-signatures.tsv)
+                  [ -n "$SIG" ] && echo "- **$name**: $SIG"
+                done <<< "$FAIL_LEGS"
+                echo ""
+              fi
             fi
             echo "**Sentry:** [E2E Health dashboard](https://paritytech.sentry.io/dashboard/1732713/?project=4511093597405264) · [raw traces](https://paritytech.sentry.io/explore/traces/?project=4511093597405264&query=deploy.tag%3A$TAG)"
           } > /tmp/report-body.md
@@ -2230,12 +2509,11 @@ jobs:
         if: >
           (github.event_name == 'schedule' || github.event_name == 'release') &&
           (needs.build-nightly.result == 'failure'
+            || needs.ensure-e2e-authorized.result == 'failure'
             || needs.nightly-s1-pool.result == 'failure'
             || needs.nightly-s1-direct.result == 'failure'
             || needs.nightly-s2-fresh.result == 'failure'
             || needs.nightly-s3.result == 'failure'
-            || needs.nightly-s4.result == 'failure'
-            || needs.nightly-verify-s4.result == 'failure'
             || needs.nightly-s5.result == 'failure'
             || needs.nightly-s6.result == 'failure'
             || needs.nightly-s8.result == 'failure'
@@ -2251,12 +2529,11 @@ jobs:
             || needs.nightly-pr-coverage.result == 'failure'
             || needs.nightly-code-path-coverage.result == 'failure'
             || needs.build-nightly.result == 'cancelled'
+            || needs.ensure-e2e-authorized.result == 'cancelled'
             || needs.nightly-s1-pool.result == 'cancelled'
             || needs.nightly-s1-direct.result == 'cancelled'
             || needs.nightly-s2-fresh.result == 'cancelled'
             || needs.nightly-s3.result == 'cancelled'
-            || needs.nightly-s4.result == 'cancelled'
-            || needs.nightly-verify-s4.result == 'cancelled'
             || needs.nightly-s5.result == 'cancelled'
             || needs.nightly-s6.result == 'cancelled'
             || needs.nightly-s8.result == 'cancelled'
@@ -2339,11 +2616,9 @@ jobs:
 
   nightly-verify-telemetry:
     name: Nightly — telemetry assertions
-    # Run after the matrix shards whose spans we assert on. S4 is excluded:
-    # its spans share the pool domain with S1-pool and would create
-    # ambiguous double-counts. S4 correctness is covered by nightly-verify-s4
-    # (HTTP endpoint check). `if: always()` so this job runs even when a
-    # matrix shard failed — assertion failures are independent of shard results.
+    # Run after the matrix shards whose spans we assert on. `if: always()` so
+    # this job runs even when a matrix shard failed — assertion failures are
+    # independent of shard results.
     needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, nightly-s2-fresh, nightly-s3]
     if: false  # disabled in public snapshot: telemetry assertions need Parity Sentry (re-enable when a public Sentry is wired)
     runs-on: ubuntu-latest
@@ -2382,7 +2657,7 @@ jobs:
     # Looks back 24h across all nightly pool-mode deploys; runs even on shard
     # failures since the assertion is independent of any one scenario's
     # success.
-    needs: [build-nightly, nightly-s1-pool, nightly-s2-fresh, nightly-s3, nightly-s4, nightly-s5, nightly-s6, nightly-s-inc]
+    needs: [build-nightly, nightly-s1-pool, nightly-s2-fresh, nightly-s3, nightly-s5, nightly-s6, nightly-s-inc]
     if: always() && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 10
@@ -2420,11 +2695,23 @@ jobs:
 
   chain-call-encoding:
     name: Chain-call arg encoding (all extrinsics)
-    # No `if:` gate — runs on every trigger (PR / push / schedule / release / dispatch).
-    # Cheap (~seconds of read-only metadata fetch); catches arg-type bugs (e.g. a proof
-    # passed as a hex string instead of a Binary → papi "Incompatible runtime entry") and
-    # chain-side call-signature drift BEFORE the deploy matrix. The chain-free completeness
-    # guard also runs in Unit Tests (npm test); this job adds the live-chain encode check.
+    needs: detect-deps-change
+    # Runs on every trigger (PR / push / schedule / release / dispatch) EXCEPT
+    # a release-only version bump on pull_request/push (#195) — same
+    # skip-safe pattern as detect-noop-push: a skipped predecessor (every
+    # non-PR/push trigger) is treated as "run normally". Cheap (~seconds of
+    # read-only metadata fetch); catches arg-type bugs (e.g. a proof passed
+    # as a hex string instead of a Binary → papi "Incompatible runtime
+    # entry") and chain-side call-signature drift BEFORE the deploy matrix.
+    # This is also the job a dependency bump (e.g. viem, which encodes every
+    # DotNS contract call — see #190) needs most: it now runs with E2E=1
+    # whenever detect-deps-change reports a real dependency change, which a
+    # path filter used to skip entirely. The chain-free completeness guard
+    # also runs in Unit Tests (npm test); this job adds the live-chain
+    # encode check.
+    if: |
+      always() &&
+      (needs.detect-deps-change.result == 'skipped' || needs.detect-deps-change.outputs.is_version_only != 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -2434,6 +2721,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - run: npm ci
       - name: Assert every extrinsic encodes against the live chain
         run: E2E=1 node --test test/e2e-chain-calls.test.js
@@ -2459,6 +2749,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       # paritytech/dotns is a private repo — GITHUB_TOKEN can't read it. With the
       # DOTNS_REPO_READ_TOKEN PAT this is the real drift check; without it the
       # tool soft-skips (exit 0) on the fetch failure rather than false-failing.
