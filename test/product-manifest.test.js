@@ -785,14 +785,13 @@ describe("publishManifest — Bulletin endpoint resolution (#1094)", () => {
       ">> FAIL: publishManifest #1094 default-env setup: expected the icon read to fail (fixture icon is intentionally missing) — check the fixture path, not the fix",
     );
 
-    // paseo-next-v2 is both DEFAULT_ENV_ID (environments.ts) and the CLI's
-    // implicit default when --env is omitted — must resolve to its OWN
-    // endpoint (wss://paseo-bulletin-next-rpc.polkadot.io), NOT the
-    // DEFAULT_BULLETIN_RPC seed constant (a different URL — see #1094).
+    // Fork: devnet is DEFAULT_ENV_ID (environments.ts) and the CLI's implicit
+    // default when --env is omitted — must resolve to devnet's OWN Bulletin
+    // endpoints, NOT the DEFAULT_BULLETIN_RPC seed constant (see #1094).
     assert.deepStrictEqual(
       BULLETIN_ENDPOINTS,
-      ["wss://paseo-bulletin-next-rpc.polkadot.io"],
-      ">> FAIL: publishManifest #1094 default-env: omitting --env must still resolve to paseo-next-v2's OWN Bulletin endpoint, not the unrelated DEFAULT_BULLETIN_RPC seed constant",
+      ["wss://bulletin-paseo.tservices.es:8443", "wss://bullet.sik.rocks"],
+      ">> FAIL: publishManifest #1094 default-env: omitting --env must still resolve to devnet's OWN Bulletin endpoints, not the unrelated DEFAULT_BULLETIN_RPC seed constant",
     );
   });
 });
