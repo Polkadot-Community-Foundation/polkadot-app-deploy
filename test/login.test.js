@@ -58,7 +58,7 @@ describe("summarizeLogin", async () => {
 describe("formatAllocationSummary", () => {
     const granted = [{ tag: "BulletInAllowance", value: undefined }];
     const rejected = [{ tag: "StatementStoreAllowance", value: undefined }];
-    const unavailable = [{ tag: "SmartContractAllowance", value: 0 }];
+    const unavailable = [{ tag: "SmartContractAllowance", value: { tag: "Index", value: 0 } }];
 
     test("all granted → lines with ✓ prefix", () => {
         const out = formatAllocationSummary({ granted, rejected: [], unavailable: [] });

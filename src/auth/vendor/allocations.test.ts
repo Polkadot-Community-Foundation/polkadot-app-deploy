@@ -129,7 +129,7 @@ describe("summarizeOutcomes", () => {
     const resources: AllocatableResource[] = [
         { tag: "BulletInAllowance", value: undefined },
         { tag: "StatementStoreAllowance", value: undefined },
-        { tag: "SmartContractAllowance", value: 0 },
+        { tag: "SmartContractAllowance", value: { tag: "Index", value: 0 } },
     ];
 
     test("buckets outcomes by tag, mapping outcomes[i] → resources[i]", () => {

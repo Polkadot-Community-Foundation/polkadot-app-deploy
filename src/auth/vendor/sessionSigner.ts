@@ -93,7 +93,10 @@ export function createSessionSigner(
     ref: ProductAccountRef,
 ): PolkadotSigner {
     const publicKey = deriveProductPublicKey(sessionRootPublicKey(session), ref);
-    const productAccountId: [string, number] = [ref.productId, ref.derivationIndex];
+    const productAccountId: [string, { tag: "Index"; value: number }] = [
+        ref.productId,
+        { tag: "Index", value: ref.derivationIndex },
+    ];
 
     /**
      * Transaction signing via `createTransaction`.
@@ -111,8 +114,9 @@ export function createSessionSigner(
         _metadata: Uint8Array,
         _atBlockNumber: number,
     ): Promise<Uint8Array> => {
-        const genesisHash = signedExtensions["CheckGenesis"]?.additionalSigned
-            ?? new Uint8Array(32);
+        const genesisHash = toHex(
+            signedExtensions["CheckGenesis"]?.additionalSigned ?? new Uint8Array(32),
+        ) as `0x${string}`;
         const extensions = Object.entries(signedExtensions).map(([id, { value, additionalSigned }]) => ({
             id,
             extra: value,

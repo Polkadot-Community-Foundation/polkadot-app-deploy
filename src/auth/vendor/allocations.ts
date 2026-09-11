@@ -52,8 +52,9 @@ import {
  *   StatementStoreAllowance — write to the SSS (host_chat, allowance ring).
  *   BulletInAllowance       — write to Bulletin (TransactionStorage.store).
  *   SmartContractAllowance  — PGAS sponsoring for Revive contract calls.
- *                             The `value` is the derivation index of the
- *                             product account (0 for the default account).
+ *                             The `value` identifies the product account:
+ *                             `{ tag: "Index", value: n }` (0 = the default
+ *                             account) or `{ tag: "Raw", value: <pubkey> }`.
  *   AutoSigning             — surrender the product-account signing key to
  *                             the host so it can sign on the user's behalf
  *                             without per-call prompts. Not used today.
@@ -61,13 +62,13 @@ import {
  * NOTE: host-api v0.8 renamed this variant to 'BulletinAllowance', but the
  * SSO resource-allocation codec (host-papp, which this path reaches via
  * product-sdk-terminal) retains the old 'BulletInAllowance' spelling as of
- * host-papp 0.8.5 / terminal 0.3.1. Ours must match the SSO codec — the
+ * host-papp 0.9.4 / terminal 0.5.4. Ours must match the SSO codec — the
  * _SDK_COMPAT_PIN below fails the build if the SDK's spelling ever changes.
  */
 export type AllocatableResource =
     | { tag: "StatementStoreAllowance"; value: undefined }
     | { tag: "BulletInAllowance"; value: undefined }
-    | { tag: "SmartContractAllowance"; value: number }
+    | { tag: "SmartContractAllowance"; value: { tag: "Index"; value: number } | { tag: "Raw"; value: Uint8Array } }
     | { tag: "AutoSigning"; value: undefined };
 
 /**
@@ -95,7 +96,7 @@ export const DEFAULT_RESOURCES: AllocatableResource[] = [
     { tag: "BulletInAllowance", value: undefined },
     { tag: "StatementStoreAllowance", value: undefined },
     // derivation index 0 = the default product account.
-    { tag: "SmartContractAllowance", value: 0 },
+    { tag: "SmartContractAllowance", value: { tag: "Index", value: 0 } },
 ];
 
 // Compile-time pin: DEFAULT_RESOURCES must be assignable to the SDK's own
