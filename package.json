@@ -1,6 +1,6 @@
 {
   "name": "@parity/polkadot-app-deploy",
-  "version": "0.16.2",
+  "version": "0.16.3",
   "private": false,
   "repository": {
     "type": "git",
@@ -64,7 +64,7 @@
     "@noble/hashes": "^1.7.2",
     "@parity/product-sdk-address": "^0.1.1",
     "@parity/product-sdk-keys": "^0.3.8",
-    "@parity/product-sdk-terminal": "^0.5.1",
+    "@parity/product-sdk-terminal": "npm:@polkadot-community-foundation/product-sdk-terminal@^0.8.2",
     "@parity/product-sdk-tx": "^0.2.12",
     "@polkadot-api/metadata-builders": "^0.14.2",
     "@polkadot-api/substrate-bindings": "^0.20.2",
@@ -92,11 +92,6 @@
   },
   "overrides": {
     "@polkadot-api/json-rpc-provider": "^0.2.0",
-    "@novasamatech/host-api": "0.9.4",
-    "@novasamatech/host-papp": "0.9.4",
-    "@novasamatech/scale": "0.9.4",
-    "@novasamatech/statement-store": "0.9.4",
-    "@novasamatech/storage-adapter": "0.9.4",
     "nanoid": "^5.1.16",
     "postcss": {
       "nanoid": "^3.3.18"
