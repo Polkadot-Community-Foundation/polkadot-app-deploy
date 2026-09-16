@@ -119,6 +119,21 @@ export async function createSessionSigner(
     options?: ProductSubtreeOptions,
 ): Promise<PolkadotSigner> {
     const publicKey = await deriveProductPublicKey(session, ref, options);
+    return createSessionSignerFromKey(session, ref, publicKey);
+}
+
+/**
+ * Build the signer from an ALREADY-RESOLVED public key, skipping the subtree fetch.
+ *
+ * Used when the wallet did not answer `getProductSubtree` in time: the CLI sends the
+ * phone an account REFERENCE, so the phone still signs as the real product account —
+ * this key only backs local bookkeeping and the address we display.
+ */
+export function createSessionSignerFromKey(
+    session: UserSession,
+    ref: ProductAccountRef,
+    publicKey: Uint8Array,
+): PolkadotSigner {
     // host-papp wire shape: `productAccountId: [productId, DerivationIndex]`.
     const productAccountId: [string, DerivationIndex] = [
         ref.productId,
@@ -144,11 +159,26 @@ export async function createSessionSigner(
         const genesisHash = toHex(
             signedExtensions["CheckGenesis"]?.additionalSigned ?? new Uint8Array(32),
         ) as `0x${string}`;
-        const extensions = Object.entries(signedExtensions).map(([id, { value, additionalSigned }]) => ({
-            id,
-            extra: value,
-            additionalSigned,
-        }));
+        // Omit CheckNonce deliberately. We forward a product-account REFERENCE, not
+        // an address, so the phone resolves and signs as the real account -- while the
+        // nonce PAPI computed here belongs to whatever address this CLI derived. Once
+        // the real account has landed one transaction those disagree and the chain
+        // rejects every attempt as Invalid::Stale (it appears to work exactly once,
+        // when both sit at zero, which is why users blamed an interrupted run).
+        //
+        // Both hosts refill an absent nonce for the account they actually sign as:
+        // Android's RealTxPayloadExtensionsResolver leaves Routing.nonce null and
+        // determineNonceSequence fetches it; iOS's fillNonceIfNeeded does the same.
+        // Neither reconstructs positionally -- the list supplies values into an
+        // extrinsic they build from their own runtime metadata -- so dropping an
+        // entry is not a malformed payload.
+        const extensions = Object.entries(signedExtensions)
+            .filter(([id]) => id !== "CheckNonce")
+            .map(([id, { value, additionalSigned }]) => ({
+                id,
+                extra: value,
+                additionalSigned,
+            }));
         // Fast-fail for expired SSS allowance: the statement-store adapter logs
         // "submitRequest failed: NoAllowanceError" to console.error but does NOT
         // reject the createTransaction promise — it just hangs for 180s waiting

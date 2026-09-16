@@ -46,6 +46,7 @@ import {
 import type { PolkadotSigner } from "polkadot-api";
 import {
     createSessionSigner,
+    createSessionSignerFromKey,
     deriveProductPublicKey,
     sessionRootPublicKey,
     type ProductSubtreeOptions,
@@ -80,6 +81,14 @@ export interface SessionAddresses {
     rootAddress: string;
     productAddress: string;
     productH160: `0x${string}`;
+    /**
+     * False when the wallet did not return the product subtree key, so
+     * `productAddress`/`productH160` are a WALLET-ROOT stand-in rather than the
+     * product account. Callers MUST NOT present them as the product account in
+     * that case -- an address nobody can sign for is worse than no address,
+     * because someone will fund it.
+     */
+    productResolved: boolean;
 }
 
 export type ConnectResult =
@@ -176,21 +185,71 @@ export function createAuthClient(config: AuthConfig): AuthClient {
     }
 
     /**
+     * Bound on the RFC-0022 subtree fetch.
+     *
+     * `getProductSubtree` is consent-free but needs the wallet to ANSWER, and no
+     * currently released phone build does (paritytech/polkadot-android-community#123,
+     * reproduced on iOS build 13). Unbounded, that turns sign-in into an indefinite
+     * wait at "Paired — finishing sign-in…" AFTER pairing has already succeeded.
+     * Bound it, and degrade instead of hanging.
+     */
+    const SUBTREE_TIMEOUT_MS = 25_000;
+
+    /**
+     * Resolve the product-account public key, or fall back to the wallet root when
+     * the phone does not answer in time.
+     *
+     * The fallback key is NOT the product account -- it cannot be, because
+     * `//product//{productId}` is hard-derived and unreachable from a public key.
+     * It exists so a session still completes and deploys can proceed: the CLI sends
+     * the phone an account REFERENCE, so the phone signs as the real product account
+     * regardless of what we hold locally. What degrades is the address we can SHOW.
+     */
+    async function productPublicKeyOrRoot(session: UserSession): Promise<{ key: Uint8Array; resolved: boolean }> {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            const key = await Promise.race([
+                deriveProductPublicKey(session, ref, subtreeOptions),
+                new Promise<never>((_, reject) => {
+                    timer = setTimeout(() => reject(new Error("subtree-timeout")), SUBTREE_TIMEOUT_MS);
+                }),
+            ]);
+            return { key, resolved: true };
+        } catch {
+            console.error(
+                `\n   Your wallet did not return the product account key within ${Math.round(SUBTREE_TIMEOUT_MS / 1000)}s.\n` +
+                "   Signing still works — the phone resolves the account itself — but the\n" +
+                "   product account address cannot be shown, and must not be funded.\n",
+            );
+            return { key: sessionRootPublicKey(session), resolved: false };
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    }
+
+    /**
      * Compute the three display addresses from a paired session. Shares
      * `deriveProductPublicKey` with `createSessionSigner` so the signing key and
      * the display SS58/H160 are computed by exactly one function.
      */
     async function deriveSessionAddresses(session: UserSession): Promise<SessionAddresses> {
         const rootBytes = sessionRootPublicKey(session);
-        const productPubkey = await deriveProductPublicKey(session, ref, subtreeOptions);
+        const { key: productPubkey, resolved } = await productPublicKeyOrRoot(session);
         return {
             rootAddress: ss58Encode(rootBytes),
             productAddress: ss58Encode(productPubkey),
             productH160: deriveH160(productPubkey),
+            productResolved: resolved,
         };
     }
 
     async function createSigner(session: UserSession): Promise<PolkadotSigner> {
+        // Warm/bound the same fetch first so a silent wallet cannot wedge sign-in
+        // inside createSessionSigner, which has no timeout of its own.
+        const { resolved } = await productPublicKeyOrRoot(session);
+        if (!resolved) {
+            return createSessionSignerFromKey(session, ref, sessionRootPublicKey(session));
+        }
         return createSessionSigner(session, ref, subtreeOptions);
     }
 
