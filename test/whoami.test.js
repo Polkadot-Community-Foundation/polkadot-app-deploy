@@ -23,16 +23,37 @@ describe("formatWhoami", () => {
         assert.match(out, /login/i, ">> FAIL: whoami: null should mention login command");
     });
 
-    test("addresses → shows product address", () => {
+    test("resolved addresses → shows product address", () => {
         const addresses = {
             rootAddress: "5RootXXX",
             productAddress: "5ProdXXX",
             productH160: "0xdeadbeef",
+            productResolved: true,
         };
         const out = formatWhoami(addresses);
         assert.ok(out.includes("5ProdXXX"), ">> FAIL: whoami: addresses should include product address");
         assert.ok(out.includes("5RootXXX"), ">> FAIL: whoami: addresses should include root address");
         assert.ok(out.includes("0xdeadbeef"), ">> FAIL: whoami: addresses should include H160 address");
+    });
+
+    test("unresolved → never prints the wallet-root stand-in as the product account", () => {
+        // productAddress/productH160 carry the ROOT stand-in when the wallet did not
+        // answer getProductSubtree. Printing either as the product account invites
+        // someone to fund an address no host will ever sign for.
+        const addresses = {
+            rootAddress: "5RootXXX",
+            productAddress: "5RootXXX",
+            productH160: "0xrootstandin",
+            productResolved: false,
+        };
+        const out = formatWhoami(addresses);
+        assert.match(out, /unresolved/i, ">> FAIL: whoami: unresolved product account must say so");
+        assert.ok(!out.includes("0xrootstandin"), ">> FAIL: whoami: must not print the H160 stand-in");
+        assert.ok(out.includes("5RootXXX"), ">> FAIL: whoami: root address is still shown, labelled as root");
+        assert.ok(
+            !/Product address:\s+5RootXXX/.test(out),
+            ">> FAIL: whoami: must not label the root as the product address",
+        );
     });
 });
 

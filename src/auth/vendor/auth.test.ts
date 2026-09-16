@@ -62,6 +62,16 @@ describe("createAuthClient", () => {
 // Default: returns []. Tests that need a real session set it before calling.
 let _waitForSessionsImpl: () => Promise<unknown[]> = async () => [];
 
+// RFC-0022: the product-subtree key crosses two hard junctions, so the real
+// helper asks the wallet and caches the answer under `~/.polkadot-apps`.
+// Stubbing it here keeps these tests off the network AND off the real home dir.
+// Records the refs it was asked for so a test can assert the derivation input.
+const _derivedFor: Array<{ productId: string; derivationIndex: number }> = [];
+const _fakeProductKey = new Uint8Array(Buffer.from(
+    "8eaf04151687736326c9fea17e25fc5287613693c912909cb226aa4794f26a48",
+    "hex",
+));
+
 vi.mock("@parity/product-sdk-terminal", async (importOriginal) => {
     const original = await importOriginal<typeof import("@parity/product-sdk-terminal")>();
     return {
@@ -85,12 +95,20 @@ vi.mock("@parity/product-sdk-terminal", async (importOriginal) => {
         },
         waitForSessions: (..._args: unknown[]) => _waitForSessionsImpl(),
         renderQrCode: original.renderQrCode,
+        deriveProductPublicKey: async (
+            _session: unknown,
+            ref: { productId: string; derivationIndex: number },
+        ) => {
+            _derivedFor.push({ ...ref });
+            return _fakeProductKey;
+        },
     };
 });
 
 describe("waitForLogin returns SessionHandle on the live pairing adapter", () => {
     beforeEach(() => {
         _capturedAdapterOptions = undefined;
+        _derivedFor.length = 0;
         // Reset to default (no sessions).
         _waitForSessionsImpl = async () => [];
     });
@@ -142,6 +160,28 @@ describe("waitForLogin returns SessionHandle on the live pairing adapter", () =>
         expect(handle, ">> FAIL: waitForLogin must return a usable SessionHandle on the live pairing adapter (no fresh-adapter re-read race)").not.toBe(null);
         if (!handle) return; // type narrowing
         expect(typeof handle.address, ">> FAIL: handle.address must be a string").toBe("string");
+        // RFC-0022: the address must be the product account derived from the
+        // wallet-supplied subtree key, not the session root account.
+        const { ss58Encode } = await import("@parity/product-sdk-address");
+        expect(handle.address, ">> FAIL: handle.address must be the derived product account").toBe(
+            ss58Encode(_fakeProductKey),
+        );
+        expect(handle.address, ">> FAIL: handle.address must NOT be the root account").not.toBe(
+            ss58Encode(alicePubkey),
+        );
+        // buildSessionHandle derives twice — once for the signer, once for the
+        // display addresses. In production the terminal helper memoizes per
+        // (cache file, session, productId), so that is one wallet round trip;
+        // this stub has no memo, hence "every" rather than an exact count.
+        expect(_derivedFor.length, ">> FAIL: derivation must run at least once").toBeGreaterThan(0);
+        expect(
+            _derivedFor.every(
+                (r) =>
+                    r.productId === config.productId &&
+                    r.derivationIndex === config.derivationIndex,
+            ),
+            ">> FAIL: every derivation must use the configured product ref",
+        ).toBe(true);
         expect(handle.userSession, ">> FAIL: handle.userSession must be the paired session (not null)").toBe(fakeSession);
         expect(handle.adapter, ">> FAIL: handle.adapter must be adapter-A (the live pairing adapter, not a fresh one)").toBe(adapterA);
         expect(typeof handle.destroy, ">> FAIL: handle.destroy must be callable").toBe("function");
