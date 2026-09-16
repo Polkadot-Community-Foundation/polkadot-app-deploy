@@ -1946,12 +1946,33 @@ describe("createSessionSigner (vendored)", () => {
     return seedToAccount(DEV_PHRASE, "").publicKey;
   }
 
+  // RFC-0022: the product account hangs off `//product//{productId}`, whose two
+  // leading junctions are HARD — the subtree public key can only come from the
+  // wallet, so the stub has to answer getProductSubtree.
+  async function getSubtreePublicKey(productId) {
+    const { seedToAccount } = await import("@parity/product-sdk-keys");
+    return seedToAccount(DEV_PHRASE, `//product//${productId}`).publicKey;
+  }
+
+  // Isolated subtree-cache dir so these tests never write to ~/.polkadot-apps.
+  async function freshSubtreeOptions() {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    return { appId: "pad-test", storageDir: mkdtempSync(join(tmpdir(), "pad-subtree-")) };
+  }
+
   async function makeStubSession(opts = {}) {
     const rootAccountId = await getRootPublicKey();
-    const captured = { signRaw: [], signPayload: [] };
+    const captured = { signRaw: [], signPayload: [], subtree: [] };
     return {
+      id: "stub-session",
       rootAccountId,
       remoteAccount: { accountId: rootAccountId },
+      getProductSubtree: async (productId) => {
+        captured.subtree.push(productId);
+        return { isErr: () => false, value: await getSubtreePublicKey(productId) };
+      },
       signRaw: async (req) => {
         captured.signRaw.push(req);
         return opts.signRawResult ?? { isErr: () => false, value: { signature: new Uint8Array(64) } };
@@ -1977,7 +1998,11 @@ describe("createSessionSigner (vendored)", () => {
     // The signBytes test below verifies the tag pattern on the sibling callback.
     const { createSessionSigner } = await import("../dist/auth/vendor/index.js");
     const session = await makeStubSession();
-    const signer = createSessionSigner(session, { productId: "test", derivationIndex: 0 });
+    const signer = await createSessionSigner(
+      session,
+      { productId: "test", derivationIndex: 0 },
+      await freshSubtreeOptions(),
+    );
 
     try {
       await signer.signTx(new Uint8Array(300), {}, new Uint8Array(0), 0);
@@ -1989,7 +2014,11 @@ describe("createSessionSigner (vendored)", () => {
   test("signBytes routes through signRaw with Bytes tag", async () => {
     const { createSessionSigner } = await import("../dist/auth/vendor/index.js");
     const session = await makeStubSession();
-    const signer = createSessionSigner(session, { productId: "test", derivationIndex: 0 });
+    const signer = await createSessionSigner(
+      session,
+      { productId: "test", derivationIndex: 0 },
+      await freshSubtreeOptions(),
+    );
 
     try {
       await signer.signBytes(new Uint8Array([1, 2, 3]));
@@ -2006,7 +2035,11 @@ describe("createSessionSigner (vendored)", () => {
     const session = await makeStubSession({
       signRawResult: { isErr: () => true, error: { message: "user declined" } },
     });
-    const signer = createSessionSigner(session, { productId: "test", derivationIndex: 0 });
+    const signer = await createSessionSigner(
+      session,
+      { productId: "test", derivationIndex: 0 },
+      await freshSubtreeOptions(),
+    );
 
     await assert.rejects(
       () => signer.signBytes(new Uint8Array([1])),

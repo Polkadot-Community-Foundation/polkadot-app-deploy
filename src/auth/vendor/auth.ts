@@ -44,7 +44,12 @@ import {
     type UserSession,
 } from "@parity/product-sdk-terminal";
 import type { PolkadotSigner } from "polkadot-api";
-import { createSessionSigner, deriveProductPublicKey, sessionRootPublicKey } from "./sessionSigner.js";
+import {
+    createSessionSigner,
+    deriveProductPublicKey,
+    sessionRootPublicKey,
+    type ProductSubtreeOptions,
+} from "./sessionSigner.js";
 import {
     requestResourceAllocation,
     DEFAULT_RESOURCES,
@@ -64,9 +69,10 @@ const QR_TIMEOUT_MS = 60_000;
  *   the mobile app sent over the SSO handshake (bare-mnemonic sr25519 root on
  *   current mobile builds). Keyed by `Resources.Consumers` on the People
  *   parachain, so it's the right input for `lookupUsername`.
- * - `productAddress` — SS58 of the product account derived via
- *   `product/{productId}/{index}` from `rootAccountId`. This is what actually
- *   signs on-chain transactions from the CLI.
+ * - `productAddress` — SS58 of the RFC-0022 product account at
+ *   `//product//{productId}/{index}`. This is what actually signs on-chain
+ *   transactions from the CLI. It is NOT reachable from `rootAccountId`: the
+ *   two leading junctions are hard, so the subtree key comes from the wallet.
  * - `productH160` — the same product pubkey as a 20-byte EVM address (Revive /
  *   contracts view). Derived from the SAME pubkey as `productAddress`.
  */
@@ -145,6 +151,16 @@ export interface AuthClient {
  */
 export function createAuthClient(config: AuthConfig): AuthClient {
     const ref = { productId: config.productId, derivationIndex: config.derivationIndex };
+    /**
+     * Scopes the RFC-0022 product-subtree disk cache
+     * (`~/.polkadot-apps/{appId}_ProductSubtrees.json`).
+     *
+     * Pinned to `dappId` rather than letting it default to `productId` so the
+     * file lands under the same `${dappId}_` prefix that `clearLocalAppStorage`
+     * sweeps — logout therefore drops the cached subtree key along with the
+     * session, instead of leaving a stale key behind for the next pairing.
+     */
+    const subtreeOptions: ProductSubtreeOptions = { appId: config.dappId };
 
     function createAdapter(): TerminalAdapter {
         return createTerminalAdapter({
@@ -164,9 +180,9 @@ export function createAuthClient(config: AuthConfig): AuthClient {
      * `deriveProductPublicKey` with `createSessionSigner` so the signing key and
      * the display SS58/H160 are computed by exactly one function.
      */
-    function deriveSessionAddresses(session: UserSession): SessionAddresses {
+    async function deriveSessionAddresses(session: UserSession): Promise<SessionAddresses> {
         const rootBytes = sessionRootPublicKey(session);
-        const productPubkey = deriveProductPublicKey(rootBytes, ref);
+        const productPubkey = await deriveProductPublicKey(session, ref, subtreeOptions);
         return {
             rootAddress: ss58Encode(rootBytes),
             productAddress: ss58Encode(productPubkey),
@@ -174,8 +190,8 @@ export function createAuthClient(config: AuthConfig): AuthClient {
         };
     }
 
-    function createSigner(session: UserSession): PolkadotSigner {
-        return createSessionSigner(session, ref);
+    async function createSigner(session: UserSession): Promise<PolkadotSigner> {
+        return createSessionSigner(session, ref, subtreeOptions);
     }
 
     function sessionRemoteAddress(session: UserSession): string | null {
@@ -184,9 +200,9 @@ export function createAuthClient(config: AuthConfig): AuthClient {
         return accountId.length === 32 ? ss58Encode(accountId) : null;
     }
 
-    function sessionLogoutAddress(session: UserSession): string {
+    async function sessionLogoutAddress(session: UserSession): Promise<string> {
         try {
-            return deriveSessionAddresses(session).productAddress;
+            return (await deriveSessionAddresses(session)).productAddress;
         } catch {
             return sessionRemoteAddress(session) ?? "(stored session)";
         }
@@ -203,7 +219,7 @@ export function createAuthClient(config: AuthConfig): AuthClient {
 
         const sessions = await waitForSessions(adapter);
         if (sessions.length > 0) {
-            const addresses = deriveSessionAddresses(sessions[0]);
+            const addresses = await deriveSessionAddresses(sessions[0]);
             // Destroy adapter-A: the kind:"existing" path doesn't need it after
             // address derivation (getSessionSigner creates a fresh adapter-B for
             // the actual signing session). Without this the WS keeps the event loop
@@ -300,7 +316,7 @@ export function createAuthClient(config: AuthConfig): AuthClient {
                 if (sessions.length > 0) {
                     // Build the handle on adapter-A (the live pairing adapter) so the
                     // caller can request allowances without a second adapter or disk-read race.
-                    handle = buildSessionHandle(adapter, sessions[0]);
+                    handle = await buildSessionHandle(adapter, sessions[0]);
                     const { address, addresses } = handle;
                     onStatus({ step: "success", address, addresses });
                 } else {
@@ -326,9 +342,12 @@ export function createAuthClient(config: AuthConfig): AuthClient {
      * The handle's destroy() is idempotent and swallows the DestroyedError /
      * "Not connected" teardown noise that polkadot-api emits from finalizers.
      */
-    function buildSessionHandle(adapter: TerminalAdapter, session: UserSession): SessionHandle {
-        const signer = createSigner(session);
-        const addresses = deriveSessionAddresses(session);
+    async function buildSessionHandle(
+        adapter: TerminalAdapter,
+        session: UserSession,
+    ): Promise<SessionHandle> {
+        const signer = await createSigner(session);
+        const addresses = await deriveSessionAddresses(session);
 
         let destroyed = false;
         const destroy = () => {
@@ -401,7 +420,7 @@ export function createAuthClient(config: AuthConfig): AuthClient {
             return null;
         }
         const session = sessions[0];
-        const address = sessionLogoutAddress(session);
+        const address = await sessionLogoutAddress(session);
         return { adapter, address, session };
     }
 

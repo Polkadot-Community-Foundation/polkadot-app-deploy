@@ -38,14 +38,27 @@
  * complete signed transaction directly. This is the same path that
  * `@parity/product-sdk-signer` pins via `PRODUCT_SIGNER_TYPE = "createTransaction"`.
  *
- * Replace this whole file with a `product-sdk-terminal` re-export once that
- * package's signer ships `createTransaction` support natively.
+ * **Why this file still exists after RFC-0022.**
+ *
+ * `product-sdk-terminal` now ships its own `createSessionSignerForAccount`, and
+ * the derivation math below is delegated to it wholesale (see
+ * `deriveProductPublicKey`). What terminal's signer does NOT carry is the
+ * fast-fail for an expired statement-store allowance and the teardown-noise
+ * suppression around `console.error` — both of which turn a silent 180 s hang
+ * into an actionable message. Those live here, wrapped around terminal's
+ * public key. Drop this file once terminal's signer grows the same behaviour.
  */
 
 import { toHex } from "polkadot-api/utils";
-import type { UserSession } from "@parity/product-sdk-terminal";
+import {
+    deriveProductPublicKey as terminalDeriveProductPublicKey,
+    sessionRootPublicKey as terminalSessionRootPublicKey,
+    INCOMPLETE_SESSION_MESSAGE as TERMINAL_INCOMPLETE_SESSION_MESSAGE,
+    type ProductSubtreeOptions,
+    type UserSession,
+} from "@parity/product-sdk-terminal";
+import type { DerivationIndex } from "@parity/product-sdk-utils";
 import type { PolkadotSigner } from "polkadot-api";
-import { deriveProductAccountPublicKey } from "@parity/product-sdk-keys";
 import { NonRetryableError } from "../../errors.js";
 import { CLI_NAME } from "../../cli-name.js";
 
@@ -54,46 +67,60 @@ export interface ProductAccountRef {
     derivationIndex: number;
 }
 
-export const INCOMPLETE_SESSION_MESSAGE =
-    'Stored login session is missing the root account public key. Run "logout" and then "login" to pair again.';
+export type { ProductSubtreeOptions };
 
+export const INCOMPLETE_SESSION_MESSAGE = TERMINAL_INCOMPLETE_SESSION_MESSAGE;
+
+/**
+ * The wallet's own root account public key.
+ *
+ * This is the SSO handshake's `rootAccountId`, used for the `rootAddress`
+ * display line and for `lookupUsername` on the People parachain. It is NOT the
+ * parent of a product account — see `deriveProductPublicKey`.
+ */
 export function sessionRootPublicKey(session: UserSession): Uint8Array {
-    const rootAccountId = (session as { rootAccountId?: Uint8Array }).rootAccountId;
-    const publicKey = rootAccountId ? new Uint8Array(rootAccountId) : new Uint8Array();
-    if (publicKey.length !== 32) {
-        throw new Error(INCOMPLETE_SESSION_MESSAGE);
-    }
-    return publicKey;
+    return terminalSessionRootPublicKey(session);
 }
 
 /**
- * Soft-derive the product account public key off a wallet root.
+ * The product account's sr25519 public key for `ref`.
  *
- * This is the single source of truth for product-account math. Both
- * `createSessionSigner` (which builds the signer used to actually sign
- * on-chain) and `deriveSessionAddresses` (which builds the display triple)
- * go through here so a future change to derivation params can't silently
- * desync the signer from what we print.
+ * **RFC-0022.** A product account sits at `//product//{productId}/{index}`. The
+ * first two junctions are HARD, which is the security boundary — and also why
+ * this cannot be computed from `session.rootAccountId` alone: sr25519 soft
+ * derivation is composable on public keys, hard derivation is not. The subtree
+ * public key of `//product//{productId}` has to come from the Account Holder,
+ * which `product-sdk-terminal` fetches via `session.getProductSubtree` and
+ * caches on disk (`{appId}_ProductSubtrees.json`), so only the first
+ * derivation per product+session needs the phone reachable.
  *
- * sr25519 soft derivation is composable on public keys alone, so deriving
- * from `rootAccountId` locally produces the SAME public key the mobile
- * derives privately via `mnemonic + "/product/...{idx}"`. Algorithm parity
- * with mobile/desktop is locked by the frozen vectors in
- * `@parity/product-sdk-keys`'s `product-account.test.ts`.
+ * Delegating to terminal (rather than reimplementing the two-step
+ * fetch-then-soft-derive here) is deliberate: it keeps one implementation of
+ * the derivation, and the disk cache is shared with terminal's own signer.
+ *
+ * This is still the single source of truth for pad's product-account math —
+ * both `createSessionSigner` (which signs) and `deriveSessionAddresses` (which
+ * displays) go through it, so the printed address cannot desync from the key
+ * that signs.
+ *
+ * @throws when the wallet is unreachable on a cold cache.
  */
-export function deriveProductPublicKey(
-    rootAccountId: Uint8Array,
-    ref: ProductAccountRef,
-): Uint8Array {
-    return deriveProductAccountPublicKey(rootAccountId, ref.productId, ref.derivationIndex);
-}
-
-export function createSessionSigner(
+export async function deriveProductPublicKey(
     session: UserSession,
     ref: ProductAccountRef,
-): PolkadotSigner {
-    const publicKey = deriveProductPublicKey(sessionRootPublicKey(session), ref);
-    const productAccountId: [string, { tag: "Index"; value: number }] = [
+    options?: ProductSubtreeOptions,
+): Promise<Uint8Array> {
+    return terminalDeriveProductPublicKey(session, ref, options);
+}
+
+export async function createSessionSigner(
+    session: UserSession,
+    ref: ProductAccountRef,
+    options?: ProductSubtreeOptions,
+): Promise<PolkadotSigner> {
+    const publicKey = await deriveProductPublicKey(session, ref, options);
+    // host-papp wire shape: `productAccountId: [productId, DerivationIndex]`.
+    const productAccountId: [string, DerivationIndex] = [
         ref.productId,
         { tag: "Index", value: ref.derivationIndex },
     ];

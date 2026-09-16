@@ -4,7 +4,7 @@
  * Identity is unified under one id: DOT_DAPP_ID === DOT_PRODUCT_ID === DOT_HOST_NAME
  * === "polkadot-app-deploy". The wallet pairs, funds PGAS, and keys all allowances
  * (Bulletin / statement-store / smart-contract) under this single id, and the product
- * account the deploy signer derives from (`product/{id}/{index}`) lives there too —
+ * account the deploy signer derives from (`//product//{id}/{index}`) lives there too —
  * so one identity covers pairing, allowances, and the signing/owning account.
  */
 
@@ -21,7 +21,7 @@ import { CLI_NAME } from "./cli-name.js";
  *  and the wallet pairing product. Aligned to the app's dedicated id "polkadot-app-deploy". */
 export const DOT_DAPP_ID = "polkadot-app-deploy";
 
-/** Product id used for product-account derivation (`/product/{productId}/{index}`).
+/** Product id used for product-account derivation (`//product//{productId}/{index}`).
  *  UNIFIED with DOT_DAPP_ID (#885): the wallet funds PGAS to product/{appId}/{index},
  *  so deriving the signer/owner under the same id lands the account where PGAS sits —
  *  one account is owner + AH signer + PGAS-funded. Requires a fresh re-pairing so the

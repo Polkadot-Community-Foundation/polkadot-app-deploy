@@ -39,7 +39,7 @@ export {
     sessionRootPublicKey,
     INCOMPLETE_SESSION_MESSAGE,
 } from "./sessionSigner.js";
-export type { ProductAccountRef } from "./sessionSigner.js";
+export type { ProductAccountRef, ProductSubtreeOptions } from "./sessionSigner.js";
 
 export { resolveSigner, SignerNotAvailableError, parseDevAccountName } from "./signer.js";
 export type { ResolvedSigner, SignerSource, SignerOptions } from "./signer.js";
