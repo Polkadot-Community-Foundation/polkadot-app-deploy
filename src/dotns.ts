@@ -935,8 +935,14 @@ const PERSONHOOD_ABI = [
   },
 ] as const;
 
-const DOTNS_REGISTRY_ABI = [
+// DotNS v0.7.0 added `persist` to SubnodeRecord; older registries take the
+// 4-field tuple below. subnodeOwnerCall() picks the shape per registry.
+const DOTNS_REGISTRY_SUBNODE_LEGACY_ABI = [
   { inputs: [{ name: "record", type: "tuple", components: [{ name: "parentNode", type: "bytes32" }, { name: "subLabel", type: "string" }, { name: "parentLabel", type: "string" }, { name: "owner", type: "address" }] }], name: "setSubnodeOwner", outputs: [{ name: "subnode", type: "bytes32" }], stateMutability: "nonpayable", type: "function" },
+] as const;
+
+const DOTNS_REGISTRY_ABI = [
+  { inputs: [{ name: "record", type: "tuple", components: [{ name: "parentNode", type: "bytes32" }, { name: "subLabel", type: "string" }, { name: "parentLabel", type: "string" }, { name: "owner", type: "address" }, { name: "persist", type: "bool" }] }], name: "setSubnodeOwner", outputs: [{ name: "subnode", type: "bytes32" }], stateMutability: "nonpayable", type: "function" },
   { inputs: [{ name: "node", type: "bytes32" }, { name: "newResolver", type: "address" }], name: "setResolver", outputs: [], stateMutability: "nonpayable", type: "function" },
   { inputs: [{ name: "node", type: "bytes32" }], name: "owner", outputs: [{ name: "", type: "address" }], stateMutability: "view", type: "function" },
   { inputs: [{ name: "node", type: "bytes32" }], name: "resolver", outputs: [{ name: "", type: "address" }], stateMutability: "view", type: "function" },
@@ -2368,6 +2374,7 @@ export class DotNS {
   // than the silent-fallback hazard it would otherwise be — do not "simplify"
   // this into a throw-if-unset without re-checking both of those.
   private _protocolVersion: DotnsProtocolVersion = "v1";
+  private _subnodePersist: boolean | null = null;
   private _adapter: DotnsProtocolAdapter = getAdapter("v1");
   private _onPhoneSigningRequired: ((label: string) => void) | undefined = undefined;
   private _confirmPhoneReady: ((ctx: { label: string; attempt: number; total: number; approvalBudgetMs: number; reason?: "resign" | "silence" }) => Promise<void>) | undefined = undefined;
@@ -3324,10 +3331,10 @@ export class DotNS {
     // moves to a third party the signer is no longer the subnode owner, so a
     // trailing setResolver would revert. The recipient sets the resolver/content
     // on their next deploy.
-    const subnodeRecord = { parentNode, subLabel: sublabel, parentLabel, owner: toH160 };
+    const subnodeCall = await this.subnodeOwnerCall({ parentNode, subLabel: sublabel, parentLabel, owner: toH160 });
     const txRes = await this.contractTransaction(
-      this._contracts.DOTNS_REGISTRY, 0n, DOTNS_REGISTRY_ABI, "setSubnodeOwner",
-      [subnodeRecord], statusCallback,
+      this._contracts.DOTNS_REGISTRY, 0n, subnodeCall.abi, "setSubnodeOwner",
+      subnodeCall.args, statusCallback,
     );
     const after = (await withTimeout(
       this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "owner", [subnode]),
@@ -3362,6 +3369,27 @@ export class DotNS {
     }
   }
 
+  /**
+   * setSubnodeOwner call shape for this registry. A bare revert (no data) on
+   * the 5-field dry-run is the missing-selector signature of a pre-v0.7.0
+   * registry; success or a decoded error means the 5-field tuple is the
+   * registry's own. Cached per instance.
+   */
+  async subnodeOwnerCall(record: { parentNode: string; subLabel: string; parentLabel: string; owner: string }): Promise<{ abi: readonly any[]; args: any[] }> {
+    const current = { abi: DOTNS_REGISTRY_ABI, args: [{ ...record, persist: true }] };
+    if (this._subnodePersist === null) {
+      const est = await this.clientWrapper!.estimateGasForCall(
+        this.substrateAddress!,
+        this._contracts.DOTNS_REGISTRY,
+        0n,
+        encodeFunctionData({ abi: DOTNS_REGISTRY_ABI, functionName: "setSubnodeOwner", args: current.args as any }),
+      );
+      const data = typeof est.revertData === "string" ? est.revertData.trim() : "";
+      this._subnodePersist = est.success || (data !== "" && data !== "0x");
+    }
+    return this._subnodePersist ? current : { abi: DOTNS_REGISTRY_SUBNODE_LEGACY_ABI, args: [record] };
+  }
+
   async checkSubdomainOwnership(sublabel: string, parentLabel: string): Promise<OwnershipResult> {
     this.ensureConnected();
     // The CLI does not expose subdomain registry lookups. Fall back to polkadot-api
@@ -3383,7 +3411,7 @@ export class DotNS {
       console.log(`\n   Registering subdomain ${sublabel}.${parentLabel}.${this._tld}...`);
       const parentNode = namehash(`${parentLabel}.${this._tld}`);
       const subnodeNode = namehash(`${sublabel}.${parentLabel}.${this._tld}`);
-      const subnodeRecord = { parentNode, subLabel: sublabel, parentLabel, owner: this.evmAddress! };
+      const subnodeCall = await this.subnodeOwnerCall({ parentNode, subLabel: sublabel, parentLabel, owner: this.evmAddress! });
 
       // verifyEffect: mirrors setContenthash/setTextRecord. Guards the nonce-advance
       // fallback path in signAndSubmitWithRetry — without it, a sibling concurrent
@@ -3428,7 +3456,7 @@ export class DotNS {
       // flags=1 data=0x1648fd01 (caller is not the node owner).
       const txResolution = await this.submitBatchedContractCalls(
         [
-          { contractAddress: this._contracts.DOTNS_REGISTRY, abi: DOTNS_REGISTRY_ABI, functionName: "setSubnodeOwner", args: [subnodeRecord] },
+          { contractAddress: this._contracts.DOTNS_REGISTRY, abi: subnodeCall.abi, functionName: "setSubnodeOwner", args: subnodeCall.args },
           { contractAddress: this._contracts.DOTNS_REGISTRY, abi: DOTNS_REGISTRY_ABI, functionName: "setResolver", args: [subnodeNode, this._contracts.DOTNS_CONTENT_RESOLVER] },
         ],
         (s: string) => console.log(`      ${s}`),
@@ -3501,9 +3529,11 @@ export class DotNS {
       }));
     }
 
+    // +25%: a fresh subname grows storage past what the dry-run proved, and an
+    // exact limit then reverts out of proof with empty data.
     const weight_limit = {
-      proof_size: headEstimate.gasRequired.proofSize,
-      ref_time: headEstimate.gasRequired.referenceTime,
+      proof_size: (BigInt(headEstimate.gasRequired.proofSize) * 125n) / 100n,
+      ref_time: (BigInt(headEstimate.gasRequired.referenceTime) * 125n) / 100n,
     };
     // Route through the same computeStorageDepositLimit() helper
     // ReviveClientWrapper.dryRunReviveCall uses, instead of recomputing the
