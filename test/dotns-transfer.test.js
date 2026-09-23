@@ -121,6 +121,7 @@ function stubSubname({ parentOwner, evmAddress, currentSubOwner, afterOwner, txH
   d.evmAddress = evmAddress;
   d._contracts = { DOTNS_REGISTRY: "0xRegistry" };
   d._tld = tld;
+  d._subnodePersist = true;
   d.ensureConnected = () => {};
   let ownerCalls = 0;
   d.__nullableCalls = [];
@@ -220,6 +221,48 @@ test("transferSubname: node derivation — parentNode/subnode/setSubnodeOwner al
   const [subnodeRecord] = d.__txCall[4];
   assert.equal(subnodeRecord.parentNode, expectedParentNode,
     ">> FAIL: transferSubname's setSubnodeOwner call must pass the paseo-tld parentNode, not a hardcoded .dot one");
+});
+
+// DotNS v0.7.0 added `persist` to SubnodeRecord. subnodeOwnerCall dry-runs the
+// 5-field tuple once and falls back to the 4-field legacy tuple only on a bare
+// revert (the missing-selector signature).
+function stubSubnodeShape(estimate) {
+  const d = Object.create(DotNS.prototype);
+  d._subnodePersist = null;
+  d._contracts = { DOTNS_REGISTRY: "0xRegistry" };
+  d.substrateAddress = "5Signer";
+  d.__estimates = 0;
+  d.clientWrapper = { estimateGasForCall: async () => { d.__estimates += 1; return estimate; } };
+  return d;
+}
+const RECORD = { parentNode: namehash("foo.dot"), subLabel: "app", parentLabel: "foo", owner: "0x0000000000000000000000000000000000000001" };
+const tupleWidth = (abi) => abi.find((f) => f.name === "setSubnodeOwner").inputs[0].components.length;
+
+test("subnodeOwnerCall: 5-field tuple with persist when the registry accepts it", async () => {
+  const d = stubSubnodeShape({ success: true });
+  const call = await d.subnodeOwnerCall(RECORD);
+  assert.equal(tupleWidth(call.abi), 5);
+  assert.deepEqual(call.args, [{ ...RECORD, persist: true }]);
+});
+
+test("subnodeOwnerCall: a decoded revert still means the 5-field tuple is recognised", async () => {
+  const d = stubSubnodeShape({ success: false, revertData: "0x1648fd01", revertFlags: 1n });
+  const call = await d.subnodeOwnerCall(RECORD);
+  assert.equal(tupleWidth(call.abi), 5);
+});
+
+test("subnodeOwnerCall: bare revert falls back to the legacy 4-field tuple", async () => {
+  const d = stubSubnodeShape({ success: false, revertData: "0x", revertFlags: 1n });
+  const call = await d.subnodeOwnerCall(RECORD);
+  assert.equal(tupleWidth(call.abi), 4);
+  assert.deepEqual(call.args, [RECORD]);
+});
+
+test("subnodeOwnerCall: probes the registry once per instance", async () => {
+  const d = stubSubnodeShape({ success: true });
+  await d.subnodeOwnerCall(RECORD);
+  await d.subnodeOwnerCall(RECORD);
+  assert.equal(d.__estimates, 1);
 });
 
 test("feeFloorFor: adds the transfer fee to the register floor", () => {

@@ -6279,6 +6279,7 @@ describe("registerSubdomain verifyEffect", () => {
           },
         },
       },
+      estimateGasForCall: async () => ({ success: true }),
     };
     return d;
   }
@@ -6338,6 +6339,7 @@ describe("registerSubdomain verifyEffect", () => {
           },
         },
       },
+      estimateGasForCall: async () => ({ success: true }),
     };
 
     await d.registerSubdomain("mywallet", "myapp");
