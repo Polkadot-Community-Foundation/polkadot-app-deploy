@@ -1,4 +1,3 @@
-// VENDORED from @parity/product-sdk-auth — do not edit here; see src/auth/index.ts swap note.
 // Copyright (C) Parity Technologies (UK) Ltd.
 // SPDX-License-Identifier: Apache-2.0
 
@@ -14,173 +13,176 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { mkdtempSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
-import { ss58Encode } from "@parity/product-sdk-address";
-import { deriveProductAccountPublicKey, seedToAccount } from "@parity/product-sdk-keys";
-import type { UserSession } from "@parity/product-sdk-terminal";
-import { createSessionSigner } from "./sessionSigner.js";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { AllowanceExpiredError, type UserSession } from "@parity/product-sdk-terminal";
+import { seedToAccount } from "@parity/product-sdk-keys";
+import { entropyToMnemonic } from "@polkadot-labs/hdkd-helpers";
+import { SUBTREE_TIMEOUT_MS, createSessionSigner, deriveProductPublicKey } from "./sessionSigner.js";
 
-const DEV_PHRASE = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
-// Injected product id (the consumer supplies this via ProductAccountRef). Uses
-// the same value playground derives from so the product account is identical.
-const PRODUCT_ID = "playground.dot";
+const { createSessionSignerForAccountMock } = vi.hoisted(() => ({
+    createSessionSignerForAccountMock: vi.fn(),
+}));
 
-/** Each test gets its own subtree-cache dir so nothing touches `~/.polkadot-apps`. */
-function freshOptions() {
-    return { appId: "sessionSigner-test", storageDir: mkdtempSync(join(tmpdir(), "pad-subtree-")) };
+// deriveProductPublicKey stays real; the signer factory is real unless a test overrides it.
+vi.mock("@parity/product-sdk-terminal", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("@parity/product-sdk-terminal")>()),
+    createSessionSignerForAccount: createSessionSignerForAccountMock,
+}));
+
+// host-rust-core vector (product_account.rs, wasm_crypto_vectors.rs): entropy
+// 0xab x 16, product "myapp.dot", index 0.
+const VECTOR_MNEMONIC = entropyToMnemonic(new Uint8Array(16).fill(0xab));
+const VECTOR_PRODUCT = "myapp.dot";
+const VECTOR_ACCOUNT = "1c1ae478b564572f806ffa6352b4273d612beb01610b19f4e5bf444521cd5b5c";
+
+/** The `//product//{productId}` key the phone returns for ProductSubtreeRequest. */
+function phoneSubtreeKey(mnemonic: string, productId: string): Uint8Array {
+    return seedToAccount(mnemonic, `//product//${productId}`).publicKey;
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// RFC-0022 account equivalence.
-//
-// A product account lives at `//product//{productId}/{index}`. The first two
-// junctions are HARD, so no public key above them can reach it — the subtree
-// public key of `//product//{productId}` must come from the wallet, over the
-// session, via `getProductSubtree`.
-//
-// These tests are the regression guard against the pre-RFC-0022 bug where the
-// CLI soft-derived three junctions off `session.rootAccountId`, producing an
-// address that matched no host and signed for the wrong account.
-// ────────────────────────────────────────────────────────────────────────────
-describe("session signer account equivalence (RFC-0022)", () => {
-    /**
-     * Stand-in for a paired wallet. `getProductSubtree` is what the real host
-     * answers with: the public key of the hard-derived `//product//{productId}`
-     * subtree. `rootAccountId` is present but must NOT be the derivation parent.
-     */
-    function fakeSession(mnemonic: string, calls?: string[]): UserSession {
-        const root = seedToAccount(mnemonic, "");
-        const wallet = seedToAccount(mnemonic, "//SomeWallet"); // user-picked account on mobile
-        return {
-            id: "test",
-            localAccount: { accountId: new Uint8Array(32), pin: undefined },
-            remoteAccount: {
-                accountId: wallet.publicKey,
-                publicKey: wallet.publicKey,
-                pin: undefined,
-            },
-            rootAccountId: root.publicKey,
-            getProductSubtree: async (productId: string) => {
-                calls?.push(productId);
-                return {
-                    isErr: () => false,
-                    value: seedToAccount(mnemonic, `//product//${productId}`).publicKey,
-                };
-            },
-        } as unknown as UserSession;
-    }
+function fakeSession(getProductSubtree: () => Promise<unknown>): UserSession {
+    return { id: `s-${Math.random()}`, getProductSubtree } as unknown as UserSession;
+}
 
-    /** The authoritative expectation: soft-derive the index off the subtree key. */
-    function expectedProductAddress(mnemonic: string, productId: string, index: number): string {
-        const subtree = seedToAccount(mnemonic, `//product//${productId}`).publicKey;
-        return ss58Encode(deriveProductAccountPublicKey(subtree, { tag: "Index", value: index }));
-    }
+const ok = (value: Uint8Array) => ({ isErr: () => false, value });
 
-    test("signer address === subtree-derived product account", async () => {
-        const session = fakeSession(DEV_PHRASE);
+const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
 
-        const cliSigner = await createSessionSigner(
-            session,
-            { productId: PRODUCT_ID, derivationIndex: 0 },
-            freshOptions(),
-        );
-
-        expect(ss58Encode(cliSigner.publicKey)).toEqual(
-            expectedProductAddress(DEV_PHRASE, PRODUCT_ID, 0),
-        );
+describe("deriveProductPublicKey", () => {
+    let storageDir = "";
+    beforeEach(async () => {
+        storageDir = await mkdtemp(join(tmpdir(), "bd-subtree-"));
+    });
+    afterEach(async () => {
+        await rm(storageDir, { recursive: true, force: true });
     });
 
-    test("the subtree key is fetched from the wallet, not computed locally", async () => {
-        // The whole point of RFC-0022: the parent key crosses two hard junctions,
-        // so it can only come from the Account Holder. If this stops being called,
-        // the CLI is deriving from something it should not have been able to reach.
-        const calls: string[] = [];
-        const session = fakeSession(DEV_PHRASE, calls);
+    test("matches host-rust-core's RFC-0022 account for the phone's subtree key", async () => {
+        const subtree = phoneSubtreeKey(VECTOR_MNEMONIC, VECTOR_PRODUCT);
+        const session = fakeSession(async () => ok(subtree));
 
-        await createSessionSigner(
+        const key = await deriveProductPublicKey(
             session,
-            { productId: PRODUCT_ID, derivationIndex: 0 },
-            freshOptions(),
+            { productId: VECTOR_PRODUCT, derivationIndex: 0 },
+            { appId: "polkadot-app-deploy", storageDir },
         );
 
-        expect(calls).toEqual([PRODUCT_ID]);
+        expect(hex(key)).toBe(VECTOR_ACCOUNT);
     });
 
-    test("regression: signer does NOT derive from rootAccountId", async () => {
-        // Pre-fix bug: the CLI soft-derived `/product/{id}/{index}` off
-        // `session.rootAccountId`. Hard junctions make that unreachable, so the
-        // resulting address matched no host and signed for the wrong account.
-        const session = fakeSession(DEV_PHRASE);
-        const cliSigner = await createSessionSigner(
-            session,
-            { productId: PRODUCT_ID, derivationIndex: 0 },
-            freshOptions(),
-        );
-        const cliAddress = ss58Encode(cliSigner.publicKey);
-
-        const oldSoftPath = ss58Encode(
-            seedToAccount(DEV_PHRASE, `/product/${PRODUCT_ID}/0`).publicKey,
-        );
-        const rootAddress = ss58Encode(seedToAccount(DEV_PHRASE, "").publicKey);
-
-        expect(cliAddress).not.toEqual(oldSoftPath);
-        expect(cliAddress).not.toEqual(rootAddress);
+    test("gives up after SUBTREE_TIMEOUT_MS when the phone never replies", async () => {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        try {
+            const pending = deriveProductPublicKey(
+                fakeSession(() => new Promise(() => {})),
+                { productId: "polkadot-app-deploy.paseo", derivationIndex: 0 },
+                { storageDir },
+            );
+            const assertion = expect(pending).rejects.toMatchObject({
+                name: "NonRetryableError",
+                message: expect.stringContaining(`no reply within ${SUBTREE_TIMEOUT_MS / 1000}s`),
+            });
+            await vi.advanceTimersByTimeAsync(SUBTREE_TIMEOUT_MS);
+            await assertion;
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
-    test("regression: signer does NOT use remoteAccount.accountId (= wallet account)", async () => {
-        const session = fakeSession(DEV_PHRASE);
-        const cliSigner = await createSessionSigner(
-            session,
-            { productId: PRODUCT_ID, derivationIndex: 0 },
-            freshOptions(),
-        );
-        const cliAddress = ss58Encode(cliSigner.publicKey);
-        const walletAddress = ss58Encode(new Uint8Array(session.remoteAccount.accountId));
-
-        // The wallet account is what the chain would see as From — different from
-        // the funded / allowance-granted product account.
-        expect(cliAddress).not.toEqual(walletAddress);
-    });
-
-    test("a different derivation index yields a different account", async () => {
-        const session = fakeSession(DEV_PHRASE);
-        const opts = freshOptions();
-
-        const zero = await createSessionSigner(
-            session,
-            { productId: PRODUCT_ID, derivationIndex: 0 },
-            opts,
-        );
-        const one = await createSessionSigner(
-            session,
-            { productId: PRODUCT_ID, derivationIndex: 1 },
-            opts,
-        );
-
-        expect(ss58Encode(one.publicKey)).toEqual(expectedProductAddress(DEV_PHRASE, PRODUCT_ID, 1));
-        expect(ss58Encode(one.publicKey)).not.toEqual(ss58Encode(zero.publicKey));
-    });
-
-    test("surfaces a wallet-side subtree failure", async () => {
-        const session = {
-            id: "test",
-            rootAccountId: seedToAccount(DEV_PHRASE, "").publicKey,
-            getProductSubtree: async () => ({
-                isErr: () => true,
-                error: { message: "user declined" },
-            }),
-        } as unknown as UserSession;
+    test("names the product id when the phone does not answer", async () => {
+        const session = fakeSession(async () => ({
+            isErr: () => true,
+            error: { message: "getProductSubtree timed out" },
+        }));
 
         await expect(
-            createSessionSigner(
+            deriveProductPublicKey(
                 session,
-                { productId: PRODUCT_ID, derivationIndex: 0 },
-                freshOptions(),
+                { productId: "polkadot-app-deploy.paseo", derivationIndex: 0 },
+                { storageDir },
             ),
-        ).rejects.toThrow(/user declined/);
+        ).rejects.toMatchObject({
+            name: "NonRetryableError",
+            message: expect.stringContaining('"polkadot-app-deploy.paseo"'),
+        });
+    });
+});
+
+describe("createSessionSigner", () => {
+    beforeEach(async () => {
+        const actual = await vi.importActual<typeof import("@parity/product-sdk-terminal")>("@parity/product-sdk-terminal");
+        createSessionSignerForAccountMock.mockReset().mockImplementation(actual.createSessionSignerForAccount);
+    });
+
+    test("signs as the RFC-0022 product account, not the wallet's selected account", async () => {
+        const storageDir = await mkdtemp(join(tmpdir(), "bd-subtree-"));
+        try {
+            const wallet = seedToAccount(VECTOR_MNEMONIC, "//SomeWallet").publicKey;
+            const session = {
+                ...fakeSession(async () => ok(phoneSubtreeKey(VECTOR_MNEMONIC, VECTOR_PRODUCT))),
+                remoteAccount: { accountId: wallet },
+            } as unknown as UserSession;
+
+            const signer = await createSessionSigner(session, { productId: VECTOR_PRODUCT, derivationIndex: 0 }, { storageDir });
+
+            expect(hex(signer.publicKey)).toBe(VECTOR_ACCOUNT);
+            expect(hex(signer.publicKey)).not.toBe(hex(wallet));
+        } finally {
+            await rm(storageDir, { recursive: true, force: true });
+        }
+    });
+
+    test("passes the product account ref and subtree options to the SDK signer", async () => {
+        createSessionSignerForAccountMock.mockResolvedValue({
+            publicKey: new Uint8Array(32),
+            signTx: async () => new Uint8Array(),
+            signBytes: async () => new Uint8Array(),
+        });
+        const session = fakeSession(async () => ok(new Uint8Array(32)));
+        const ref = { productId: "polkadot-app-deploy.paseo", derivationIndex: 0 };
+
+        await createSessionSigner(session, ref, { appId: "polkadot-app-deploy" });
+
+        expect(createSessionSignerForAccountMock).toHaveBeenCalledWith(session, ref, { appId: "polkadot-app-deploy" });
+    });
+
+    test("an expired statement-store allowance becomes a non-retryable login hint", async () => {
+        createSessionSignerForAccountMock.mockResolvedValue({
+            publicKey: new Uint8Array(32),
+            signTx: async () => {
+                throw new AllowanceExpiredError("statementStore", new Error("NoAllowance"));
+            },
+            signBytes: async () => new Uint8Array(),
+        });
+        const signer = await createSessionSigner(
+            fakeSession(async () => ok(new Uint8Array(32))),
+            { productId: "polkadot-app-deploy.paseo", derivationIndex: 0 },
+        );
+
+        await expect(signer.signTx(new Uint8Array(), {}, new Uint8Array(), 0)).rejects.toMatchObject({
+            name: "NonRetryableError",
+            message: expect.stringContaining("allowance has expired"),
+        });
+    });
+
+    test("other signing errors pass through unchanged", async () => {
+        const rejected = new Error("user rejected on phone");
+        createSessionSignerForAccountMock.mockResolvedValue({
+            publicKey: new Uint8Array(32),
+            signTx: async () => new Uint8Array(),
+            signBytes: async () => {
+                throw rejected;
+            },
+        });
+        const signer = await createSessionSigner(
+            fakeSession(async () => ok(new Uint8Array(32))),
+            { productId: "polkadot-app-deploy.paseo", derivationIndex: 0 },
+        );
+
+        await expect(signer.signBytes(new Uint8Array())).rejects.toBe(rejected);
     });
 });
 

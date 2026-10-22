@@ -1,8 +1,10 @@
-import { test, describe } from "node:test";
+import { test, describe, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { collectUnitTestFiles } from "../scripts/run-unit-tests.mjs";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
+import { setupIsolatedHome } from "./helpers/isolated-home.js";
 // Personhood bootstrap imports (loaded after build)
-import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow } from "../dist/dotns.js";
+import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow, shortNamesClosedReason, soulboundTransferReason } from "../dist/dotns.js";
 import { getAdapter } from "../dist/dotns-protocol.js";
 import { concatBytes, compactEncode, blake2_256, encodeMembers, bytesToHex, hexToBytes } from "../dist/personhood/encoding.js";
 import { deriveMemberEntropy } from "../dist/personhood/member-key.js";
@@ -16,33 +18,52 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "node:child_process";
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError } from "../dist/deploy.js";
+import { createRequire } from "node:module";
+
+// The shared CI classifier script (.github/scripts/classify-version-bump.cjs)
+// is CommonJS by design (it's invoked standalone by both workflows via plain
+// `node`), so it's loaded here via createRequire rather than converted to
+// ESM just for this test file.
+const require = createRequire(import.meta.url);
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, readBoundedChunkNonce, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
-import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError } from "../dist/dotns.js";
+import { subnameNestingLevels } from "../dist/subname-depth.js";
+import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError, DEFAULT_TLD } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
   isTelemetryDisabled, scrubPaths, truncateAddress, sanitizeBranch,
   sanitizeRepo, setDeploySentryTag, sampleMemory, initTelemetry,
-  setDeployAttribute, __setDeployRootSpanForTest,
+  setDeployAttribute, __setDeployRootSpanForTest, markDeployFatal,
   flush, closeTelemetry, __setSentryForTest,
-  classifyErrorKind, sanitizeErrorMessage, setDeployError,
+  classifyErrorKind, ERROR_KIND_CATEGORY, sanitizeErrorMessage, setDeployError,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
-import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingTransactions, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
-import { merkleizeJS, merkleizeWithStableOrder, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
+import { derivePoolAccounts, selectAccount, isTestnetSpecName, detectTestnet, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingStoreBytes, remainingTransactions, quotaHeadroomDimensions, DEFAULT_AUTHORIZATION_NEEDS, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests, resolvePoolMnemonic, describeIgnoredPoolMnemonicEnv } from "../dist/pool.js";
+import { stuckQueueMessage } from "../dist/pool.js";
+// Mirrors of the anchor + slot parts of the two ChunkInclusionUnverifiedError messages in
+// src/deploy.ts; the source-pin test in the chunk-inclusion describe pins the anchors.
+const chunkUnverifiedMessage = (idxs, reason) =>
+  `Could not verify that chunk ${idxs} is stored on-chain: the TransactionByContentHash probe gave no answer (${reason}).`;
+const chunkNotIncludedMessage = (idxs) =>
+  `Chunk ${idxs} still absent at the best block after 3 re-upload rounds; not treating it as stored.`;
+const STUCK_ADDR = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+const STUCK_HEALTH = { verdict: "stuck", samples: [], onchain: 5, nextIndex: 42, gap: 37 };
+const STUCK_POOL_MESSAGE = stuckQueueMessage("Pool account 7", STUCK_ADDR, STUCK_HEALTH, "BULLETIN_POOL_ACCOUNT_INDEX=7 pins it: unset BULLETIN_POOL_ACCOUNT_INDEX or pick another index.");
+import { merkleizeJS, merkleizeWithStableOrder, merkleizeBackend, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
 import { hasIPFS } from "../dist/deploy.js";
-import { classifyFile, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
+import { classifyFile, classifyFileHeuristic, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
+import { Twox128 } from "@polkadot-api/substrate-bindings";
 import { probeChunks, _decodeStorageValue, _resetProbeSession, _bypassMetadataCheckForTest, classifyFinalityGap, probeFinalityGap, getBestBlockNumber } from "../dist/chunk-probe.js";
 import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "../dist/manifest-embed.js";
 import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLocalManifest, getCacheDir, SIDECAR_FILENAME, normalizeBitswapBytes, fetchManifestFromChain } from "../dist/manifest-fetch.js";
 import { computeStats, telemetryAttributes, renderSummary } from "../dist/incremental-stats.js";
-import { buildFilesMap, detectFramework, applyManifestFetchAttributes } from "../dist/deploy.js";
+import { buildFilesMap, detectFramework, applyManifestFetchAttributes, usesIncrementalCache, computePhaseACounts, formatUploadInclusionLine } from "../dist/deploy.js";
 import { buildFixture, fixtureFiles } from "./helpers/e2e-incremental-fixture.js";
-import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag } from "./e2e.test.js";
+import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag, registerOrConverge, registerOrConvergeChecked, buildBase8TwoDigitLabel, buildOneTrailingDigitLabel } from "./e2e.test.js";
 import * as nodeCrypto from "node:crypto";
 import { CarReader } from "@ipld/car/reader";
 import * as dagPb from "@ipld/dag-pb";
-import { encodeErrorResult, encodeFunctionData } from "viem";
+import { encodeErrorResult, encodeFunctionData, encodeFunctionResult } from "viem";
 import { isInternalUser, classifyErrorArea, compareSemver, assessVersion, promptYesNo, isPreReleaseVersion, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
 import { buildTitle, buildLabels, buildReportBody, setDeployContext, buildCliFlagsSummary, scrubSecrets, installLogCapture, getCapturedTail, isUserInputError } from "../dist/bug-report.js";
 import { PassThrough } from "node:stream";
@@ -68,6 +89,33 @@ import { cryptoWaitReady as ensureAuthCryptoWaitReady } from "@polkadot/util-cry
 // ---------------------------------------------------------------------------
 function jobBlock(text, jobName) {
   return getJobBlock(text, jobName);
+}
+
+// Parses a job block's `needs:` line (either bracketed list or bare single
+// job name) into an array of referenced job names. Shared so a `needs:`
+// membership assertion (order-independent — a job can sit between two
+// others) isn't reimplemented at every call site.
+function parseNeedsRefs(block, missingMessage = "job has no needs: — needs: line missing or mis-indented") {
+  const needsMatch = block.match(/^\s{4}needs:\s*(?:\[([^\]]*)\]|(\S+))\s*$/m);
+  assert.ok(needsMatch, missingMessage);
+  return (needsMatch[1] ?? needsMatch[2]).split(",").map((s) => s.trim());
+}
+
+// Pulls a single `key: |` block-scalar body (e.g. `command`, `on_retry_command`)
+// out of an arbitrary slice of workflow/action YAML treated as text, dedenting
+// it the same way getJobBlock's own step parsing does.
+function extractBlockScalar(text, key) {
+  const at = text.search(new RegExp(`^\\s*${key}: \\|\\s*$`, "m"));
+  if (at === -1) return null;
+  const lines = text.slice(at).split("\n").slice(1);
+  const indent = (lines.find((l) => l.trim() !== "") ?? "").match(/^ */)[0].length;
+  const body = [];
+  for (const line of lines) {
+    if (line.trim() === "") { body.push(""); continue; }
+    if (line.match(/^ */)[0].length < indent) break;
+    body.push(line.slice(indent));
+  }
+  return body.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +158,19 @@ const NO_FAUCET_SELFSERVE = {
 // ---------------------------------------------------------------------------
 // 1. createCID
 // ---------------------------------------------------------------------------
+// Parses the DeployErrorKind union out of src/telemetry.ts (shared by the kind guards).
+function parseDeployErrorKindUnion() {
+  const src = fs.readFileSync("src/telemetry.ts", "utf8");
+  // Strip `//` comments first: the union is interleaved with them and one
+  // carries a semicolon, which would otherwise end the slice early.
+  const union = src.slice(src.indexOf("export type DeployErrorKind =")).replace(/\/\/[^\n]*/g, "");
+  const kinds = union.slice(0, union.indexOf(";")).match(/'[^']+'/g).map((k) => k.slice(1, -1));
+  // Parse sanity: a broken slice must fail loudly rather than pass vacuously.
+  assert.ok(kinds.length >= 20, `>> FAIL: kind-union parse: only ${kinds.length} DeployErrorKind members parsed from src/telemetry.ts — the parse broke, so the guard was not checking anything`);
+  assert.ok(kinds.includes("unknown"), ">> FAIL: kind-union parse: parsed union does not include 'unknown' — wrong slice of src/telemetry.ts");
+  return kinds;
+}
+
 describe("createCID", () => {
   test("produces a valid CIDv1 for known input", () => {
     const data = new TextEncoder().encode("hello world");
@@ -310,13 +371,13 @@ describe("PopRules-derived rules relocated from validateDomainLabel to classifyR
     for (const [input, expectedDigitCount, expectedAlternative] of cases) {
       assert.strictEqual(validateDomainLabel(input), input,
         `>> FAIL: relocated-trailing-digits: "${input}": validateDomainLabel must accept this unchanged post-#1185 (PopRules rules moved to preflight)`);
-      const r = classifyRegistrability(input);
+      const r = classifyRegistrability(input, "poprules-startingPrice");
       assert.strictEqual(r.registrable, false, `>> FAIL: relocated-trailing-digits: "${input}": classifyRegistrability should flag it`);
       assert.strictEqual(r.rule, "trailing-digits",
         `>> FAIL: relocated-trailing-digits: "${input}": expected rule trailing-digits (must win over hyphen-base/reserved-base), got ${r.rule}`);
       assert.match(r.message, new RegExp(`${expectedDigitCount} trailing digit`),
         `>> FAIL: relocated-trailing-digits: "${input}": message should name the trailing-digit count, got: ${r.message}`);
-      const msg = formatUnregistrableReason({ label: input, registrability: r, existingOwner: null, selfAddress: "0xaaa" });
+      const msg = formatUnregistrableReason({ label: input, registrability: r, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
       assert.ok(msg.includes(expectedAlternative),
         `>> FAIL: relocated-trailing-digits: "${input}": message should still offer "${expectedAlternative}" as a compliant alternative, got: ${msg}`);
       assert.doesNotThrow(() => validateDomainLabel(expectedAlternative.replace(/\.dot$/, "")),
@@ -328,21 +389,21 @@ describe("PopRules-derived rules relocated from validateDomainLabel to classifyR
     for (const input of ["palacehub-33", "palace-hub-app-88", "localdot-33-pr-78"]) {
       assert.strictEqual(validateDomainLabel(input), input,
         `>> FAIL: relocated-hyphen-base: "${input}": validateDomainLabel must accept this unchanged post-#1185`);
-      const r = classifyRegistrability(input);
+      const r = classifyRegistrability(input, "poprules-startingPrice");
       assert.strictEqual(r.registrable, false, `>> FAIL: relocated-hyphen-base: "${input}": classifyRegistrability should flag it`);
       assert.strictEqual(r.rule, "hyphen-base", `>> FAIL: relocated-hyphen-base: "${input}": expected rule hyphen-base, got ${r.rule}`);
     }
   });
 
   test("hyphen-base message identifies the broken base name and offers only re-registrable alternatives", () => {
-    const r = classifyRegistrability("palacehub-33");
-    const msg = formatUnregistrableReason({ label: "palacehub-33", registrability: r, existingOwner: null, selfAddress: "0xaaa" });
+    const r = classifyRegistrability("palacehub-33", "poprules-startingPrice");
+    const msg = formatUnregistrableReason({ label: "palacehub-33", registrability: r, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.match(msg, /palacehub-/, "should quote the broken base name");
     const bulletMatches = [...msg.matchAll(/- ([a-z0-9-]+)\.dot/g)].map((m) => m[1]);
     assert.ok(bulletMatches.length > 0, `>> FAIL: hyphen-base message has no alternatives: ${msg}`);
     for (const alt of bulletMatches) {
       assert.doesNotThrow(() => validateDomainLabel(alt), `>> FAIL: offered alternative "${alt}" is not itself syntax-valid`);
-      assert.strictEqual(classifyRegistrability(alt).registrable, true, `>> FAIL: offered alternative "${alt}" is not itself registrable`);
+      assert.strictEqual(classifyRegistrability(alt, "poprules-startingPrice").registrable, true, `>> FAIL: offered alternative "${alt}" is not itself registrable`);
     }
   });
 
@@ -350,7 +411,7 @@ describe("PopRules-derived rules relocated from validateDomainLabel to classifyR
     for (const input of ["foo", "abcde", "game"]) {
       assert.strictEqual(validateDomainLabel(input), input,
         `>> FAIL: relocated-reserved-base: "${input}": validateDomainLabel must accept this unchanged post-#1185`);
-      const r = classifyRegistrability(input);
+      const r = classifyRegistrability(input, "poprules-startingPrice");
       assert.strictEqual(r.registrable, false, `>> FAIL: relocated-reserved-base: "${input}": classifyRegistrability should flag it`);
       assert.strictEqual(r.rule, "reserved-base", `>> FAIL: relocated-reserved-base: "${input}": expected rule reserved-base, got ${r.rule}`);
       assert.match(r.message, /governance|5 chars or fewer/i, `>> FAIL: relocated-reserved-base: "${input}": message should quote the governance phrase, got: ${r.message}`);
@@ -362,10 +423,10 @@ describe("PopRules-derived rules relocated from validateDomainLabel to classifyR
   // own remediation only makes sense for inputs whose digit count is already
   // compliant. Verify with the ordering test's original motivating input.
   test("orders the trailing-digits rule BEFORE the hyphen-base rule", () => {
-    const r = classifyRegistrability("my-app-1");
+    const r = classifyRegistrability("my-app-1", "poprules-startingPrice");
     assert.strictEqual(r.rule, "trailing-digits",
       `>> FAIL: ordering: expected trailing-digits to win over hyphen-base for "my-app-1", got ${r.rule}`);
-    const msg = formatUnregistrableReason({ label: "my-app-1", registrability: r, existingOwner: null, selfAddress: "0xaaa" });
+    const msg = formatUnregistrableReason({ label: "my-app-1", registrability: r, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     // The old hyphen-base-style suggestions ("my-app1", "my-app-pr1") both
     // still have exactly 1 trailing digit — they must NOT be offered, since
     // they'd be refused again on the next attempt.
@@ -374,7 +435,7 @@ describe("PopRules-derived rules relocated from validateDomainLabel to classifyR
     const bulletMatches = [...msg.matchAll(/- ([a-z0-9-]+)\.dot/g)].map((m) => m[1]);
     assert.ok(bulletMatches.length > 0, `>> FAIL: ordering: no alternatives found in message: ${msg}`);
     for (const alt of bulletMatches) {
-      assert.strictEqual(classifyRegistrability(alt).registrable, true, `>> FAIL: ordering: offered alternative "${alt}" is not itself registrable on the next attempt.`);
+      assert.strictEqual(classifyRegistrability(alt, "poprules-startingPrice").registrable, true, `>> FAIL: ordering: offered alternative "${alt}" is not itself registrable on the next attempt.`);
     }
   });
 
@@ -387,14 +448,14 @@ describe("PopRules-derived rules relocated from validateDomainLabel to classifyR
       "palacehub-9999", "e2esmoke26652530002-83abbd6", "a12345", "foo123",
     ];
     for (const input of inputs) {
-      const alternatives = buildLabelAlternatives(input);
+      const alternatives = buildLabelAlternatives(input, "poprules-startingPrice");
       assert.ok(alternatives.length > 0, `>> FAIL: buildLabelAlternatives-invariant: "${input}" produced zero alternatives — the NoStatus fallback should always survive.`);
       for (const alt of alternatives) {
         assert.doesNotThrow(
           () => validateDomainLabel(alt.label),
           `>> FAIL: buildLabelAlternatives-invariant: candidate "${alt.label}" (suggested for "${input}") does not itself pass validateDomainLabel.`,
         );
-        assert.strictEqual(classifyRegistrability(alt.label).registrable, true,
+        assert.strictEqual(classifyRegistrability(alt.label, "poprules-startingPrice").registrable, true,
           `>> FAIL: buildLabelAlternatives-invariant: candidate "${alt.label}" (suggested for "${input}") is not itself registrable.`);
       }
     }
@@ -606,6 +667,226 @@ describe("pickFreshRunLabel (test/e2e.test.js) — sanitization-stable fresh lab
       ">> FAIL: pickFreshRunLabel-fix: NoStatus branch (signerPopStatus < 2) must be unaffected by the buildFreshLabelFromTag fix",
     );
   });
+
+  // #274 (mirror of bulletin #1589): S-INC-CROSSLABEL built labelA/labelB from
+  // pickFreshRunLabel("e2exlbla") and pickFreshRunLabel("e2exlblb") with no
+  // merkle discriminator. Both derive from RUN_TAG (`${GITHUB_RUN_ID}-${sha7}`),
+  // which is identical for the js and kubo matrix legs of one workflow run, so
+  // the two legs picked the SAME labels and whichever leg deployed second
+  // found label B already deployed. The fix folds MERKLE ("js"/"kubo") into
+  // both prefixes before handing them to pickFreshRunLabel. Pin the property
+  // directly against buildFreshLabelFromTag (PoP-Full path) and
+  // noStatusRunLabel (NoStatus path) so a future revert to a bare prefix is
+  // caught here, not by a red nightly.
+  test("#274: folding MERKLE into the prefix keeps js/kubo legs' labels distinct under the SAME RUN_TAG (both PoP paths)", () => {
+    const tag = "26855501122-2994449"; // same all-digit-sha edge case as above
+
+    // Build both legs' labels from ONE closure per (path, base-prefix) pair,
+    // instead of hand-concatenating "js"/"kubo" onto each prefix 8 separate
+    // times — that duplication is exactly the typo hazard a discriminator
+    // fix like this one needs to avoid (e.g. "e2exlblakubo" silently
+    // diverging from "e2exlblbkubo"'s prefix).
+    const legLabels = (build) => ({ js: build("js"), kubo: build("kubo") });
+    const popFullLabelA = legLabels((leg) => buildFreshLabelFromTag(`e2exlbla${leg}`, tag));
+    const popFullLabelB = legLabels((leg) => buildFreshLabelFromTag(`e2exlblb${leg}`, tag));
+    const noStatusLabelA = legLabels((leg) => noStatusRunLabel(`e2exlbla${leg}`));
+    const noStatusLabelB = legLabels((leg) => noStatusRunLabel(`e2exlblb${leg}`));
+
+    assert.notEqual(popFullLabelA.js, popFullLabelA.kubo,
+      ">> FAIL: crosslabel-leg-collision: label A must differ between js and kubo legs sharing the same RUN_TAG (PoP-Full path)");
+    assert.notEqual(popFullLabelB.js, popFullLabelB.kubo,
+      ">> FAIL: crosslabel-leg-collision: label B must differ between js and kubo legs sharing the same RUN_TAG (PoP-Full path)");
+    assert.notEqual(noStatusLabelA.js, noStatusLabelA.kubo,
+      ">> FAIL: crosslabel-leg-collision: label A must differ between js and kubo legs (NoStatus path)");
+    assert.notEqual(noStatusLabelB.js, noStatusLabelB.kubo,
+      ">> FAIL: crosslabel-leg-collision: label B must differ between js and kubo legs (NoStatus path)");
+
+    // Label A and label B must also still differ from each other WITHIN a
+    // single merkle leg — the merkle discriminator must not collapse the
+    // pre-existing A-vs-B distinction the scenario also depends on.
+    assert.notEqual(popFullLabelA.js, popFullLabelB.js,
+      ">> FAIL: crosslabel-leg-collision: label A and label B must differ within the js leg (PoP-Full path)");
+    assert.notEqual(popFullLabelA.kubo, popFullLabelB.kubo,
+      ">> FAIL: crosslabel-leg-collision: label A and label B must differ within the kubo leg (PoP-Full path)");
+    assert.notEqual(noStatusLabelA.js, noStatusLabelB.js,
+      ">> FAIL: crosslabel-leg-collision: label A and label B must differ within the js leg (NoStatus path)");
+    assert.notEqual(noStatusLabelA.kubo, noStatusLabelB.kubo,
+      ">> FAIL: crosslabel-leg-collision: label A and label B must differ within the kubo leg (NoStatus path)");
+
+    const allLabels = [popFullLabelA, popFullLabelB, noStatusLabelA, noStatusLabelB].flatMap((o) => [o.js, o.kubo]);
+    for (const label of allLabels) {
+      assert.ok(label.length >= 6,
+        `>> FAIL: crosslabel-leg-collision: generated label "${label}" is shorter than the 6-char DotNS base-name floor.`);
+      assert.ok([0, 2].includes(countTrailingDigits(label)),
+        `>> FAIL: crosslabel-leg-collision: generated label "${label}" must have 0 or 2 trailing digits per the DotNS naming rule, got ${countTrailingDigits(label)}.`);
+      assert.equal(sanitizeDomainLabel(label), label,
+        `>> FAIL: crosslabel-leg-collision: sanitizeDomainLabel(label) is not stable/idempotent for "${label}".`);
+    }
+  });
+});
+
+// S-V060-UNBLOCK label builders (test/e2e.test.js, bulletin #1423/#1410) —
+// pins the exact shape invariants each builder promises, then confirms
+// classifyRegistrability itself treats each shape the way the E2E scenario's
+// comments claim: illegal on every older profile, registrable on v0.6.0.
+// Offline/pure — no chain needed, mirrors the buildFreshLabelFromTag tests
+// directly above.
+//
+// NOTE: the twin's src/dotns.ts already implements the v0.6.0 naming-rule
+// branches these tests exercise. Before this port, no test called
+// classifyDotnsLabel/classifyRegistrability with profile "v0.6.0" for these
+// two label shapes specifically — the twin's existing v0.6.0 coverage was
+// all on protocol DETECTION (connect()'s ABI-profile probe), a different
+// concern. These label-builder tests are new here, not a pre-existing gap
+// this port merely documents.
+describe("S-V060-UNBLOCK label builders (test/e2e.test.js) — shape invariants + cross-profile classification (#1410)", () => {
+  const sha7s = ["a1b2cd9", "3fc11234", "deadbee", "0ffbeef", "cafe123", "2994449" /* all-digit, the buildFreshLabelFromTag regression sha */];
+  const runIds = ["26648857693", "26652530002", "26700011234"];
+  const tags = runIds.flatMap((runId) => sha7s.map((sha7) => `${runId}${sha7}`));
+
+  test('buildBase8TwoDigitLabel: base-8 + exactly 2 trailing digits, distinct across runs, distinct from buildOneTrailingDigitLabel', () => {
+    const labels = tags.map((tag) => buildBase8TwoDigitLabel(tag));
+    for (const label of labels) {
+      assert.match(label, /^[a-z0-9]{10}$/, `>> FAIL: buildBase8TwoDigitLabel: "${label}" is not a 10-char lowercase-alnum label`);
+      assert.equal(countTrailingDigits(label), 2, `>> FAIL: buildBase8TwoDigitLabel: "${label}" must have EXACTLY 2 trailing digits, got ${countTrailingDigits(label)}`);
+      assert.equal(label.length - countTrailingDigits(label), 8, `>> FAIL: buildBase8TwoDigitLabel: "${label}" base length must be 8`);
+    }
+    assert.equal(new Set(labels).size, labels.length,
+      `>> FAIL: buildBase8TwoDigitLabel: labels collided across distinct (runId, sha7) tags: ${JSON.stringify(labels)} — entropy must be taken from the tag's tail (sha-derived), not its monotonic run-id head.`);
+  });
+
+  test('buildOneTrailingDigitLabel: exactly 1 trailing digit, base >= 9 as written, distinct across runs', () => {
+    const labels = tags.map((tag) => buildOneTrailingDigitLabel(tag));
+    for (const label of labels) {
+      assert.match(label, /^[a-z0-9]{11}$/, `>> FAIL: buildOneTrailingDigitLabel: "${label}" is not an 11-char lowercase-alnum label`);
+      assert.equal(countTrailingDigits(label), 1, `>> FAIL: buildOneTrailingDigitLabel: "${label}" must have EXACTLY 1 trailing digit, got ${countTrailingDigits(label)}`);
+      assert.ok(label.length >= 9, `>> FAIL: buildOneTrailingDigitLabel: "${label}" must be >= 9 chars as written`);
+    }
+    assert.equal(new Set(labels).size, labels.length,
+      `>> FAIL: buildOneTrailingDigitLabel: labels collided across distinct (runId, sha7) tags: ${JSON.stringify(labels)}.`);
+  });
+
+  // labelA's shape is NOT a naming-rule violation on any profile
+  // (classifyRegistrability accepts it everywhere — 2 trailing digits is
+  // compliant, baseLength 8 or 10 is well above the reserved-base floor).
+  // The old-profile demand is a personhood-TIER requirement (PopLite),
+  // decided by classifyDotnsLabel/canRegister, not by classifyRegistrability.
+  test("labelA (base-8+2-digit): old profiles demand PopLite personhood; v0.6.0 is open (NoStatus)", () => {
+    const sampleTag = "266528571232994449";
+    const label = buildBase8TwoDigitLabel(sampleTag);
+
+    for (const profile of ["poprules-startingPrice", "v0.5.8-rc1"]) {
+      assert.equal(classifyRegistrability(label, profile).registrable, true,
+        `>> FAIL: v060-unblock-labelA: "${label}" must be registrable (naming-rule-legal) on profile "${profile}" — the personhood tier, not the shape, is what old profiles object to`);
+      const r = classifyDotnsLabel(label, DEFAULT_TLD, profile);
+      assert.equal(r.status, ProofOfPersonhoodStatus.ProofOfPersonhoodLite,
+        `>> FAIL: v060-unblock-labelA: "${label}" must demand ProofOfPersonhoodLite on profile "${profile}", got status ${r.status} (${r.message})`);
+    }
+
+    const newR = classifyDotnsLabel(label, DEFAULT_TLD, "v0.6.0");
+    assert.equal(newR.status, ProofOfPersonhoodStatus.NoStatus,
+      `>> FAIL: v060-unblock-labelA: "${label}" must be NoStatus on v0.6.0 (open to any account), got status ${newR.status} (${newR.message})`);
+  });
+
+  // labelB IS a naming-rule violation on old profiles (the independent
+  // trailing-digit-count gate), and that rule is entirely deleted on v0.6.0.
+  test("labelB (1 trailing digit, base>=9): old profiles refuse via the trailing-digits naming rule; v0.6.0 is registrable", () => {
+    const sampleTag = "266528571232994449";
+    const label = buildOneTrailingDigitLabel(sampleTag);
+
+    for (const profile of ["poprules-startingPrice", "v0.5.8-rc1"]) {
+      const r = classifyRegistrability(label, profile);
+      assert.equal(r.registrable, false, `>> FAIL: v060-unblock-labelB: "${label}" must be non-registrable on profile "${profile}"`);
+      assert.equal(r.rule, "trailing-digits", `>> FAIL: v060-unblock-labelB: "${label}" must be refused via the trailing-digits rule on profile "${profile}", got ${r.rule}`);
+    }
+
+    const newR = classifyRegistrability(label, "v0.6.0");
+    assert.equal(newR.registrable, true,
+      `>> FAIL: v060-unblock-labelB: "${label}" must be registrable on v0.6.0 (the trailing-digits rule is gone) — got ${JSON.stringify(newR)}`);
+  });
+});
+
+describe("registerOrConverge (test/e2e.test.js) — S-TRANSFER* retry-idempotency helper (bulletin #1364/#1334)", () => {
+  test("fresh label: calls register() once and returns null", async () => {
+    const calls = [];
+    const reg = { register: async (label) => { calls.push(label); } };
+    const result = await registerOrConverge(reg, "e2exferabc");
+    assert.equal(result, null, ">> FAIL: registerOrConverge: a successful register() must report null (freshly registered), not an existing owner");
+    assert.deepEqual(calls, ["e2exferabc"], ">> FAIL: registerOrConverge: must call reg.register(label) exactly once with the given label");
+  });
+
+  test("already owned by the expected signer (retry after a failure between register and transfer): returns the owner, does not throw", async () => {
+    const reg = { register: async () => { throw new Error("Domain e2exferabc.dot already owned by 0x1234567890abcdef1234567890abcdef12345678"); } };
+    const result = await registerOrConverge(reg, "e2exferabc");
+    assert.equal(
+      result?.toLowerCase(), "0x1234567890abcdef1234567890abcdef12345678",
+      ">> FAIL: registerOrConverge: an 'already owned by <addr>' register() failure must converge by returning <addr>, not throw or return the wrong address",
+    );
+  });
+
+  test("already owned by the recipient (retry after a fully-completed prior attempt): returns the recipient's address", async () => {
+    const reg = { register: async () => { throw new Error("Domain e2exferabc.dot already owned by 0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01"); } };
+    const result = await registerOrConverge(reg, "e2exferabc");
+    assert.equal(
+      result?.toLowerCase(), "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01",
+      ">> FAIL: registerOrConverge: must surface whichever address the on-chain 'already owned by' error names, so the caller can distinguish a same-signer retry from a fully-completed handover",
+    );
+  });
+
+  test("a non-ownership register() failure propagates unchanged, not swallowed as a convergence signal", async () => {
+    const boom = new Error("ChainHead disjointed");
+    const reg = { register: async () => { throw boom; } };
+    await assert.rejects(
+      () => registerOrConverge(reg, "e2exferabc"),
+      (err) => err === boom,
+      ">> FAIL: registerOrConverge: a register() failure that is NOT an 'already owned by' message must propagate as-is (e.g. a real RPC/chain flake), never get misread as an ownership convergence",
+    );
+  });
+
+  test("a non-Error throw (string/object) without 'already owned by' also propagates unchanged", async () => {
+    const reg = { register: async () => { throw "connection reset"; } };
+    await assert.rejects(
+      () => registerOrConverge(reg, "e2exferabc"),
+      (err) => err === "connection reset",
+      ">> FAIL: registerOrConverge: a non-Error throw must still be message-matched via String(err) and propagate unchanged when it isn't an ownership conflict",
+    );
+  });
+});
+
+describe("registerOrConvergeChecked (test/e2e.test.js) — allowed-owner guard shared by S-TRANSFER and S-TRANSFER-SUBNAME (bulletin #1364/#1334)", () => {
+  test("fresh label: delegates to registerOrConverge and returns null without asserting", async () => {
+    const reg = { register: async () => {} };
+    const result = await registerOrConvergeChecked(reg, "e2exferabc", ["0xAAAA"], "TEST");
+    assert.equal(result, null, ">> FAIL: registerOrConvergeChecked: a fresh registration must return null");
+  });
+
+  test("owned by an allowed address: returns that address without throwing", async () => {
+    const reg = { register: async () => { throw new Error("Domain e2exferabc.dot already owned by 0xAAAA"); } };
+    const result = await registerOrConvergeChecked(reg, "e2exferabc", ["0xBBBB", "0xAAAA"], "TEST");
+    assert.equal(
+      result?.toLowerCase(), "0xaaaa",
+      ">> FAIL: registerOrConvergeChecked: an owner present in allowedOwners must be returned, not rejected",
+    );
+  });
+
+  test("owned by an unlisted third party: throws instead of silently converging", async () => {
+    const reg = { register: async () => { throw new Error("Domain e2exferabc.dot already owned by 0xCCCC"); } };
+    await assert.rejects(
+      () => registerOrConvergeChecked(reg, "e2exferabc", ["0xAAAA", "0xBBBB"], "TEST"),
+      /unexpected third party 0xCCCC/i,
+      ">> FAIL: registerOrConvergeChecked: an owner NOT in allowedOwners must fail loudly (fixture drifted to a real third party), never converge silently",
+    );
+  });
+
+  test("a non-ownership register() failure still propagates unchanged through the assertion layer", async () => {
+    const boom = new Error("ChainHead disjointed");
+    const reg = { register: async () => { throw boom; } };
+    await assert.rejects(
+      () => registerOrConvergeChecked(reg, "e2exferabc", ["0xAAAA"], "TEST"),
+      (err) => err === boom,
+      ">> FAIL: registerOrConvergeChecked: a non-'already owned by' failure must propagate as-is, same as the underlying registerOrConverge",
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -660,7 +941,7 @@ describe("countTrailingDigits", () => {
 describe("classifyRegistrability (#1185)", () => {
   test("accepts labels that satisfy every PopRules rule", () => {
     for (const l of ["mysitedemo00", "palacehub00", "test-app00", "testapp12"]) {
-      const r = classifyRegistrability(l);
+      const r = classifyRegistrability(l, "poprules-startingPrice");
       assert.strictEqual(r.registrable, true,
         `>> FAIL: classifyRegistrability: registrable label rejected: ${l} classified as ${JSON.stringify(r)}`);
     }
@@ -668,7 +949,7 @@ describe("classifyRegistrability (#1185)", () => {
 
   test("flags 1 or 3+ trailing digits before any other rule", () => {
     for (const l of ["mysite123", "my-app-1", "dim2"]) {
-      const r = classifyRegistrability(l);
+      const r = classifyRegistrability(l, "poprules-startingPrice");
       assert.strictEqual(r.registrable, false, `>> FAIL: classifyRegistrability: ${l}: expected non-registrable`);
       assert.strictEqual(r.rule, "trailing-digits",
         `>> FAIL: classifyRegistrability: ${l}: expected rule trailing-digits, got ${r.rule} (precedence bug: trailing-digits must win over hyphen-base and reserved-base)`);
@@ -676,13 +957,13 @@ describe("classifyRegistrability (#1185)", () => {
   });
 
   test("flags a hyphen-terminated base only when digits are compliant", () => {
-    const r = classifyRegistrability("palacehub-33");
+    const r = classifyRegistrability("palacehub-33", "poprules-startingPrice");
     assert.strictEqual(r.rule, "hyphen-base",
       `>> FAIL: classifyRegistrability: palacehub-33: expected hyphen-base, got ${r.rule}`);
   });
 
   test("flags a short base", () => {
-    const r = classifyRegistrability("game");
+    const r = classifyRegistrability("game", "poprules-startingPrice");
     assert.strictEqual(r.rule, "reserved-base",
       `>> FAIL: classifyRegistrability: game: expected reserved-base, got ${r.rule}`);
     assert.match(r.message, /base name is 4 chars/i,
@@ -702,7 +983,7 @@ describe("formatUnregistrableReason (#1185)", () => {
   };
 
   test("unregistered: names the dotns-cli route", () => {
-    const m = formatUnregistrableReason({ label: "game", registrability: R, existingOwner: null, selfAddress: "0xaaa" });
+    const m = formatUnregistrableReason({ label: "game", registrability: R, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.match(m, /not registered/i, `>> FAIL: formatUnregistrableReason: unregistered message must say so; got: ${m}`);
     assert.match(m, /dotns register domain -n game --governance/,
       `>> FAIL: formatUnregistrableReason: must give the exact dotns-cli command; got: ${m}`);
@@ -711,7 +992,7 @@ describe("formatUnregistrableReason (#1185)", () => {
   });
 
   test("owned by another account: tells the operator to deploy with that account", () => {
-    const m = formatUnregistrableReason({ label: "game", registrability: R, existingOwner: "0xbbb", selfAddress: "0xaaa" });
+    const m = formatUnregistrableReason({ label: "game", registrability: R, existingOwner: "0xbbb", selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.match(m, /owned by 0xbbb/i, `>> FAIL: formatUnregistrableReason: must name the owner; got: ${m}`);
     assert.match(m, /--mnemonic/, `>> FAIL: formatUnregistrableReason: must offer the owning-signer route; got: ${m}`);
     assert.doesNotMatch(m, /dotns register domain/,
@@ -719,7 +1000,7 @@ describe("formatUnregistrableReason (#1185)", () => {
   });
 
   test("keeps the phrasing telemetry classifies as a user error", () => {
-    const m = formatUnregistrableReason({ label: "game", registrability: R, existingOwner: null, selfAddress: "0xaaa" });
+    const m = formatUnregistrableReason({ label: "game", registrability: R, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.strictEqual(isExpectedError(m), true,
       `>> FAIL: formatUnregistrableReason: message would be classified as a non-user error and would raise a bug-report prompt; got: ${m}`);
   });
@@ -735,7 +1016,7 @@ describe("decideRegistrabilityOutcome (#1185)", () => {
   const nr = { registrable: false, rule: "reserved-base", message: "Base name is 4 chars; …" };
 
   test("proceeds when the signer owns the name", () => {
-    const d = decideRegistrabilityOutcome({ label: "game", registrability: nr, existingOwner: "0xaaa", selfAddress: "0xaaa" });
+    const d = decideRegistrabilityOutcome({ label: "game", registrability: nr, existingOwner: "0xaaa", selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.strictEqual(d.canProceed, true,
       ">> FAIL: decideRegistrabilityOutcome: the owner of a reserved name must be allowed to update its content");
     assert.strictEqual(d.plannedAction, "already-owned-by-us",
@@ -743,7 +1024,7 @@ describe("decideRegistrabilityOutcome (#1185)", () => {
   });
 
   test("aborts when unregistered", () => {
-    const d = decideRegistrabilityOutcome({ label: "game", registrability: nr, existingOwner: null, selfAddress: "0xaaa" });
+    const d = decideRegistrabilityOutcome({ label: "game", registrability: nr, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.strictEqual(d.canProceed, false,
       ">> FAIL: decideRegistrabilityOutcome: bulletin-deploy cannot register a reserved name; must abort");
     assert.match(d.reason, /dotns register domain/,
@@ -751,14 +1032,14 @@ describe("decideRegistrabilityOutcome (#1185)", () => {
   });
 
   test("aborts when owned by another account", () => {
-    const d = decideRegistrabilityOutcome({ label: "game", registrability: nr, existingOwner: "0xbbb", selfAddress: "0xaaa" });
+    const d = decideRegistrabilityOutcome({ label: "game", registrability: nr, existingOwner: "0xbbb", selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.strictEqual(d.canProceed, false,
       ">> FAIL: decideRegistrabilityOutcome: must not attempt to write content to someone else's name");
     assert.match(d.reason, /0xbbb/, `>> FAIL: decideRegistrabilityOutcome: abort reason must name the owner; got: ${d.reason}`);
   });
 
   test("does not short-circuit a registrable label", () => {
-    const d = decideRegistrabilityOutcome({ label: "mysitedemo00", registrability: { registrable: true }, existingOwner: null, selfAddress: "0xaaa" });
+    const d = decideRegistrabilityOutcome({ label: "mysitedemo00", registrability: { registrable: true }, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.strictEqual(d.canProceed, true,
       ">> FAIL: decideRegistrabilityOutcome: a registrable label must fall through to the normal register path");
     assert.notStrictEqual(d.plannedAction, "abort",
@@ -773,13 +1054,13 @@ describe("decideRegistrabilityOutcome (#1185)", () => {
   // phone-signature planner branches on "register"). This is the assertion
   // that discriminates the two.
   test("a registrable, UNOWNED label plans register — never already-owned-by-us", () => {
-    const d = decideRegistrabilityOutcome({ label: "mysitedemo00", registrability: { registrable: true }, existingOwner: null, selfAddress: "0xaaa" });
+    const d = decideRegistrabilityOutcome({ label: "mysitedemo00", registrability: { registrable: true }, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.strictEqual(d.plannedAction, "register",
       `>> FAIL: decideRegistrabilityOutcome: a registrable label nobody owns must plan "register"; got "${d.plannedAction}" — reporting already-owned-by-us here would tell a caller to skip registering a name that does not exist`);
   });
 
   test("ownership wins over registrability when the signer owns a registrable label", () => {
-    const d = decideRegistrabilityOutcome({ label: "mysitedemo00", registrability: { registrable: true }, existingOwner: "0xaaa", selfAddress: "0xaaa" });
+    const d = decideRegistrabilityOutcome({ label: "mysitedemo00", registrability: { registrable: true }, existingOwner: "0xaaa", selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.strictEqual(d.plannedAction, "already-owned-by-us",
       `>> FAIL: decideRegistrabilityOutcome: a registrable label the signer already owns must plan already-owned-by-us (skip register, go to setContenthash); got "${d.plannedAction}"`);
   });
@@ -1363,6 +1644,67 @@ describe("captureWarning", () => {
   });
 });
 
+describe("deploy span on a forced exit", () => {
+  // atEnd is what Sentry sends: the attributes at the moment the span ends.
+  const fakeRoot = () => ({ attrs: new Map(), ended: 0, atEnd: null, setAttribute(k, v) { this.attrs.set(k, v); }, setStatus() {}, end() { this.ended++; this.atEnd ??= new Map(this.attrs); } });
+  const stubSentry = (root) => ({
+    startSpan: async (_opts, fn) => fn(root), setTags() {}, setTag() {}, getActiveSpan: () => null,
+    captureMessage() {}, addBreadcrumb() {}, captureException() {}, withScope() {}, flush: async () => true, close: async () => true,
+  });
+
+  test("a fatal crash mid-deploy is sent as a failed deploy with its outcome", async () => {
+    const root = fakeRoot();
+    const prev = __setSentryForTest(stubSentry(root));
+    try {
+      await withDeploySpan("crash.dot", async () => {
+        markDeployFatal(new SyntaxError("Unexpected end of JSON input"));
+        await closeTelemetry(0);
+        await closeTelemetry(0);
+      });
+      assert.equal(root.ended, 1, ">> FAIL: closeTelemetry: an open deploy span must end exactly once; an unended span is never sent");
+      assert.equal(root.atEnd.get("deploy.status"), "error", ">> FAIL: markDeployFatal: a fatal crash must report deploy.status=error");
+      assert.equal(root.atEnd.get("deploy.sad"), "true", ">> FAIL: markDeployFatal: a fatal crash must set deploy.sad=true");
+      assert.match(root.atEnd.get("deploy.error"), /Unexpected end of JSON input/, ">> FAIL: markDeployFatal: deploy.error must carry the crash message");
+      assert.equal(root.atEnd.get("deploy.outcome"), "unknown_error", ">> FAIL: closeTelemetry: the ended span must carry the crash's deploy.outcome, which the Health dashboard groups by");
+    } finally {
+      __setSentryForTest(prev);
+    }
+  });
+
+  test("a crash during manifest publish ends the manifest span without deploy attributes", async () => {
+    const root = fakeRoot();
+    __setDeployRootSpanForTest(root);
+    try {
+      markDeployFatal(new Error("boom"));
+      await closeTelemetry(0);
+      assert.equal(root.ended, 1, ">> FAIL: closeTelemetry: an open root span must be ended so it is sent");
+      assert.equal(root.atEnd.has("deploy.outcome"), false, ">> FAIL: closeTelemetry: deploy.outcome belongs on deploy spans only");
+      assert.equal(root.atEnd.has("deploy.status"), false, ">> FAIL: markDeployFatal: a manifest span reports through deploy.manifest.status, not deploy.status");
+    } finally {
+      __setDeployRootSpanForTest(null);
+    }
+  });
+
+  test("markDeployFatal does not throw on a non-Error throw value", async () => {
+    const root = fakeRoot();
+    const prev = __setSentryForTest(stubSentry(root));
+    try {
+      await withDeploySpan("crash.dot", async () => {
+        markDeployFatal(null);
+        assert.equal(root.attrs.get("deploy.status"), "error", ">> FAIL: markDeployFatal: a null throw is still a failed deploy");
+      });
+    } finally {
+      __setSentryForTest(prev);
+    }
+  });
+
+  test("source: Sentry.init routes fatal errors through exitOnFatalError", () => {
+    const src = fs.readFileSync("src/telemetry.ts", "utf-8");
+    assert.match(src, /onFatalError:\s*exitOnFatalError/,
+      ">> FAIL: initTelemetry: Sentry.init must route fatal errors through exitOnFatalError, or a library-mode crash sends no span");
+  });
+});
+
 describe("initTelemetry ambient mode", () => {
   test("source: initTelemetry checks PAD_USE_AMBIENT_SENTRY before calling Sentry.init", () => {
     const src = fs.readFileSync("src/telemetry.ts", "utf-8");
@@ -1424,24 +1766,6 @@ describe("classifyErrorKind", () => {
     );
   });
 
-  // Decoded ABI custom-error reverts from src/dotns.ts's Publisher paths
-  // (publishLabel / unpublishLabel) — these have no "Contract reverted" /
-  // flags=N / ContractReverted envelope, so they need their own alternative
-  // on the contract-revert rule.
-  //
-  // Reason deliberately NOT NoPersonhood: the `reverted: NoPersonhood`
-  // rule sits ahead of contract-revert and claims that one for
-  // naming.pop_required (the kind that names the remedy). See the
-  // "naming.pop_required: Publisher.publish NoPersonhood revert reason" test.
-  // Every other decoded Publisher error still lands here.
-  test("contract-revert: Publisher.publish reverted with decoded custom error", () => {
-    assert.strictEqual(classifyErrorKind("Publisher.publish reverted: NotOwner"), "contract-revert");
-  });
-
-  test("contract-revert: Publisher.unpublish reverted with decoded custom error", () => {
-    assert.strictEqual(classifyErrorKind("Publisher.unpublish reverted: CooldownActive"), "contract-revert");
-  });
-
   test("chain-timeout: timed out waiting for block", () => {
     assert.strictEqual(classifyErrorKind("finalize-registration timed out after 90s waiting for block confirmation"), "chain-timeout");
   });
@@ -1472,6 +1796,16 @@ describe("classifyErrorKind", () => {
 
   test("connection: WebSocket closed", () => {
     assert.strictEqual(classifyErrorKind("WebSocket to wss://asset-hub-paseo.dotters.network closed before response"), "connection");
+  });
+
+  // Generated by the producer, not typed out, so the rule and the message
+  // cannot drift apart while still agreeing with each other.
+  test("naming.short_names_closed: shortNamesClosedReason's message", () => {
+    assert.strictEqual(classifyErrorKind(shortNamesClosedReason("hodlem", 6, "paseo", "paseo-next-v2")), "naming.short_names_closed");
+  });
+
+  test("naming.soulbound: soulboundTransferReason's message", () => {
+    assert.strictEqual(classifyErrorKind(soulboundTransferReason("giftbox", "dot")), "naming.soulbound");
   });
 
   test("connection: WS halt", () => {
@@ -1516,10 +1850,14 @@ describe("classifyErrorKind", () => {
       "naming.already_owned",
     );
   });
-  test("naming.already_owned: 'owned by' without 'already' does not match", () => {
+  // Since the category is derived from the kind, the looser "owned by" phrasing
+  // must carry a kind (it used to be user-classified by a separate legacy regex).
+  // It lands on the looser trailing rule, not the strict "already owned by 0x..." one.
+  test("naming.already_owned: 'owned by' without 'already' is caught only by the looser rule", () => {
     assert.strictEqual(
       classifyErrorKind("Domain mysite.dot is owned by 0xabc."),
-      "unknown",
+      "naming.already_owned",
+      ">> FAIL: 'owned by' phrasing lost its kind, so it would surface as unknown_error again",
     );
   });
 
@@ -1539,10 +1877,11 @@ describe("classifyErrorKind", () => {
     assert.strictEqual(classifyErrorKind(msg), "naming.governance_reserved",
       `>> FAIL: naming.governance_reserved: owned-by-another variant should classify the same way (uniform 'cannot register it' phrase); got ${classifyErrorKind(msg)}`);
   });
-  test("naming.governance_reserved: message without 'cannot register it' does not match", () => {
+  test("naming.governance_reserved: bare 'Base name is N chars' message is caught only by the looser rule", () => {
     assert.strictEqual(
       classifyErrorKind("Base name is 4 chars; DotNS reserves base names of 5 chars or fewer for governance (PopRules)."),
-      "unknown",
+      "naming.governance_reserved",
+      ">> FAIL: bare base-name-length message lost its kind, so it would surface as unknown_error again",
     );
   });
 
@@ -1553,10 +1892,11 @@ describe("classifyErrorKind", () => {
       "naming.subdomain_orphan",
     );
   });
-  test("naming.subdomain_orphan: similar message without 'Cannot deploy' does not match", () => {
+  test("naming.subdomain_orphan: similar message without 'Cannot deploy' is not subdomain_orphan", () => {
     assert.strictEqual(
       classifyErrorKind("parent mysite.dot is owned by 0xabc"),
-      "unknown",
+      "naming.already_owned",
+      ">> FAIL: a bare 'owned by' message must fall to the looser ownership rule, never subdomain_orphan",
     );
   });
   test("naming.subdomain_orphan: 'owned by no one' variant (#1061)", () => {
@@ -1722,7 +2062,17 @@ describe("classifyErrorKind", () => {
   test("naming.contract_unavailable: 'No contract deployed at' wrapper message (hasCode=false)", () => {
     assert.strictEqual(
       classifyErrorKind(
-        "No contract deployed at 0xabc (POP_RULES) env=paseo-next-v2 — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. Check environments.json / --contract config for this network.",
+        "No contract deployed at 0xabc (POP_RULES) env=paseo-next-v2 — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. This address came from assets/environments.json shipped with polkadot-app-deploy (environment paseo-next-v2).",
+      ),
+      "naming.contract_unavailable",
+    );
+  });
+
+  // #272: the ERROR_KIND_RULES comment in src/telemetry.ts explains why this rule is a prefix match.
+  test("naming.contract_unavailable: classifyProtocolVersion's hasCode=false message (#272)", () => {
+    assert.strictEqual(
+      classifyErrorKind(
+        "paseo-next-v2 (POP_RULES 0xabc): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here.",
       ),
       "naming.contract_unavailable",
     );
@@ -1784,6 +2134,13 @@ describe("classifyErrorKind", () => {
     assert.strictEqual(
       classifyErrorKind("Chunk 2 failed after 3 retries: chunk(nonce:0) subscription error: Mobile signing rejected: message too big"),
       "signer.message_too_large",
+    );
+  });
+  test("signer.message_too_large matches product-sdk-terminal 0.10's transaction signing error", () => {
+    assert.strictEqual(
+      classifyErrorKind("Chunk 2 failed after 3 retries: chunk(nonce:0) subscription error: Mobile transaction signing rejected: message too big"),
+      "signer.message_too_large",
+      ">> FAIL: telemetry: the SDK's signTx error text must still classify as signer.message_too_large",
     );
   });
 
@@ -1875,14 +2232,14 @@ describe("classifyErrorKind", () => {
 
   // naming.pop_required (9 spans) — Revive surfaces the personhood gate as a
   // bare revert reason, not the "requires ProofOfPersonhoodX" prose.
-  test("naming.pop_required: Publisher.publish NoPersonhood revert reason", () => {
-    const msg = "Publisher.publish reverted: NoPersonhood";
+  test("naming.pop_required: NoPersonhood revert reason", () => {
+    const msg = "Contract reverted: NoPersonhood";
     assert.strictEqual(classifyErrorKind(msg), "naming.pop_required",
       `>> FAIL: naming.pop_required: the NoPersonhood revert reason is the same user-actionable cause as the prose variant and must share its kind; got ${classifyErrorKind(msg)}`);
   });
   test("naming.pop_required: a revert without NoPersonhood stays contract-revert", () => {
     assert.strictEqual(
-      classifyErrorKind("Publisher.publish reverted (flags=1) with data: 0x"),
+      classifyErrorKind("Contract reverted (flags=1) with data: 0x"),
       "contract-revert",
       ">> FAIL: naming.pop_required: the NoPersonhood rule is over-broad — it swallowed a generic revert",
     );
@@ -1904,10 +2261,39 @@ describe("classifyErrorKind", () => {
       ">> FAIL: user.aborted: the rule is unanchored — a real chunk failure was reclassified as an operator interrupt and vanished from the failure rate");
   });
 
+  // signer.phone_confirmation_unavailable (#1363) — a non-interactive caller
+  // (CI, no TTY) hit the phone-confirmation gate. Distinct from user.aborted:
+  // this is NEVER a deliberate cancellation, so it must not land in the kind
+  // that dashboards treat as "not a product failure", nor fall into 'unknown'
+  // the way it did pre-fix (misclassified as an operator abort).
+  test("signer.phone_confirmation_unavailable: nonInteractivePhoneConfirmationError's message classifies distinctly from user.aborted and unknown", () => {
+    const err = nonInteractivePhoneConfirmationError("Link content");
+    const kind = classifyErrorKind(err.message);
+    assert.strictEqual(kind, "signer.phone_confirmation_unavailable",
+      `>> FAIL: signer.phone_confirmation_unavailable: got ${kind} — the non-interactive phone-gate failure must have its own kind, not fall into unknown`);
+    assert.notStrictEqual(kind, "user.aborted",
+      ">> FAIL: signer.phone_confirmation_unavailable: must not be folded into user.aborted — nobody deliberately cancelled a CI run");
+  });
+
+  test("signer.phone_confirmation_unavailable: still classifies if a future wrapper prefixes the message (deliberately unanchored)", () => {
+    // Traced the live propagation path (confirmPhoneReady -> _awaitPhoneReady ->
+    // contractTransaction -> withSpan chain -> withDeploySpan) and confirmed no
+    // current layer wraps/prefixes this message — every hop rethrows the same
+    // Error object. This rule is left unanchored anyway (unlike user.aborted,
+    // which must stay anchored so over-matching can't delete real failures from
+    // the failure rate): this rule only ADDS a bucket, so there's no downside to
+    // tolerating a future wrapper, and no plausible unrelated message contains
+    // this phrase by accident.
+    const err = nonInteractivePhoneConfirmationError("Register");
+    const wrapped = `dotns register failed: ${err.message}`;
+    assert.strictEqual(classifyErrorKind(wrapped), "signer.phone_confirmation_unavailable",
+      `>> FAIL: signer.phone_confirmation_unavailable: a wrapped/prefixed variant of the message must still classify correctly; got ${classifyErrorKind(wrapped)}`);
+  });
+
   // naming.contract_unavailable (1 span) — env config carries a zero/absent
   // address, caught before the call rather than as empty return data.
   test("naming.contract_unavailable: invalid configured contract address", () => {
-    const msg = "Invalid contract address for PUBLISHER in environment paseo-next-v2: 0x0000000000000000000000000000000000000000";
+    const msg = "Invalid contract address for DOTNS_RESOLVER in environment paseo-next-v2: 0x0000000000000000000000000000000000000000";
     assert.strictEqual(classifyErrorKind(msg), "naming.contract_unavailable",
       `>> FAIL: naming.contract_unavailable: a zero/absent configured address is the same failure family as an empty contract read; got ${classifyErrorKind(msg)}`);
   });
@@ -1919,60 +2305,76 @@ describe("classifyErrorKind", () => {
   // invisible. Masking is on content, not key, and short enum-like values are
   // masked exactly like long prose. Any new kind must avoid these substrings.
   test("no DeployErrorKind literal contains a Sentry-scrubbed substring", () => {
-    const src = fs.readFileSync("src/telemetry.ts", "utf8");
-    // Strip `//` comments first: the union is interleaved with them and one
-    // carries a semicolon, which would otherwise end the slice early.
-    const union = src.slice(src.indexOf("export type DeployErrorKind =")).replace(/\/\/[^\n]*/g, "");
-    const kinds = union.slice(0, union.indexOf(";")).match(/'[^']+'/g).map(k => k.slice(1, -1));
-    // Parse sanity: a broken slice must fail loudly rather than pass vacuously.
-    assert.ok(kinds.length >= 20, `>> FAIL: kind-scrub guard: parsed only ${kinds.length} DeployErrorKind members from src/telemetry.ts — the union parse broke, so this guard was not actually checking anything`);
-    assert.ok(kinds.includes("unknown"), ">> FAIL: kind-scrub guard: parsed union does not include 'unknown' — wrong slice of src/telemetry.ts");
+    const kinds = parseDeployErrorKindUnion();
     const scrubbed = kinds.filter(k => /auth|secret|credential|password/i.test(k));
     assert.deepStrictEqual(scrubbed, [],
       `>> FAIL: kind-scrub guard: ${scrubbed.join(", ")} contain(s) a substring Sentry's relayPiiConfig masks — the value would render as asterisks in every dashboard grouped by deploy.error_kind. Rename the kind (e.g. storage.rejected, not storage.not_authorized).`);
   });
+
+  // Chunk-inclusion and stuck-queue errors (follow-up to the S9 / #1637 fixes): each
+  // had no rule and landed in 'unknown'. The two ChunkInclusionUnverifiedError
+  // throw sites in src/deploy.ts are different mechanisms (the probe RPC gave no
+  // answer vs the chain accepted the txs but never included the chunk), so they get
+  // two kinds. The message builders below mirror the producers; the source-pin test
+  // reads src/deploy.ts so a wording change there fails here instead of silently
+  // demoting the span back to 'unknown'.
+  describe("classifyErrorKind — chunk-inclusion and stuck-queue errors", () => {
+    const deploySrc = fs.readFileSync(new URL("../src/deploy.ts", import.meta.url), "utf8");
+
+    test("source pin: the producers still contain the fragments these tests mirror", () => {
+      for (const fragment of ["Could not verify that chunk", "is stored on-chain", "still absent at the best block after", "re-upload rounds"]) {
+        assert.ok(deploySrc.includes(fragment),
+          `>> FAIL: chunk-inclusion kinds: src/deploy.ts no longer contains "${fragment}"; update chunkUnverifiedMessage/chunkNotIncludedMessage in test/test.js and the ERROR_KIND_RULES regexes together`);
+      }
+    });
+
+    test("chain.chunk_unverified: probe gave no answer; not stolen by connection/timeout rules via the interpolated reason", () => {
+      for (const reason of ["timed out", "websocket closed"]) {
+        const msg = chunkUnverifiedMessage("4", reason);
+        assert.strictEqual(classifyErrorKind(msg), "chain.chunk_unverified",
+          `>> FAIL: chunk-inclusion kinds: reason "${reason}" made the message classify as ${classifyErrorKind(msg)}`);
+        assert.strictEqual(classifyDeployError(msg), "environment");
+      }
+    });
+
+    test("chain.chunk_not_included: chain accepts txs but does not include the chunk", () => {
+      for (const list of ["1", "1, 2, 3"]) {
+        const msg = chunkNotIncludedMessage(list);
+        assert.strictEqual(classifyErrorKind(msg), "chain.chunk_not_included",
+          `>> FAIL: chunk-inclusion kinds: got ${classifyErrorKind(msg)} for "${msg}"`);
+        assert.strictEqual(classifyDeployError(msg), "environment");
+      }
+    });
+
+    test("chain.queue_stuck: pinned pool account and direct signer share the kind", () => {
+      const direct = stuckQueueMessage("Direct signer //dotns/3", STUCK_ADDR, STUCK_HEALTH, "Deploy with another signer or derivation path, or wait for the queue to clear.");
+      for (const msg of [STUCK_POOL_MESSAGE, direct]) {
+        assert.strictEqual(classifyErrorKind(msg), "chain.queue_stuck", `>> FAIL: stuck-queue kind: got ${classifyErrorKind(msg)} for "${msg}"`);
+        assert.strictEqual(classifyDeployError(msg), "environment");
+      }
+    });
+  });
+
 });
 
 // ---------------------------------------------------------------------------
-// 8d. createSessionSigner — PAPI-native signRaw routing
+// 8d. createSessionSigner: transactions via createTransaction, bytes via signRaw
 // ---------------------------------------------------------------------------
 describe("createSessionSigner (vendored)", () => {
-  // DEV phrase gives a stable, valid Ristretto point for rootAccountId so that
-  // sessionRootPublicKey + deriveProductPublicKey don't throw in curve math.
+  // DEV phrase gives a stable, valid Ristretto point for the subtree key the
+  // stub phone returns, so the product-account soft derivation succeeds.
   const DEV_PHRASE = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
-
-  async function getRootPublicKey() {
-    const { seedToAccount } = await import("@parity/product-sdk-keys");
-    return seedToAccount(DEV_PHRASE, "").publicKey;
-  }
-
-  // RFC-0022: the product account hangs off `//product//{productId}`, whose two
-  // leading junctions are HARD — the subtree public key can only come from the
-  // wallet, so the stub has to answer getProductSubtree.
-  async function getSubtreePublicKey(productId) {
-    const { seedToAccount } = await import("@parity/product-sdk-keys");
-    return seedToAccount(DEV_PHRASE, `//product//${productId}`).publicKey;
-  }
-
-  // Isolated subtree-cache dir so these tests never write to ~/.polkadot-apps.
-  async function freshSubtreeOptions() {
-    const { mkdtempSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
-    return { appId: "pad-test", storageDir: mkdtempSync(join(tmpdir(), "pad-subtree-")) };
-  }
+  // The SDK caches the subtree key on disk; keep it out of the real ~/.polkadot-apps.
+  const subtreeOptions = { storageDir: fs.mkdtempSync(path.join(os.tmpdir(), "bd-subtree-")) };
+  after(() => fs.rmSync(subtreeOptions.storageDir, { recursive: true, force: true }));
 
   async function makeStubSession(opts = {}) {
-    const rootAccountId = await getRootPublicKey();
-    const captured = { signRaw: [], signPayload: [], subtree: [] };
+    const { seedToAccount } = await import("@parity/product-sdk-keys");
+    const subtreeKey = seedToAccount(DEV_PHRASE, "").publicKey;
+    const captured = { signRaw: [], signPayload: [] };
     return {
-      id: "stub-session",
-      rootAccountId,
-      remoteAccount: { accountId: rootAccountId },
-      getProductSubtree: async (productId) => {
-        captured.subtree.push(productId);
-        return { isErr: () => false, value: await getSubtreePublicKey(productId) };
-      },
+      id: `stub-${Math.random()}`,
+      getProductSubtree: async () => ({ isErr: () => false, value: subtreeKey }),
       signRaw: async (req) => {
         captured.signRaw.push(req);
         return opts.signRawResult ?? { isErr: () => false, value: { signature: new Uint8Array(64) } };
@@ -1988,21 +2390,12 @@ describe("createSessionSigner (vendored)", () => {
   test("signTx never routes through signPayload (anti-regression: message-too-big)", async () => {
     // Core regression guard: the old PJS-based path called session.signPayload,
     // sending the full 2 MB chunk calldata as the 'method' field. Android rejects
-    // that with "message too big". The new path (getPolkadotSigner + signRaw Payload)
-    // must never call signPayload regardless of how signTx is invoked.
-    //
-    // NOTE: verifying session.signRaw IS called requires valid PAPI metadata
-    // (decAnyMetadata throws on empty bytes). That contract is covered by the
-    // Payload-tag unit in makeTxSignCallback: the sign callback passed to
-    // getPolkadotSigner always routes to session.signRaw({ tag: "Payload", ... }).
-    // The signBytes test below verifies the tag pattern on the sibling callback.
+    // that with "message too big". signTx goes through session.createTransaction
+    // and must never call signPayload. Empty metadata makes signTx throw before
+    // it sends anything, which is enough to check signPayload stays unused.
     const { createSessionSigner } = await import("../dist/auth/vendor/index.js");
     const session = await makeStubSession();
-    const signer = await createSessionSigner(
-      session,
-      { productId: "test", derivationIndex: 0 },
-      await freshSubtreeOptions(),
-    );
+    const signer = await createSessionSigner(session, { productId: "test", derivationIndex: 0 }, subtreeOptions);
 
     try {
       await signer.signTx(new Uint8Array(300), {}, new Uint8Array(0), 0);
@@ -2014,11 +2407,7 @@ describe("createSessionSigner (vendored)", () => {
   test("signBytes routes through signRaw with Bytes tag", async () => {
     const { createSessionSigner } = await import("../dist/auth/vendor/index.js");
     const session = await makeStubSession();
-    const signer = await createSessionSigner(
-      session,
-      { productId: "test", derivationIndex: 0 },
-      await freshSubtreeOptions(),
-    );
+    const signer = await createSessionSigner(session, { productId: "test", derivationIndex: 0 }, subtreeOptions);
 
     try {
       await signer.signBytes(new Uint8Array([1, 2, 3]));
@@ -2028,6 +2417,11 @@ describe("createSessionSigner (vendored)", () => {
     const rawCalls = session.captured.signRaw;
     assert.ok(rawCalls.length > 0);
     assert.strictEqual(rawCalls[rawCalls.length - 1].data.tag, "Bytes");
+    assert.deepStrictEqual(
+      rawCalls[rawCalls.length - 1].productAccountId,
+      ["test", { tag: "Index", value: 0 }],
+      ">> FAIL: signBytes: host-papp 0.10 needs a tagged derivation index in productAccountId",
+    );
   });
 
   test("mobile rejection surfaces as 'Mobile signing rejected:' prefix", async () => {
@@ -2035,11 +2429,7 @@ describe("createSessionSigner (vendored)", () => {
     const session = await makeStubSession({
       signRawResult: { isErr: () => true, error: { message: "user declined" } },
     });
-    const signer = await createSessionSigner(
-      session,
-      { productId: "test", derivationIndex: 0 },
-      await freshSubtreeOptions(),
-    );
+    const signer = await createSessionSigner(session, { productId: "test", derivationIndex: 0 }, subtreeOptions);
 
     await assert.rejects(
       () => signer.signBytes(new Uint8Array([1])),
@@ -2184,17 +2574,12 @@ describe("withSpan error attribute propagation", () => {
 
   test("source: withDeploySpan catch also sets deploy.error_kind on the root span", () => {
     const src = fs.readFileSync("src/telemetry.ts", "utf-8");
-    // #1061: the catch now routes error recording through the single
-    // setDeployErrorOnSpan choke point instead of inlining each setAttribute —
-    // so the invariant (catch sets deploy.error_kind on the root span) is
-    // preserved *via the helper*. Verify BOTH the delegation and that the
-    // helper writes the attribute, so no path can record deploy.error without it.
-    const deploySpanCatch = src.match(/setAttribute\("deploy\.status",\s*"error"\)[\s\S]*?throw error;/);
-    assert.ok(deploySpanCatch, "withDeploySpan catch block must exist");
-    assert.ok(
-      /setDeployErrorOnSpan\(/.test(deploySpanCatch[0]),
-      "withDeploySpan catch must route error recording through setDeployErrorOnSpan",
-    );
+    // The catch records through recordDeployFailure, which goes through setDeployErrorOnSpan.
+    assert.match(src, /catch \(error\) \{\s*recordDeployFailure\(span, error\);\s*throw error;/,
+      ">> FAIL: withDeploySpan: the catch must record the failure through recordDeployFailure");
+    const recorder = src.match(/function recordDeployFailure\([\s\S]*?\n}/);
+    assert.ok(recorder && /setDeployErrorOnSpan\(/.test(recorder[0]),
+      ">> FAIL: recordDeployFailure: error recording must go through setDeployErrorOnSpan");
     const helper = src.match(/function setDeployErrorOnSpan\([\s\S]*?\n}/);
     assert.ok(helper, "setDeployErrorOnSpan helper must exist");
     assert.ok(
@@ -2205,12 +2590,11 @@ describe("withSpan error attribute propagation", () => {
 
   test("source: withDeploySpan catch also sets deploy.error_message on the root span", () => {
     const src = fs.readFileSync("src/telemetry.ts", "utf-8");
-    const deploySpanCatch = src.match(/setAttribute\("deploy\.status",\s*"error"\)[\s\S]*?throw error;/);
-    assert.ok(deploySpanCatch, "withDeploySpan catch block must exist");
-    assert.ok(
-      /setDeployErrorOnSpan\(/.test(deploySpanCatch[0]),
-      "withDeploySpan catch must route error recording through setDeployErrorOnSpan",
-    );
+    assert.match(src, /catch \(error\) \{\s*recordDeployFailure\(span, error\);\s*throw error;/,
+      ">> FAIL: withDeploySpan: the catch must record the failure through recordDeployFailure");
+    const recorder = src.match(/function recordDeployFailure\([\s\S]*?\n}/);
+    assert.ok(recorder && /setDeployErrorOnSpan\(/.test(recorder[0]),
+      ">> FAIL: recordDeployFailure: error recording must go through setDeployErrorOnSpan");
     const helper = src.match(/function setDeployErrorOnSpan\([\s\S]*?\n}/);
     assert.ok(helper, "setDeployErrorOnSpan helper must exist");
     assert.ok(
@@ -2225,6 +2609,187 @@ describe("withSpan error attribute propagation", () => {
     // the function returns cleanly without throwing.
     const result = await withSpan("deploy.dotns.finalize-registration", "2a-iv. finalize-registration", {}, () => "ok");
     assert.strictEqual(result, "ok");
+  });
+});
+
+// A wrong contract address is the operator's mistake only when it came from
+// their config. A stale address in the config we ship is a fleet-wide tool
+// failure and must stay on the health dashboards.
+describe("a missing contract is classified by WHOSE config is wrong", () => {
+  const body = (env) => `No contract deployed at 0xabc (POP_RULES) env=${env} — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code.`;
+  const from = (origin) => ` This address came from ${origin}.`;
+
+  test("an address from the operator's own file is user error, not a sad deploy", () => {
+    const msg = body("gamingnet") + from("/home/ops/envs.json (environment gamingnet)");
+    assert.equal(classifyDeployError(msg), "user",
+      ">> FAIL: an operator's own wrong address counted against tool health");
+  });
+
+  test("an address from the config we ship stays visible as a tool failure", () => {
+    const msg = body("paseo-next-v2") + from("assets/environments.json shipped with polkadot-app-deploy (environment paseo-next-v2)");
+    assert.equal(classifyDeployError(msg), "unknown",
+      ">> FAIL: a stale address in our own shipped config was blamed on the operator and filtered off the dashboards");
+    assert.equal(isExpectedError(msg), false,
+      ">> FAIL: a stale shipped address was marked expected, hiding it from every widget filtering NOT deploy.expected:true");
+  });
+
+  test("an address from the built-in fallback also stays visible", () => {
+    const msg = body("paseo-next-v2") + from("the built-in fallback for paseo-next-v2");
+    assert.equal(classifyDeployError(msg), "unknown",
+      ">> FAIL: a bad fallback address was blamed on the operator");
+  });
+
+  test("no stated origin stays visible rather than assumed to be the operator's", () => {
+    assert.equal(classifyDeployError(body("gamingnet")), "unknown",
+      ">> FAIL: an address with no known origin was assumed to be the operator's mistake");
+  });
+
+  test("an unverifiable address follows the same rule", () => {
+    const unverifiable = "Contract call returned empty data — contract=POP_RULES (0xabc) env=paseo-next-v2 functionName=startingPrice. Could not verify whether contract code exists at this address (runtime code-presence query failed); investigate the contract/ABI or the configured address.";
+    assert.equal(classifyDeployError(unverifiable + from("/home/ops/envs.json (environment paseo-next-v2)")), "user",
+      ">> FAIL: unverifiable address: an operator's own wrong address counted against tool health");
+    assert.equal(classifyDeployError(unverifiable + from("assets/environments.json shipped with polkadot-app-deploy (environment paseo-next-v2)")), "unknown",
+      ">> FAIL: unverifiable address: an address from the config we ship was blamed on the operator");
+  });
+
+  test("an unrecognised DotNS generation is environment, not unknown", () => {
+    const msg = "Could not determine the DotNS ABI profile: contract code is present at POP_RULES, but neither pricingVersion() (v0.5.8-rc1) nor startingPrice() (poprules-startingPrice) answered.";
+    assert.equal(classifyDeployError(msg), "environment",
+      ">> FAIL: an unsupported chain generation counted as a tool failure");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8e. deploy.error_category / deploy.outcome derive from the kind classifier
+// ---------------------------------------------------------------------------
+describe("error category follows the mechanism classifier", () => {
+  const FUNDING = "DotNS signer 5DfXvJ3K has 6.0323 PAS free; needs \u226516.1000 PAS for register. Testnet auto-top-up via Alice/Bob failed (both also low). Top up at https://faucet.polkadot.io.";
+  const TRANSFER_FAILED = 'Transaction failed: {"type":"Module","value":{"type":"Revive","value":{"type":"TransferFailed"}}}';
+  const CASES = [
+    ["funding.insufficient_balance", FUNDING],
+    ["user.aborted", "aborted by user"],
+    ["funding.transfer_failed", TRANSFER_FAILED],
+  ];
+
+  for (const [kind, msg] of CASES) {
+    test(`${kind}: kind, category, expected flag and outcome agree on a user error`, () => {
+      assert.strictEqual(classifyErrorKind(msg), kind,
+        `>> FAIL: category-from-kind: ${kind}: message classified to a different kind: "${msg}"`);
+      assert.strictEqual(classifyDeployError(msg), "user",
+        `>> FAIL: category-from-kind: ${kind}: category is not 'user', so the Deploy Outcomes widget shows unknown_error for an operator-fixable failure`);
+      assert.strictEqual(isExpectedError(msg), true,
+        `>> FAIL: category-from-kind: ${kind}: not expected, so deploy.sad=true and the span errors for an operator-fixable failure`);
+      assert.strictEqual(computeDeployOutcome(classifyDeployError(msg), false, "other"), "user_error",
+        `>> FAIL: category-from-kind: ${kind}: outcome is not user_error`);
+    });
+  }
+
+  // The kinds added with the single classifier, one verbatim sample each (the table
+  // upstream's classifyErrorKind block carries; p-a-d has no such table).
+  test("kinds added with the single classifier classify their verbatim messages", () => {
+    const SAMPLES = [
+      ["naming.invalid_label", "Invalid domain label: cannot start or end with hyphen"],
+      ["naming.name_unavailable", "Contract reverted: NameNotAvailable(my-domain)"],
+      ["signer.invalid_mnemonic", "Invalid bip39 mnemonic specified"],
+      ["storage.allowance_insufficient", "Account 5CXg... has insufficient Bulletin authorization quota (need 12 txs / 40.0MB, have 60 txs / 30.0MB)"],
+      ["tool.ipfs_missing", "IPFS CLI not installed. Install from: https://docs.ipfs.tech/install/"],
+      ["tool.out_of_memory", "JavaScript heap out of memory"],
+      ["tool.external_signer_unsupported", "External signer mode is not supported with dotns-cli subprocess"],
+      ["chain.chunk_failed", "Chunk 3 failed after 3 retries: upload aborted by user"],
+      ["chain.tx_dropped", "Chunk 3 failed after 3 retries: tx dropped from best chain 5 times"],
+      ["chain.tx_invalid", 'subscription error: {"type":"Invalid","value":{"type":"Custom"}}'],
+      ["chain.not_finalised", "extrinsic not finalised after 120s"],
+      ["dotns.register_failed", "dotns register failed (exit null)"],
+      ["network.endpoints_failed", "All promises were rejected"],
+      ["funding.transfer_failed", 'Transaction failed: {"type":"Module","value":{"type":"Revive","value":{"type":"TransferFailed"}}}'],
+    ];
+    for (const [kind, msg] of SAMPLES) {
+      assert.strictEqual(classifyErrorKind(msg), kind, `>> FAIL: kind-samples: "${msg}" did not classify as ${kind}`);
+    }
+  });
+
+  test("every DeployErrorKind has a category; only unclassified or context-dependent kinds map to 'unknown'", () => {
+    const MAY_BE_UNKNOWN = ["unknown", "naming.contract_unavailable", "naming.contract_function_removed", "dotns.abi_decode_empty"];
+    const valid = new Set(["user", "environment", "internal", "unknown"]);
+    for (const k of parseDeployErrorKindUnion()) {
+      assert.ok(Object.hasOwn(ERROR_KIND_CATEGORY, k),
+        `>> FAIL: kind-category-map: kind "${k}" is missing from ERROR_KIND_CATEGORY`);
+      const v = ERROR_KIND_CATEGORY[k];
+      assert.ok(valid.has(v), `>> FAIL: kind-category-map: kind "${k}" has invalid category ${v}`);
+      if (!MAY_BE_UNKNOWN.includes(k)) {
+        assert.notStrictEqual(v, "unknown", `>> FAIL: kind-category-map: kind "${k}" maps to 'unknown' — classify it or add it to the deliberate list`);
+      }
+    }
+  });
+
+  test("a user-pattern message keeps winning over a generic contract-revert kind", () => {
+    assert.strictEqual(classifyDeployError("Contract reverted: PopError(Name must be lowercase ASCII DNS label)"), "user",
+      ">> FAIL: category-from-kind: contract-revert kind overrode the existing user-error pattern");
+  });
+});
+
+// Regression guard for the ONE classifier. The corpus is every message the
+// classifier tests exercise plus the distinct real deploy errors Sentry saw in a
+// 30-day window (addresses normalised), each with the kind/category/expected the
+// classifier produced when the legacy category regexes were removed. Anything
+// that moves must be justified here, so a classifier edit cannot silently
+// re-attribute fault for real traffic.
+describe("error classification corpus", () => {
+  const corpus = JSON.parse(fs.readFileSync("test/fixtures/error-classification-corpus.json", "utf8"));
+  // Entries whose category/expected or a KNOWN kind changed. unknown -> new kind
+  // with the same category/expected needs no entry (newly classified).
+  const ALLOWED_CHANGES = [
+    { prefix: "Contract reverted: NameNotAvailable(", kind: "naming.name_unavailable", category: "user", expected: true,
+      reason: "NameNotAvailable reverts are the operator's naming problem: own kind, same user category as before" },
+    { prefix: "Contract reverted: PopError(Name must be lowercase", kind: "naming.invalid_label", category: "user", expected: true,
+      reason: "PopError label reverts are the operator's typo: own kind, same user category as before" },
+    { prefix: "Cannot auto-refresh: signer balance", kind: "funding.insufficient_balance", category: "user", expected: true,
+      reason: "signer cannot pay the refresh fee: newly classified as funding, was unknown_error" },
+  ];
+
+  // p-a-d adaptations: its classifier does not thread the InvalidTransaction
+  // variant (bulletin #1256/#1386) and lacks the contract_unavailable /
+  // contract_function_removed split of bulletin #1345 (only its ABI-profile rule
+  // is ported), so entries that depend on either are skipped; the corpus's
+  // "shipped with bulletin-deploy" origin phrase is rewritten to p-a-d's own.
+  const KINDS = new Set(parseDeployErrorKindUnion());
+  const portable = corpus.filter((e) => !e.variant && KINDS.has(e.snapshot.kind) && e.snapshot.kind !== "naming.contract_function_removed");
+  const own = (m) => m.replaceAll("shipped with bulletin-deploy", "shipped with polkadot-app-deploy");
+
+  test("every corpus message keeps its classification unless the change is allow-listed", () => {
+    for (const e of portable) {
+      const now = {
+        kind: classifyErrorKind(own(e.message)),
+        category: classifyDeployError(own(e.message)),
+        expected: isExpectedError(own(e.message)),
+      };
+      const old = e.snapshot;
+      if (now.kind === old.kind && now.category === old.category && now.expected === old.expected) continue;
+      const newlyClassified = old.kind === "unknown" && now.category === old.category && now.expected === old.expected;
+      if (newlyClassified) continue;
+      const allow = ALLOWED_CHANGES.find((a) => e.message.startsWith(a.prefix));
+      assert.ok(allow && allow.kind === now.kind && allow.category === now.category && allow.expected === now.expected,
+        `>> FAIL: corpus: "${e.message.slice(0, 160)}" changed ${old.kind}/${old.category}/${old.expected} -> ${now.kind}/${now.category}/${now.expected} and is not allow-listed with exactly that result`);
+    }
+  });
+
+  test("the allow-list has no stale entries", () => {
+    for (const a of ALLOWED_CHANGES) {
+      assert.ok(corpus.some((e) => e.message.startsWith(a.prefix)),
+        `>> FAIL: corpus: allow-list entry "${a.prefix}" (${a.reason}) matches no corpus message — remove it`);
+    }
+  });
+
+  test("the corpus covers the real Sentry traffic and the classifier tests", () => {
+    assert.ok(corpus.filter((e) => e.sources.includes("sentry")).length >= 400, ">> FAIL: corpus: lost the Sentry-derived messages");
+    assert.ok(corpus.filter((e) => e.sources.includes("test")).length >= 150, ">> FAIL: corpus: lost the test-derived messages");
+  });
+
+  test("contract-address kinds attribute fault by whose config is wrong", () => {
+    const base = "No contract deployed at 0xabc (POP_RULES) env=gamingnet.";
+    assert.strictEqual(classifyDeployError(`${base} This address came from /home/ops/envs.json (environment gamingnet).`), "user");
+    assert.strictEqual(classifyDeployError(`${base} This address came from assets/environments.json shipped with polkadot-app-deploy (environment gamingnet).`), "unknown");
+    assert.strictEqual(classifyDeployError(base), "unknown");
   });
 });
 
@@ -2795,6 +3360,44 @@ describe("getDeployAttributes", () => {
     assert.strictEqual(attrs["deploy.dotns_pop_source"], "personhood-precompile");
     assert.ok(!("deploy.dotns_cli_version" in attrs), "deploy.dotns_cli_version must not be emitted after removing deploy-time dotns-cli");
   });
+
+  describe("#1626: deploy.expected_error", () => {
+    function withExpectFail(value, fn) {
+      const prior = process.env.PAD_E2E_EXPECT_FAIL;
+      if (value === undefined) delete process.env.PAD_E2E_EXPECT_FAIL; else process.env.PAD_E2E_EXPECT_FAIL = value;
+      try {
+        fn();
+      } finally {
+        if (prior === undefined) delete process.env.PAD_E2E_EXPECT_FAIL; else process.env.PAD_E2E_EXPECT_FAIL = prior;
+      }
+    }
+
+    test("defaults to the string \"false\" on every span (both-values rule)", () => {
+      withExpectFail(undefined, () => {
+        assert.strictEqual(getDeployAttributes("test-domain")["deploy.expected_error"], "false", ">> FAIL: deploy.expected_error default: must be the string \"false\" with PAD_E2E_EXPECT_FAIL unset");
+      });
+    });
+
+    test("is the string \"true\" when PAD_E2E_EXPECT_FAIL=1", () => {
+      withExpectFail("1", () => {
+        assert.strictEqual(getDeployAttributes("test-domain")["deploy.expected_error"], "true", ">> FAIL: deploy.expected_error: must be \"true\" when the harness sets PAD_E2E_EXPECT_FAIL=1");
+      });
+    });
+
+    test("stays \"false\" for any value other than 1", () => {
+      for (const v of ["", "0", "true", "false"]) {
+        withExpectFail(v, () => {
+          assert.strictEqual(getDeployAttributes("test-domain")["deploy.expected_error"], "false", `>> FAIL: deploy.expected_error for PAD_E2E_EXPECT_FAIL="${v}": only "1" opts in`);
+        });
+      }
+    });
+
+    test("is a tag only: no src file but telemetry.ts reads the env var", async () => {
+      const { execFileSync } = await import("node:child_process");
+      const hits = execFileSync("grep", ["-rl", "PAD_E2E_EXPECT_FAIL", "src", "bin"], { encoding: "utf8" }).trim().split("\n").sort();
+      assert.deepStrictEqual(hits, ["src/telemetry.ts"], ">> FAIL: PAD_E2E_EXPECT_FAIL must be read only by src/telemetry.ts so it can never change deploy behavior");
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2839,6 +3442,8 @@ describe("getDeployAttributes seed completeness (issue #497)", () => {
     "deploy.pool.nonce_collision_count": 0,
     "deploy.pool.nonce_collision_missing": 0,
     "deploy.pool.nonce_collision_reupload_count": 0,
+    // pool health (#1637)
+    "deploy.pool.stuck_skipped": "none",
     // manifest (string "0" per @sentry/node EAP numeric-attribute caveat)
     "deploy.manifest.fetch_source": "none",
     "deploy.manifest.fetch_attempts": "0",
@@ -2871,6 +3476,9 @@ describe("getDeployAttributes seed completeness (issue #497)", () => {
     "deploy.tool_version",
     "deploy.runner",
     "deploy.runner_type",
+    "deploy.ci_run_id",
+    "deploy.ci_run_attempt",
+    "deploy.expected_error",
     // deploy.pr, deploy.host_app, deploy.host_app_version are conditional — not checked here
   ];
 
@@ -3430,6 +4038,32 @@ describe("DotNS initial state", () => {
       assert.match(msg, /diagnostic: bare-revert/);
       assert.doesNotMatch(msg, /storage deposit/i);
     });
+
+    // bulletin-deploy #1518: the register diagnostic used to hardcode "typically
+    // 200+ PAS" — a figure that never matched any measured environment. It now
+    // reports the ACTUAL floor this specific call declared, so a user tops up
+    // the right amount even if the floor changes again without a release (a
+    // per-env registerStorageDeposit override).
+    test("register diagnostic reports the actual declared floor in PAS, not a hardcoded '200+ PAS'", () => {
+      const msg = __formatContractDryRunFailureForTest(
+        { revertData: "0x", revertFlags: 1n },
+        { ...baseContext, functionName: "register", registerStorageDeposit: 30_000_000_000n }, // 3 PAS
+      );
+      assert.doesNotMatch(msg, /200\+ PAS/,
+        ">> FAIL: register diagnostic prose: must not still hardcode the old 200+ PAS figure");
+      assert.match(msg, /3\.0000 PAS/,
+        ">> FAIL: register diagnostic prose: must report the caller-supplied floor (3 PAS), not a fixed constant");
+    });
+
+    test("register diagnostic falls back to MINIMUM_REGISTER_STORAGE_DEPOSIT when no floor is supplied", async () => {
+      const { fmtPas, MINIMUM_REGISTER_STORAGE_DEPOSIT } = await import("../dist/dotns.js");
+      const msg = __formatContractDryRunFailureForTest(
+        { revertData: "0x", revertFlags: 1n },
+        { ...baseContext, functionName: "register" }, // no registerStorageDeposit in context
+      );
+      assert.match(msg, new RegExp(`${fmtPas(MINIMUM_REGISTER_STORAGE_DEPOSIT).replace(".", "\\.")} PAS`),
+        ">> FAIL: register diagnostic default: with no per-call floor supplied, must report MINIMUM_REGISTER_STORAGE_DEPOSIT, not omit the figure");
+    });
   });
 
   test("contractTransaction forwards custom environment contracts to submitTransaction", async () => {
@@ -3550,6 +4184,10 @@ describe("DotNS initial state", () => {
   // (not through a wrapper like getUserPopStatus) so the env id in the thrown
   // message isn't obscured by an outer "Could not read ..." wrapper.
   const EMPTY_DATA_LABELHASH = "0x" + "11".repeat(32);
+  const SAMPLE_VIEW_ABI = [
+    { inputs: [{ name: "labelhash", type: "bytes32" }], name: "isPublished", outputs: [{ name: "", type: "bool" }], stateMutability: "view", type: "function" },
+  ];
+
   function makeEmptyDataDotNS(hasContractCode) {
     const d = new DotNS();
     d.connected = true;
@@ -3571,7 +4209,7 @@ describe("DotNS initial state", () => {
   test("contractCall empty-data error (no contract code) names the environment", async () => {
     const d = makeEmptyDataDotNS(false);
     await assert.rejects(
-      () => d.contractCall("0xPublisherAddress", PUBLISHER_ABI, "isPublished", [EMPTY_DATA_LABELHASH]),
+      () => d.contractCall("0xSomeContract", SAMPLE_VIEW_ABI, "isPublished", [EMPTY_DATA_LABELHASH]),
       (err) => {
         assert.match(err.message, /No contract deployed at/);
         assert.match(err.message, /env=paseo-next-v2/, `expected env id in message, got: ${err.message}`);
@@ -3583,7 +4221,7 @@ describe("DotNS initial state", () => {
   test("contractCall empty-data error (has contract code, unexpected empty) names the environment", async () => {
     const d = makeEmptyDataDotNS(true);
     await assert.rejects(
-      () => d.contractCall("0xPublisherAddress", PUBLISHER_ABI, "isPublished", [EMPTY_DATA_LABELHASH]),
+      () => d.contractCall("0xSomeContract", SAMPLE_VIEW_ABI, "isPublished", [EMPTY_DATA_LABELHASH]),
       (err) => {
         assert.match(err.message, /Contract call returned empty data/);
         assert.match(err.message, /env=paseo-next-v2/, `expected env id in message, got: ${err.message}`);
@@ -3596,7 +4234,7 @@ describe("DotNS initial state", () => {
     const d = makeEmptyDataDotNS(false);
     d._environmentId = null;
     await assert.rejects(
-      () => d.contractCall("0xPublisherAddress", PUBLISHER_ABI, "isPublished", [EMPTY_DATA_LABELHASH]),
+      () => d.contractCall("0xSomeContract", SAMPLE_VIEW_ABI, "isPublished", [EMPTY_DATA_LABELHASH]),
       (err) => {
         assert.doesNotMatch(err.message, /env=null/, `must not leak literal 'null', got: ${err.message}`);
         assert.match(err.message, /env=/, `expected an env= field even when unset, got: ${err.message}`);
@@ -3850,6 +4488,7 @@ describe("DotNS initial state", () => {
 
     assert.deepStrictEqual(events, [
       "check-before-trigger:false",
+      "log:   DotNS signer 5Signer... is NOT mapped on Revive (no OriginalAccount entry).",
       "check-before-trigger:false",
       "trigger",
       "check-after-trigger:true",
@@ -3860,6 +4499,118 @@ describe("DotNS initial state", () => {
   test("autoAccountMapping log names Revive.OriginalAccount confirmation", async () => {
     const src = fs.readFileSync("src/dotns.ts", "utf8");
     assert.match(src, /Account: auto-mapped \(Revive\.OriginalAccount confirmed\)/);
+  });
+
+  // bulletin #1221 Part 1: the H160 line printed just before account-mapping
+  // runs must not read as mapping evidence — it's a deterministic
+  // SS58->H160 derivation that says nothing about whether
+  // Revive.OriginalAccount exists yet.
+  test("H160 log line carries the 'derived from SS58' qualifier (#1221)", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf8");
+    assert.match(src, /H160 Address: \$\{this\.evmAddress\} \(derived from SS58; Revive mapping checked next\)/,
+      ">> FAIL: H160 qualifier: the log line must not read as mapping evidence — see #1221 Part 1");
+  });
+
+  // bulletin #1221 Part 1: the "NOT mapped" log must appear before ANY
+  // top-up attempt in source order, and must not be nested inside the
+  // isTestnet() branch — otherwise the messaging fix silently only fires for
+  // testnets.
+  test("ensureAutoMappedAccountReady logs 'NOT mapped' before attempting any top-up (#1221 Part 1)", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf8");
+    const bodyStart = src.indexOf("async ensureAutoMappedAccountReady(");
+    const notMappedIdx = src.indexOf("is NOT mapped on Revive", bodyStart);
+    const topUpIdx = src.indexOf("attemptTestnetTopUp(this.substrateAddress", bodyStart);
+    assert.ok(bodyStart !== -1 && notMappedIdx !== -1 && topUpIdx !== -1,
+      ">> FAIL: #1221 NOT-mapped ordering: could not locate all three markers in ensureAutoMappedAccountReady");
+    assert.ok(notMappedIdx < topUpIdx,
+      ">> FAIL: #1221 NOT-mapped ordering: the 'NOT mapped' log must appear before the top-up attempt in source order");
+  });
+
+  test("ensureAutoMappedAccountReady logs 'NOT mapped' even off testnet (mainnet path, no top-up)", async () => {
+    const d = new DotNS();
+    const events = [];
+    d.connected = true;
+    d.substrateAddress = "5MainnetSigner";
+    d.signer = {};
+    d.clientWrapper = {
+      checkIfAccountMapped: async () => false,
+      client: { tx: { Revive: { call: () => ({}) } } },
+      signAndSubmitWithRetry: async () => { throw new Error("no funds"); },
+    };
+    d.isTestnet = async () => false;
+    const originalLog = console.log;
+    console.log = (message) => { events.push(String(message)); };
+    try {
+      await assert.rejects(() => d.ensureAutoMappedAccountReady());
+    } finally {
+      console.log = originalLog;
+    }
+    assert.ok(events.some((e) => e.includes("is NOT mapped on Revive")),
+      ">> FAIL: #1221 mainnet NOT-mapped: the log must fire regardless of isTestnet(), not only inside the testnet top-up branch");
+  });
+
+  // bulletin #1221 Part 2: an opt-in autoMapTopUpTarget lets deploy() size
+  // the first top-up for a register instead of the flat 0.5 PAS default.
+  // Read-only callers that never set it must keep the 0.5 PAS default
+  // exactly — that's the safety property that stops every unmapped
+  // read-only connect from draining Alice/Bob at register-sized amounts.
+  function unmappedTestnetSignerCapturingTopUpTarget() {
+    const d = new DotNS();
+    let requestedTarget = null;
+    let mapped = false;
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    d.clientWrapper = {
+      checkIfAccountMapped: async () => mapped, // false until the trigger submission below "maps" it
+      client: { tx: { Revive: { call: () => ({}) } } },
+      signAndSubmitWithRetry: async (buildExtrinsic) => { buildExtrinsic(); mapped = true; },
+    };
+    d.isTestnet = async () => true;
+    d.readFreeBalance = async () => 0n;
+    d.attemptTestnetTopUp = async (_addr, target) => {
+      requestedTarget = target;
+      return { source: "Alice", transferred: target };
+    };
+    return { d, getRequestedTarget: () => requestedTarget };
+  }
+
+  test("ensureAutoMappedAccountReady uses autoMapTopUpTarget when the caller provides one (#1221 Part 2)", async () => {
+    const { d, getRequestedTarget } = unmappedTestnetSignerCapturingTopUpTarget();
+
+    await d.ensureAutoMappedAccountReady(75_000_000_000n); // 7.5 PAS, a stand-in register-sized target
+
+    assert.strictEqual(getRequestedTarget(), 75_000_000_000n,
+      ">> FAIL: autoMapTopUpTarget threading: ensureAutoMappedAccountReady must pass the caller's target to attemptTestnetTopUp, not the flat default");
+  });
+
+  test("ensureAutoMappedAccountReady keeps the flat TOP_UP_TARGET default when no override is given (#1221 Part 2 safety property)", async () => {
+    const { d, getRequestedTarget } = unmappedTestnetSignerCapturingTopUpTarget();
+
+    await d.ensureAutoMappedAccountReady(); // no arg — read-only-caller shape
+
+    assert.strictEqual(getRequestedTarget(), 5_000_000_000n, // TOP_UP_TARGET = ONE_PAS/2 = 0.5 PAS = 5_000_000_000n
+      ">> FAIL: autoMapTopUpTarget default: an unset override must still top up to exactly TOP_UP_TARGET (0.5 PAS), or every read-only connect over-funds from Alice/Bob");
+  });
+
+  test("ensureMappedAccountReady threads autoMapTopUpTarget into ensureAutoMappedAccountReady on the auto-map path", async () => {
+    const d = new DotNS();
+    const seenTargets = [];
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    d.ensureAutoMappedAccountReady = async (target) => { seenTargets.push(target); };
+    d.clientWrapper = { checkIfAccountMapped: async () => false };
+
+    await d.ensureMappedAccountReady(true, 99_000_000_000n);
+    assert.deepStrictEqual(seenTargets, [99_000_000_000n],
+      ">> FAIL: ensureMappedAccountReady autoAccountMapping=true path must forward autoMapTopUpTarget");
+  });
+
+  test("DotNS.connect() forwards options.autoMapTopUpTarget into ensureMappedAccountReady", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf8");
+    assert.match(src, /ensureMappedAccountReady\(options\.autoAccountMapping \?\? false, options\.autoMapTopUpTarget\)/,
+      ">> FAIL: connect() wiring: options.autoMapTopUpTarget must reach ensureMappedAccountReady, or deploy.ts's opt-in has no effect");
   });
 
   test("explicit account mapping falls back to auto-map trigger when map_account is unavailable", async () => {
@@ -4065,7 +4816,32 @@ describe("DotNS initial state", () => {
         "ownerOf",
         [123n],
       ),
-      /No contract deployed at.*Check environments\.json/,
+      // This stub passes no contractSources, so the tail is the built-in default.
+      /No contract deployed at.*built-in default address/,
+    );
+  });
+
+  test("contractCall (strict) names the address's recorded source when one exists", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.evmAddress = "0x1111111111111111111111111111111111111111";
+    d._environmentId = "gamingnet";
+    d._contracts = { ...d._contracts, POP_RULES: "0x2222222222222222222222222222222222222222" };
+    d._contractSources = { POP_RULES: "/home/ops/envs.json (environment gamingnet)" };
+    d.clientWrapper = {
+      performDryRunCall: async () => ({
+        result: { isOk: true, value: { data: "0x" } },
+        gasConsumed: { referenceTime: 1n, proofSize: 2n },
+        gasRequired: { referenceTime: 3n, proofSize: 4n },
+        storageDeposit: { value: 0n },
+      }),
+      hasContractCode: async () => false,
+    };
+    const abi = [{ type: "function", name: "ownerOf", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ name: "", type: "address" }] }];
+    await assert.rejects(
+      () => d.contractCall("0x2222222222222222222222222222222222222222", abi, "ownerOf", [123n]),
+      /No contract deployed at.*\(POP_RULES\).*This address came from \/home\/ops\/envs\.json \(environment gamingnet\)/,
     );
   });
 
@@ -4305,6 +5081,20 @@ describe("isCommitmentTimingBarerevert", () => {
 // DotNS.register — contract path
 // ---------------------------------------------------------------------------
 describe("DotNS.register contract path", () => {
+  // #1412: DotNS.register() now routes through commitAndRegister(), which
+  // persists/clears a commitment record via src/run-state.ts's
+  // resolveStateDir() — the REAL per-user OS state dir, not a test fixture.
+  // None of the tests below stub that away, so without this isolation every
+  // run in this describe block would read and write actual files under the
+  // machine's real `~/Library/Application Support/polkadot-app-deploy/` (or
+  // the Linux/Windows equivalent) using this file's placeholder evmAddress/
+  // label values — a real side effect leaking out of a unit test suite.
+  // Point HOME (and the other platform-specific vars resolveStateDir()
+  // consults) at a fresh tmpdir for the duration of each test in this block.
+  let isolatedHome;
+  beforeEach(() => { isolatedHome = setupIsolatedHome(); });
+  afterEach(() => { isolatedHome.restore(); });
+
   function makeDotnsForRegister() {
     const d = new DotNS();
     d.connected = true;
@@ -4488,9 +5278,13 @@ describe("DotNS.register contract path", () => {
     };
     d.verifyOwnership = async () => {};
 
+    d._sleep = async () => {}; // the retry's settle wait
     const result = await d.register("rc6pool");
     assert.deepStrictEqual(result, { label: "rc6pool", owner: "0xabc" });
-    assert.strictEqual(commitCount, 2, "should generate a fresh commitment on retry");
+    // #1659: was 2 ("a fresh commitment on retry"). Committing fresh while the
+    // first commitment is still valid is a double commit (CommitResume
+    // NoDoubleCommitValid, CR_Rivals); the retry now reuses it.
+    assert.strictEqual(commitCount, 1, ">> FAIL: register-barerevert-retry: the retry must reuse the still-valid commitment, not generate a second one");
     assert.strictEqual(finalizeCount, 2, "should attempt finalize twice");
   });
 
@@ -4525,6 +5319,7 @@ describe("DotNS.register contract path", () => {
     d.generateCommitment = async (label) => ({ commitment: "0xc1", registration: { label } });
     d.submitCommitment = async () => {};
     d.waitForCommitmentAge = async () => {};
+    d._sleep = async () => {}; // the retry's settle wait
     d.getPriceAndValidate = async () => ({ priceWei: 0n });
     d.finalizeRegistration = async () => {
       throw new Error("bare-revert (empty 0x) — commitment timing");
@@ -4573,18 +5368,18 @@ describe("DotNS.register contract path", () => {
 });
 
 // ---------------------------------------------------------------------------
-// DotNS protocol-version-aware registration (2026-09-01 ABI drift fix)
+// DotNS ABI-profile-aware registration (2026-09-01 ABI drift fix)
 //
-// v1 (preview) and v2 (paseo-next-v2) are live at the same time on
-// mutually-incompatible ABIs — the Registration tuple went from 4 to 6
-// fields (maxPrice, pricingVersion appended) and the NoStatus deposit gate
-// moved from PopRules.startingPrice() to PopRules.price(label). These tests
-// exercise generateCommitment's real (non-stubbed) tuple-building through
-// __setProtocolVersionForTest, and gateOnFeeBalance's adapter-routed deposit
+// poprules-startingPrice (preview) and v0.5.8-rc1 (paseo-next-v2) are live at
+// the same time on mutually-incompatible ABIs — the Registration tuple went
+// from 4 to 6 fields (maxPrice, pricingVersion appended) and the NoStatus
+// deposit gate moved from PopRules.startingPrice() to PopRules.price(label).
+// These tests exercise generateCommitment's real (non-stubbed) tuple-building
+// through __setProtocolVersionForTest, and gateOnFeeBalance's adapter-routed deposit
 // read — the two call sites the drift actually broke.
 // ---------------------------------------------------------------------------
-describe("DotNS protocol-version-aware registration", () => {
-  test("generateCommitment: v1 (default, no override) builds the unchanged 4-field tuple", async () => {
+describe("DotNS ABI-profile-aware registration", () => {
+  test("generateCommitment: poprules-startingPrice (default, no override) builds the unchanged 4-field tuple", async () => {
     const d = new DotNS();
     d.connected = true;
     d.evmAddress = "0xabcd000000000000000000000000000000000001";
@@ -4596,44 +5391,44 @@ describe("DotNS protocol-version-aware registration", () => {
     };
     const { registration } = await d.generateCommitment("protov1registerlabel");
     assert.deepStrictEqual(Object.keys(registration), ["label", "owner", "secret", "reserved"],
-      ">> FAIL: v1-tuple: v1's registration must stay the unchanged 4-field tuple");
-    assert.ok(seenAbiFnCount > 0, ">> FAIL: v1-tuple: makeCommitment must be routed through an adapter ABI");
+      ">> FAIL: poprules-tuple: poprules-startingPrice's registration must stay the unchanged 4-field tuple");
+    assert.ok(seenAbiFnCount > 0, ">> FAIL: poprules-tuple: makeCommitment must be routed through an adapter ABI");
   });
 
-  test("generateCommitment: v2 builds the 6-field tuple with maxPrice then pricingVersion appended, buffered +10%", async () => {
+  test("generateCommitment: v0.5.8-rc1 builds the 6-field tuple with maxPrice then pricingVersion appended, buffered +10%", async () => {
     const d = new DotNS();
     d.connected = true;
     d.evmAddress = "0xabcd000000000000000000000000000000000001";
     d._contracts = { DOTNS_REGISTRAR_CONTROLLER: "0xCTRL" };
-    d.__setProtocolVersionForTest("v2");
+    d.__setProtocolVersionForTest("v0.5.8-rc1");
     d.contractCall = async (_addr, _abi, fn) => {
       if (fn === "makeCommitment") return "0xcommitment";
       throw new Error(`unexpected contractCall in stub: ${fn}`);
     };
     const { registration } = await d.generateCommitment("protov2registerlabel", false, { priceWei: 100n, pricingVersion: 7n });
     assert.deepStrictEqual(Object.keys(registration), ["label", "owner", "secret", "reserved", "maxPrice", "pricingVersion"],
-      ">> FAIL: v2-tuple: v2's registration must carry all 6 fields, maxPrice before pricingVersion");
-    assert.strictEqual(registration.maxPrice, 110n, ">> FAIL: v2-tuple: maxPrice must be priceWei + the same 10% buffer finalizeRegistration applies");
-    assert.strictEqual(registration.pricingVersion, 7n, ">> FAIL: v2-tuple: pricingVersion must be the value read from PopRules.pricingVersion()");
+      ">> FAIL: v0.5.8-rc1-tuple: v0.5.8-rc1's registration must carry all 6 fields, maxPrice before pricingVersion");
+    assert.strictEqual(registration.maxPrice, 110n, ">> FAIL: v0.5.8-rc1-tuple: maxPrice must be priceWei + the same 10% buffer finalizeRegistration applies");
+    assert.strictEqual(registration.pricingVersion, 7n, ">> FAIL: v0.5.8-rc1-tuple: pricingVersion must be the value read from PopRules.pricingVersion()");
   });
 
-  test("generateCommitment: v2 without pricing throws naming pricingVersion, before any chain call", async () => {
+  test("generateCommitment: v0.5.8-rc1 without pricing throws naming pricingVersion, before any chain call", async () => {
     const d = new DotNS();
     d.connected = true;
     d.evmAddress = "0xabcd000000000000000000000000000000000001";
     d._contracts = { DOTNS_REGISTRAR_CONTROLLER: "0xCTRL" };
-    d.__setProtocolVersionForTest("v2");
+    d.__setProtocolVersionForTest("v0.5.8-rc1");
     let chainCalled = false;
     d.contractCall = async () => { chainCalled = true; throw new Error("should not be called"); };
     await assert.rejects(
       () => d.generateCommitment("protov2nopricing"),
       /pricingVersion/,
-      ">> FAIL: v2-missing-pricing: must throw naming pricingVersion when pricing is omitted on v2",
+      ">> FAIL: v0.5.8-rc1-missing-pricing: must throw naming pricingVersion when pricing is omitted on v0.5.8-rc1",
     );
-    assert.strictEqual(chainCalled, false, ">> FAIL: v2-missing-pricing: must fail before any chain call, not after a doomed makeCommitment");
+    assert.strictEqual(chainCalled, false, ">> FAIL: v0.5.8-rc1-missing-pricing: must fail before any chain call, not after a doomed makeCommitment");
   });
 
-  test("gateOnFeeBalance (via preflight): v1 reads startingPrice() with no args for the NoStatus deposit gate", async () => {
+  test("gateOnFeeBalance (via preflight): poprules-startingPrice reads startingPrice() with no args for the NoStatus deposit gate", async () => {
     const d = new DotNS();
     d.connected = true;
     const myAddr = "0xabcd000000000000000000000000000000000001";
@@ -4650,22 +5445,22 @@ describe("DotNS protocol-version-aware registration", () => {
     d.contractCall = async (_contract, _abi, fn, args) => {
       if (fn === "isBaseNameReserved") return [false, "0x" + "0".repeat(40), 0n];
       if (fn === "startingPrice") { calledFn = fn; calledArgs = args; return 10n * 10n ** 18n; }
-      if (fn === "price") throw new Error("v1 must not call price(label) — that is v2-only");
+      if (fn === "price") throw new Error("poprules-startingPrice must not call price(label) — that is v0.5.8-rc1-only");
       throw new Error(`unexpected contractCall in stub: ${fn}`);
     };
     const r = await d.preflight("v1depositgatelabel");
-    assert.strictEqual(r.canProceed, true, `>> FAIL: v1-deposit-gate: expected canProceed=true; reason=${r.reason}`);
-    assert.strictEqual(calledFn, "startingPrice", ">> FAIL: v1-deposit-gate: v1 must call startingPrice for the NoStatus deposit gate");
-    assert.deepStrictEqual(calledArgs, [], ">> FAIL: v1-deposit-gate: startingPrice takes no args");
+    assert.strictEqual(r.canProceed, true, `>> FAIL: poprules-deposit-gate: expected canProceed=true; reason=${r.reason}`);
+    assert.strictEqual(calledFn, "startingPrice", ">> FAIL: poprules-deposit-gate: poprules-startingPrice must call startingPrice for the NoStatus deposit gate");
+    assert.deepStrictEqual(calledArgs, [], ">> FAIL: poprules-deposit-gate: startingPrice takes no args");
   });
 
-  test("gateOnFeeBalance (via preflight): v2 reads price(label) and REJECTS startingPrice for the NoStatus deposit gate", async () => {
+  test("gateOnFeeBalance (via preflight): v0.5.8-rc1 reads price(label) and REJECTS startingPrice for the NoStatus deposit gate", async () => {
     const d = new DotNS();
     d.connected = true;
     const myAddr = "0xabcd000000000000000000000000000000000001";
     d.evmAddress = myAddr;
     d.substrateAddress = "5".padEnd(48, "x");
-    d.__setProtocolVersionForTest("v2");
+    d.__setProtocolVersionForTest("v0.5.8-rc1");
     d.checkOwnership = async () => ({ owned: false, owner: null });
     d.getUserPopStatus = async () => ProofOfPersonhoodStatus.NoStatus;
     d.isTestnet = async () => false;
@@ -4676,14 +5471,14 @@ describe("DotNS protocol-version-aware registration", () => {
     let calledArgs = null;
     d.contractCall = async (_contract, _abi, fn, args) => {
       if (fn === "isBaseNameReserved") return [false, "0x" + "0".repeat(40), 0n];
-      if (fn === "startingPrice") throw new Error("v2 must not call startingPrice() — it was removed upstream and this stub rejects it");
+      if (fn === "startingPrice") throw new Error("v0.5.8-rc1 must not call startingPrice() — it was removed upstream and this stub rejects it");
       if (fn === "price") { calledFn = fn; calledArgs = args; return 10n * 10n ** 18n; }
       throw new Error(`unexpected contractCall in stub: ${fn}`);
     };
     const r = await d.preflight("v2depositgatelabel");
-    assert.strictEqual(r.canProceed, true, `>> FAIL: v2-deposit-gate: expected canProceed=true; reason=${r.reason}`);
-    assert.strictEqual(calledFn, "price", ">> FAIL: v2-deposit-gate: v2 must call price(label), not startingPrice");
-    assert.deepStrictEqual(calledArgs, ["v2depositgatelabel"], ">> FAIL: v2-deposit-gate: price must be called with the label");
+    assert.strictEqual(r.canProceed, true, `>> FAIL: v0.5.8-rc1-deposit-gate: expected canProceed=true; reason=${r.reason}`);
+    assert.strictEqual(calledFn, "price", ">> FAIL: v0.5.8-rc1-deposit-gate: v0.5.8-rc1 must call price(label), not startingPrice");
+    assert.deepStrictEqual(calledArgs, ["v2depositgatelabel"], ">> FAIL: v0.5.8-rc1-deposit-gate: price must be called with the label");
   });
 });
 
@@ -4700,10 +5495,11 @@ describe("DotNS protocol-version-aware registration", () => {
 // classifier tests can't, since they call classifyProtocolVersion directly
 // and never touch detectProtocolVersion's plumbing.
 // ---------------------------------------------------------------------------
+const POP_RULES_ADDR = "0xPOPRULESADDRESS0000000000000000000000";
+const PRICING_VERSION_CALLDATA = encodeFunctionData({ abi: getAdapter("v0.5.8-rc1").popRulesAbi, functionName: "pricingVersion", args: [] });
+const STARTING_PRICE_CALLDATA = encodeFunctionData({ abi: getAdapter("poprules-startingPrice").popRulesAbi, functionName: "startingPrice", args: [] });
+
 test("detectProtocolVersion passes hasContractCode's result through to classifyProtocolVersion unflattened (null stays null)", async () => {
-  const POP_RULES_ADDR = "0xPOPRULESADDRESS0000000000000000000000";
-  const PRICING_VERSION_CALLDATA = encodeFunctionData({ abi: getAdapter("v2").popRulesAbi, functionName: "pricingVersion", args: [] });
-  const STARTING_PRICE_CALLDATA = encodeFunctionData({ abi: getAdapter("v1").popRulesAbi, functionName: "startingPrice", args: [] });
   const PROBE_REVERTS = { result: { isOk: false, value: { data: "0x" } } };
 
   const d = new DotNS();
@@ -4732,6 +5528,106 @@ test("detectProtocolVersion passes hasContractCode's result through to classifyP
       return true;
     },
   );
+});
+
+// detectProtocolVersion + protocolVersion(). The probes cannot tell v0.6.0,
+// v0.7.0 and v0.8.0 apart, so a declared release is read alongside them. They
+// stay the authority: a declaration can lag the deployed code.
+describe("detectProtocolVersion reads the declared DotNS release", () => {
+  const REGISTRY_ADDR = "0xREGISTRYADDRESS0000000000000000000000";
+  const POP_CONTROLLER_ADDR = "0xPOPCONTROLLER00000000000000000000000";
+  const PROTOCOL_VERSION_ABI = [
+    { inputs: [], name: "protocolVersion", outputs: [{ name: "", type: "string" }], stateMutability: "view", type: "function" },
+  ];
+  const PROTOCOL_VERSION_CALLDATA = encodeFunctionData({ abi: PROTOCOL_VERSION_ABI, functionName: "protocolVersion", args: [] });
+  const ANSWERS = { result: { isOk: true, value: { data: encodeFunctionResult({ abi: getAdapter("v0.5.8-rc1").popRulesAbi, functionName: "pricingVersion", result: 2n }) } } };
+  const REVERTS = { result: { isOk: false, value: { data: "0x", flags: 1n } } };
+  const declares = (semver) => ({ result: { isOk: true, value: { data: encodeFunctionResult({ abi: PROTOCOL_VERSION_ABI, functionName: "protocolVersion", result: semver }) } } });
+
+  // `probes` picks which generation the capability probes report:
+  //   "v0.6.0"  — pricingVersion + isPopIssued answer
+  //   "old"     — startingPrice answers instead (poprules-startingPrice)
+  //   "none"    — everything reverts, the unclassifiable chain
+  function makeDotNS({ declared, probes = "v0.6.0", hasCode = true }) {
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d._environmentId = "paseo-next-v2";
+    d["_contracts"] = { ...d["_contracts"], POP_RULES: POP_RULES_ADDR, DOTNS_PROTOCOL_REGISTRY: REGISTRY_ADDR, DOTNS_POP_CONTROLLER: POP_CONTROLLER_ADDR };
+    d.clientWrapper = {
+      hasContractCode: async () => hasCode,
+      performDryRunCall: async (_signer, addr, _value, encodedData) => {
+        if (encodedData === PROTOCOL_VERSION_CALLDATA && addr === REGISTRY_ADDR) return declared === null ? REVERTS : declares(declared);
+        if (probes === "none") return REVERTS;
+        if (encodedData === PRICING_VERSION_CALLDATA) return probes === "v0.6.0" ? ANSWERS : REVERTS;
+        if (encodedData === STARTING_PRICE_CALLDATA) return probes === "old" ? ANSWERS : REVERTS;
+        if (addr === POP_CONTROLLER_ADDR) return probes === "v0.6.0" ? ANSWERS : REVERTS;
+        throw new Error(`unexpected encodedData in protocol-detect stub: ${encodedData}`);
+      },
+    };
+    return d;
+  }
+
+  async function captureLogs(fn) {
+    const lines = [];
+    const original = console.log;
+    console.log = (...args) => lines.push(args.join(" "));
+    try { await fn(); } finally { console.log = original; }
+    return lines.join("\n");
+  }
+
+  test("a declared release is reported alongside the profile, without warning at the verified ceiling", async () => {
+    const d = makeDotNS({ declared: "0.8.0" });
+    const logs = await captureLogs(() => d["detectProtocolVersion"]());
+    assert.equal(d["_protocolVersion"], "v0.6.0");
+    assert.match(logs, /declares DotNS 0\.8\.0/, ">> FAIL: the declared release is the only signal that a generation rollout happened — the profile alone cannot show it");
+    assert.doesNotMatch(logs, /WARNING/, ">> FAIL: warning on the newest verified release would train everyone to ignore it");
+  });
+
+  test("no declaration leaves the log exactly as it was before this change", async () => {
+    const d = makeDotNS({ declared: null });
+    const logs = await captureLogs(() => d["detectProtocolVersion"]());
+    assert.equal(d["_protocolVersion"], "v0.6.0");
+    assert.doesNotMatch(logs, /declares DotNS/, ">> FAIL: a pre-v0.8.0 chain must not grow a line about a release it never declared");
+  });
+
+  test("a release newer than anything diffed against this client warns", async () => {
+    const d = makeDotNS({ declared: "0.9.0" });
+    const logs = await captureLogs(() => d["detectProtocolVersion"]());
+    assert.equal(d["_protocolVersion"], "v0.6.0", ">> FAIL: still deploy — refusing an unknown generation would strand every user the day dotns tags one");
+    assert.match(logs, /WARNING/, ">> FAIL: an undiffed generation must be loud; this warning is what v0.7.0 and v0.8.0 were missing");
+  });
+
+  test("a declaration that disagrees with the probes is reported, and the probes win", async () => {
+    // A half-applied upgrade: the registry carries protocolVersion() while
+    // PopRules still probes as an older generation.
+    const d = makeDotNS({ declared: "0.8.0", probes: "old" });
+    const logs = await captureLogs(() => d["detectProtocolVersion"]());
+    assert.equal(d["_protocolVersion"], "poprules-startingPrice", ">> FAIL: the probes read the deployed ABI; a declaration is written last in an upgrade and can lag it");
+    assert.match(logs, /NOTE:.*declares DotNS 0\.8\.0/, ">> FAIL: a chain claiming one generation while running another must say so");
+  });
+
+  test("a declaration cannot rescue a chain the probes cannot classify", async () => {
+    const d = makeDotNS({ declared: "0.8.0", probes: "none" });
+    await assert.rejects(() => d["detectProtocolVersion"](), /Could not determine the DotNS ABI profile/, ">> FAIL: an unrecognised PopRules ABI must still abort — a declared release says nothing about the shape of a contract that answered none of its probes");
+  });
+
+  test("an RPC failure reading the release does not abort a connect the probes can classify", async () => {
+    const d = makeDotNS({ declared: "0.8.0" });
+    const inner = d.clientWrapper.performDryRunCall;
+    d.clientWrapper.performDryRunCall = async (signer, addr, value, encodedData) => {
+      if (encodedData === PROTOCOL_VERSION_CALLDATA) throw new Error("WS disconnected");
+      return inner(signer, addr, value, encodedData);
+    };
+    const logs = await captureLogs(() => d["detectProtocolVersion"]());
+    assert.equal(d["_protocolVersion"], "v0.6.0", ">> FAIL: the probes answered, so the connect must still classify");
+    assert.doesNotMatch(logs, /declares DotNS/, ">> FAIL: a read that never completed must not be reported as a declaration");
+  });
+
+  test("a declaration cannot mask a wrong POP_RULES address", async () => {
+    const d = makeDotNS({ declared: "0.8.0", probes: "none", hasCode: false });
+    await assert.rejects(() => d["detectProtocolVersion"](), /No contract deployed/, ">> FAIL: a misconfigured address is a config error, not something a working registry on the same chain gets to paper over");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -4780,39 +5676,39 @@ describe("waitForCommitmentAge expiry guard", () => {
 describe("classifyDotnsLabel", () => {
   // From dotns contracts/pop/PopRules.sol:316-344.
   test("baselength <= 5 returns Reserved (governance)", () => {
-    assert.strictEqual(classifyDotnsLabel("abc").status, ProofOfPersonhoodStatus.Reserved);        // 3 chars base
-    assert.strictEqual(classifyDotnsLabel("rc4i").status, ProofOfPersonhoodStatus.Reserved);       // 4-char base
-    assert.strictEqual(classifyDotnsLabel("rc4i00").status, ProofOfPersonhoodStatus.Reserved);     // 4-char base + 2 digits (still <=5)
-    assert.strictEqual(classifyDotnsLabel("abcde").status, ProofOfPersonhoodStatus.Reserved);      // 5-char base, no trailing
-    assert.strictEqual(classifyDotnsLabel("abcde00").status, ProofOfPersonhoodStatus.Reserved);    // 5-char base + 2 digits
+    assert.strictEqual(classifyDotnsLabel("abc", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);        // 3 chars base
+    assert.strictEqual(classifyDotnsLabel("rc4i", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);       // 4-char base
+    assert.strictEqual(classifyDotnsLabel("rc4i00", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);     // 4-char base + 2 digits (still <=5)
+    assert.strictEqual(classifyDotnsLabel("abcde", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);      // 5-char base, no trailing
+    assert.strictEqual(classifyDotnsLabel("abcde00", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);    // 5-char base + 2 digits
   });
 
   test("baselength 6-8 with 2 trailing digits → PopLite", () => {
-    assert.strictEqual(classifyDotnsLabel("rc6path00").status, ProofOfPersonhoodStatus.ProofOfPersonhoodLite); // base 7, td 2
-    assert.strictEqual(classifyDotnsLabel("abcdef00").status, ProofOfPersonhoodStatus.ProofOfPersonhoodLite);  // base 6, td 2
-    assert.strictEqual(classifyDotnsLabel("abcdefgh00").status, ProofOfPersonhoodStatus.ProofOfPersonhoodLite);// base 8, td 2
+    assert.strictEqual(classifyDotnsLabel("rc6path00", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.ProofOfPersonhoodLite); // base 7, td 2
+    assert.strictEqual(classifyDotnsLabel("abcdef00", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.ProofOfPersonhoodLite);  // base 6, td 2
+    assert.strictEqual(classifyDotnsLabel("abcdefgh00", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.ProofOfPersonhoodLite);// base 8, td 2
   });
 
   test("baselength 6-8 with 0 trailing digits → PopFull; 1 trailing digit → Reserved", () => {
-    assert.strictEqual(classifyDotnsLabel("rc6path").status, ProofOfPersonhoodStatus.ProofOfPersonhoodFull);  // base 7, td 0
-    assert.strictEqual(classifyDotnsLabel("rc6path0").status, ProofOfPersonhoodStatus.Reserved);              // base 7, td 1 → Reserved (1 digit invalid)
-    assert.strictEqual(classifyDotnsLabel("rc6path1").status, ProofOfPersonhoodStatus.Reserved);              // base 7, td 1 → Reserved
+    assert.strictEqual(classifyDotnsLabel("rc6path", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.ProofOfPersonhoodFull);  // base 7, td 0
+    assert.strictEqual(classifyDotnsLabel("rc6path0", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);              // base 7, td 1 → Reserved (1 digit invalid)
+    assert.strictEqual(classifyDotnsLabel("rc6path1", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);              // base 7, td 1 → Reserved
   });
 
   test("baselength >= 9 with 2 trailing digits → NoStatus", () => {
-    assert.strictEqual(classifyDotnsLabel("rcsixdirskvc00").status, ProofOfPersonhoodStatus.NoStatus);  // base 12, td 2
-    assert.strictEqual(classifyDotnsLabel("productivity-test-bd-rc6-dir00").status, ProofOfPersonhoodStatus.NoStatus); // base 28, td 2
+    assert.strictEqual(classifyDotnsLabel("rcsixdirskvc00", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.NoStatus);  // base 12, td 2
+    assert.strictEqual(classifyDotnsLabel("productivity-test-bd-rc6-dir00", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.NoStatus); // base 28, td 2
   });
 
   test("baselength >= 9 with 0 trailing digits → NoStatus; 1 trailing digit → Reserved", () => {
-    assert.strictEqual(classifyDotnsLabel("productivity").status, ProofOfPersonhoodStatus.NoStatus);  // base 12, td 0 → NoStatus
-    assert.strictEqual(classifyDotnsLabel("web3summit").status, ProofOfPersonhoodStatus.NoStatus);    // base 10, td 0 → NoStatus
-    assert.strictEqual(classifyDotnsLabel("productivity0").status, ProofOfPersonhoodStatus.Reserved); // base 12, td 1 → Reserved (1 digit invalid)
+    assert.strictEqual(classifyDotnsLabel("productivity", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.NoStatus);  // base 12, td 0 → NoStatus
+    assert.strictEqual(classifyDotnsLabel("web3summit", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.NoStatus);    // base 10, td 0 → NoStatus
+    assert.strictEqual(classifyDotnsLabel("productivity0", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved); // base 12, td 1 → Reserved (1 digit invalid)
   });
 
   test("more than 2 trailing digits → Reserved (maximum 2 digit suffix)", () => {
-    assert.strictEqual(classifyDotnsLabel("rc6path000").status, ProofOfPersonhoodStatus.Reserved);
-    assert.strictEqual(classifyDotnsLabel("rc6path12345").status, ProofOfPersonhoodStatus.Reserved);
+    assert.strictEqual(classifyDotnsLabel("rc6path000", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);
+    assert.strictEqual(classifyDotnsLabel("rc6path12345", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);
   });
 
   // Regression guard for issue #118: the classifier's `.message` is surfaced
@@ -4827,7 +5723,7 @@ describe("classifyDotnsLabel", () => {
   // digit-count refusal message uses) — the factual first half (base length +
   // governance reservation) is unchanged.
   test("short-base message names the base length and offers a concrete, input-derived remediation (regression #118, flipped in #1189)", () => {
-    const r = classifyDotnsLabel("rc4i00"); // base 4, trailing 2 → Reserved
+    const r = classifyDotnsLabel("rc4i00", DEFAULT_TLD, "poprules-startingPrice"); // base 4, trailing 2 → Reserved
     assert.strictEqual(r.status, ProofOfPersonhoodStatus.Reserved);
     assert.match(r.message, /base name/i);
     assert.match(r.message, /4 chars/i); // states the actual base length it computed
@@ -4837,7 +5733,7 @@ describe("classifyDotnsLabel", () => {
   });
 
   test("too-many-trailing-digits message names the 2-digit cap (regression #118)", () => {
-    const r = classifyDotnsLabel("mylabel12345"); // trailing 5 → Reserved
+    const r = classifyDotnsLabel("mylabel12345", DEFAULT_TLD, "poprules-startingPrice"); // trailing 5 → Reserved
     assert.strictEqual(r.status, ProofOfPersonhoodStatus.Reserved);
     assert.match(r.message, /2 trailing digits|at most 2|most 2/i);
   });
@@ -4965,6 +5861,12 @@ describe("DotNS.preflight", () => {
       // register (issue #884). Default to the live paseo-next-v2 value (10 ether)
       // so the fee floor matches the historical bufferedRentNative behaviour.
       if (fn === "startingPrice") return overrides.startingPrice ?? (10n * 10n ** 18n);
+      // Omit the override to leave the read failing, which is the "unknown" case
+      // preflight must treat as not-blocking.
+      if (fn === "shortNamesEnabled") {
+        if (overrides.shortNamesEnabled === undefined) throw new Error("shortNamesEnabled unavailable");
+        return overrides.shortNamesEnabled;
+      }
       throw new Error(`unexpected contractCall in stub: ${fn}`);
     };
     // readFreeBalance → bigint plancks. Default well above any threshold so
@@ -5112,6 +6014,102 @@ describe("DotNS.preflight", () => {
     assert.match(r.reason, /e2efull\.dot requires ProofOfPersonhoodFull/i);
     assert.match(r.reason, /NoStatus-compatible label/i);
     assert.match(r.reason, /github\.com\/paritytech\/dotns/i);
+  });
+
+  // PopRules gates short names twice: the personhood tier, which the classifier
+  // models, and shortNamesEnabled, which ignores personhood entirely.
+  test("preflight blocks a 6-8 base when shortNamesEnabled is off, even for a Full signer", async () => {
+    const d = stubDotns({ userStatus: Full, isTestnet: true, shortNamesEnabled: false });
+
+    const r = await d.preflight("e2efull");
+
+    assert.strictEqual(r.canProceed, false, ">> FAIL: shortNamesEnabled:false must block the 6-8 band; the chain reverts with 'Short names are not for sale'");
+    assert.strictEqual(r.plannedAction, "abort");
+    assert.match(r.reason, /short names are not on sale/i, `>> FAIL: reason must name the closed band; got: ${r.reason}`);
+    assert.doesNotMatch(r.reason, /requires ProofOfPersonhood|get verified|personhood faucet/i,
+      ">> FAIL: a closed band is not a personhood problem, so the reason must not send the reader to get verified when verification cannot unblock them");
+    assert.match(r.reason, /e2efullxx00\.dot/, ">> FAIL: reason should offer a 9+ character alternative the signer can actually register");
+  });
+
+  test("preflight leaves a 9+ base alone when shortNamesEnabled is off", async () => {
+    const d = stubDotns({ userStatus: NoStatus, isTestnet: true, shortNamesEnabled: false, checkOwnership: { owned: false, owner: null } });
+
+    const r = await d.preflight("mainnet-long-label00");
+
+    assert.strictEqual(r.canProceed, true, ">> FAIL: shortNamesEnabled only gates baseLength 6-8; a 9+ base is always open");
+  });
+
+  // A read that never completed must not be reported as "the band is open", and
+  // a decode that is not a boolean must not be reported as "the band is shut".
+  test("shortNamesEnabled rethrows a connection failure instead of degrading to unknown", async () => {
+    const d = stubDotns({ userStatus: Full, isTestnet: true });
+    d.contractCall = async (_c, _a, fn) => {
+      if (fn === "isBaseNameReserved") return [false, "0x" + "0".repeat(40), 0n];
+      if (fn === "startingPrice") return 10n * 10n ** 18n;
+      if (fn === "shortNamesEnabled") throw new Error("WS halt: socket closed");
+      throw new Error(`unexpected ${fn}`);
+    };
+    await assert.rejects(() => d.preflight("e2efull"), /WS halt|socket closed/,
+      ">> FAIL: a read that never completed is not evidence about the flag. isBaseNameReserved rethrows these same patterns; swallowing them here hides the real fault behind a later, unrelated error");
+  });
+
+  test("shortNamesEnabled treats a non-boolean decode as unknown, never as off", async () => {
+    const d = stubDotns({ userStatus: Full, isTestnet: true, shortNamesEnabled: "0x" });
+    const r = await d.preflight("e2efull");
+    assert.strictEqual(r.canProceed, true,
+      ">> FAIL: an unexpected decode shape must not close the band. `value === true` would cache it as false and shut a band that is open");
+  });
+
+  for (const [label, base, blocked] of [["e2efiv", 6, true], ["e2efullx", 8, true], ["e2efullxx", 9, false]]) {
+    test(`shortNamesEnabled band boundary: ${base}-char base is ${blocked ? "blocked" : "allowed"} when the flag is off`, async () => {
+      const d = stubDotns({ userStatus: Full, isTestnet: true, shortNamesEnabled: false });
+      const r = await d.preflight(label);
+      assert.strictEqual(r.canProceed, !blocked,
+        `>> FAIL: baseLength ${base} must be ${blocked ? "inside" : "outside"} the gated band; the contract rule is baseLength >= 9 is always open`);
+    });
+  }
+
+  test("shortNamesEnabled emits its telemetry attribute on every outcome, including unknown", async () => {
+    // Without the "unknown" value a silent read failure is indistinguishable
+    // from an open band in Sentry.
+    const root = { attrs: new Map(), setAttribute(k, v) { this.attrs.set(k, v); } };
+    const seen = [];
+    for (const overrides of [{ shortNamesEnabled: false }, { shortNamesEnabled: true }, {}]) {
+      root.attrs.clear();
+      __setDeployRootSpanForTest(root);
+      try {
+        await stubDotns({ userStatus: Full, isTestnet: true, ...overrides }).preflight("e2efull");
+      } finally {
+        __setDeployRootSpanForTest(null);
+      }
+      seen.push(root.attrs.get("deploy.dotns.short_names_enabled"));
+    }
+    assert.deepStrictEqual(seen, ["false", "true", "unknown"],
+      `>> FAIL: every outcome must land in telemetry; got ${JSON.stringify(seen)}`);
+  });
+
+  test("the shortNamesEnabled seam keeps the personhood branch reachable on a closed band", async () => {
+    // S-REPROVE needs a 6-8 char label to force canRegister(Full, NoStatus) = false,
+    // and the short-names gate runs first. Without the seam it aborts before the
+    // personhood branch; with it pinned open, the branch is reached.
+    const gated = await stubDotns({ userStatus: NoStatus, isTestnet: true, shortNamesEnabled: false }).preflight("e2efull");
+    assert.match(gated.reason, /short names are not on sale/i, ">> FAIL: with the band closed the gate must fire first");
+
+    const d = stubDotns({ userStatus: NoStatus, isTestnet: true, shortNamesEnabled: false });
+    d.__setShortNamesEnabledForTest(true);
+    const r = await d.preflight("e2efull");
+    assert.match(r.reason, /requires ProofOfPersonhoodFull/i,
+      ">> FAIL: the seam must override the chain read so the personhood branch is reachable; this is what S-REPROVE relies on");
+  });
+
+  test("preflight treats an unreadable shortNamesEnabled as unknown, not off", async () => {
+    // No shortNamesEnabled override, so the stub throws: an older deployment
+    // reverts on the accessor and a transient RPC failure looks identical.
+    const d = stubDotns({ userStatus: Full, isTestnet: true });
+
+    const r = await d.preflight("e2efull");
+
+    assert.strictEqual(r.canProceed, true, ">> FAIL: a failed read must not block. Treating it as false would close the band on every chain whose accessor reverts, and on any RPC blip");
   });
 
   test("preflight allows already-owned names without requiring a PoP upgrade", async () => {
@@ -5491,6 +6489,19 @@ describe("DotNS.preflight", () => {
     assert.strictEqual(fmtPas(100_000_000n), "0.0100");
   });
 
+  // bulletin #1221: deploy.ts needs topUpTargetFor + AUTO_MAP_RENT_HEADROOM to
+  // size the first auto-map top-up for a register, so a fresh testnet signer
+  // needs only one top-up (+ finalization wait) instead of two.
+  test("topUpTargetFor and AUTO_MAP_RENT_HEADROOM are exported for deploy.ts's #1221 auto-map sizing", async () => {
+    const dotnsModule = await import("../dist/dotns.js");
+    assert.strictEqual(typeof dotnsModule.topUpTargetFor, "function",
+      ">> FAIL: topUpTargetFor export: deploy.ts needs this to size autoMapTopUpTarget for a register");
+    assert.strictEqual(typeof dotnsModule.AUTO_MAP_RENT_HEADROOM, "bigint",
+      ">> FAIL: AUTO_MAP_RENT_HEADROOM export: must be a bigint constant deploy.ts can pass as rentPriceNative");
+    assert.ok(dotnsModule.AUTO_MAP_RENT_HEADROOM > 0n && dotnsModule.AUTO_MAP_RENT_HEADROOM <= 300_000_000_000n,
+      ">> FAIL: AUTO_MAP_RENT_HEADROOM sanity: expected a headroom in the 0-30 PAS band");
+  });
+
   // -----------------------------------------------------------------
   // submitTransfer: waits for finalization (not just best-block) and
   // honors a per-attempt timeout. The first protects against a re-org
@@ -5711,35 +6722,81 @@ describe("assertSubdomainOwnerMatchesSigner (issue #562)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// formatSubdomainParentError — subdomain parent ownership message (#1185)
+// formatSubdomainParentError — subdomain parent ownership message (#1185, bulletin #1380)
 //
 // Task 7 of the #1185 plan. Today an unregistered reserved parent yields
 // "parent game.dot is owned by no one, not by this signer" — awkward, and
 // silent about the only route forward. When the parent is non-registrable
 // per classifyRegistrability AND unowned, the message must additionally
 // teach the dotns-cli whitelisted-registration route.
+//
+// bulletin #1380 (issue #1062): recurring on a consumer's per-branch preview
+// deploys — the refusal was correct but silent about the remedy for the
+// other two states too. Both the "unregistered, registrable parent" and
+// "owned by another account" branches now name a concrete, verified next
+// step (see the doc comment on formatSubdomainParentError in src/deploy.ts
+// for how each was verified).
 // ---------------------------------------------------------------------------
-describe("formatSubdomainParentError (#1185)", () => {
+describe("formatSubdomainParentError (#1185, bulletin #1380)", () => {
   test("unregistered, non-registrable parent: names it and teaches the dotns-cli route", () => {
-    const m = formatSubdomainParentError("app.game.dot", "game", null, "0xaaa");
+    const m = formatSubdomainParentError("app.game.dot", "game", null, "0xaaa", DEFAULT_TLD, "poprules-startingPrice");
     assert.match(m, /parent game\.dot is not registered/,
       `>> FAIL: formatSubdomainParentError: must say the parent is not registered; got: ${m}`);
     assert.match(m, /dotns register domain -n game --governance/,
       `>> FAIL: formatSubdomainParentError: must give the exact dotns-cli command; got: ${m}`);
   });
 
-  test("owned by another account: still names the owner, does NOT suggest registering", () => {
-    const m = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "0xaaa");
+  test("owned by another account: names the owner AND a transfer remedy that actually works, does NOT suggest registering", () => {
+    const m = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "0xaaa", DEFAULT_TLD, "poprules-startingPrice");
     assert.match(m, /owned by 0xbbb/i, `>> FAIL: formatSubdomainParentError: must name the owner; got: ${m}`);
     assert.doesNotMatch(m, /dotns register domain/,
       `>> FAIL: formatSubdomainParentError: an already-owned parent must NOT suggest registering it; got: ${m}`);
+    // bulletin #1380: must name a concrete next step — the transfer command run
+    // BY the current owner (0xbbb), handing to this signer (0xaaa). runTransfer
+    // (src/commands/transfer.ts) always signs as `opts.mnemonic ??
+    // DEFAULT_MNEMONIC` — never from a session — so a hint without --mnemonic
+    // would connect as Alice's dev key and fail on-chain unless the real owner
+    // happens to be Alice. The command must include it.
+    assert.match(m, /transfer game\.dot --to 0xaaa --mnemonic/,
+      `>> FAIL: formatSubdomainParentError: must give a transfer command that includes --mnemonic — without it, runTransfer signs as DEFAULT_MNEMONIC (Alice) instead of the real owner and the transfer fails on-chain; got: ${m}`);
   });
 
-  test("unregistered, registrable parent: unchanged pre-#1185 message (no dotns-cli line)", () => {
-    const m = formatSubdomainParentError("app.mysitedemo00.dot", "mysitedemo00", null, "0xaaa");
+  test("owned by another account, empty selfAddress: no dangling --to, still refuses", () => {
+    // The deploy.ts call site passes `preflight.evmAddress ?? ""` — guard
+    // against selfAddress being unresolved so the message never renders a
+    // command with a missing --to value.
+    const m = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "", DEFAULT_TLD, "poprules-startingPrice");
+    assert.match(m, /owned by 0xbbb/i, `>> FAIL: formatSubdomainParentError: must still name the owner; got: ${m}`);
+    assert.doesNotMatch(m, /--to\b/, `>> FAIL: formatSubdomainParentError: must not render a --to flag with no address to give it; got: ${m}`);
+  });
+
+  test("unregistered, registrable parent: now names the register-by-deploying remedy (bulletin #1380)", () => {
+    const m = formatSubdomainParentError("app.mysitedemo00.dot", "mysitedemo00", null, "0xaaa", DEFAULT_TLD, "poprules-startingPrice");
     assert.match(m, /parent mysitedemo00\.dot is owned by no one, not by this signer/,
-      `>> FAIL: formatSubdomainParentError: a registrable, unregistered parent must keep the original message; got: ${m}`);
-    assert.doesNotMatch(m, /dotns register domain/, `>> FAIL: formatSubdomainParentError: must not add unnecessary registration advice; got: ${m}`);
+      `>> FAIL: formatSubdomainParentError: a registrable, unregistered parent must keep the original refusal sentence (telemetry's naming.subdomain_orphan classifier keys on it); got: ${m}`);
+    assert.doesNotMatch(m, /dotns register domain/,
+      `>> FAIL: formatSubdomainParentError: a registrable parent is not governance-reserved, must not point at the dotns-cli whitelisted route; got: ${m}`);
+    // This CLI has no register-only command — deploying the parent directly
+    // IS the registration path. Verify the exact command is offered.
+    assert.match(m, /polkadot-app-deploy <build-dir> mysitedemo00\.dot/,
+      `>> FAIL: formatSubdomainParentError: must give the exact register-the-parent command; got: ${m}`);
+  });
+
+  test("tld=paseo: transfer remedy uses the resolved tld, not a hardcoded .dot", () => {
+    const m = formatSubdomainParentError("app.game.paseo", "game", "0xbbb", "0xaaa", "paseo", "poprules-startingPrice");
+    assert.match(m, /parent game\.paseo is owned by 0xbbb/i,
+      `>> FAIL: formatSubdomainParentError tld=paseo: must use .paseo, not .dot; got: ${m}`);
+    assert.match(m, /transfer game\.paseo --to 0xaaa --mnemonic/,
+      `>> FAIL: formatSubdomainParentError tld=paseo: transfer remedy must use .paseo, not .dot; got: ${m}`);
+  });
+
+  test("naming.subdomain_orphan classifier still matches both unregistered and owned-by-other messages (bulletin #1380 must not weaken telemetry)", () => {
+    const unregistered = formatSubdomainParentError("app.mysitedemo00.dot", "mysitedemo00", null, "0xaaa", DEFAULT_TLD, "poprules-startingPrice");
+    const ownedByOther = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "0xaaa", DEFAULT_TLD, "poprules-startingPrice");
+    assert.strictEqual(classifyErrorKind(unregistered), 'naming.subdomain_orphan',
+      `>> FAIL: formatSubdomainParentError: unregistered-parent message must still classify as naming.subdomain_orphan; got kind for: ${unregistered}`);
+    assert.strictEqual(classifyErrorKind(ownedByOther), 'naming.subdomain_orphan',
+      `>> FAIL: formatSubdomainParentError: owned-by-other-parent message must still classify as naming.subdomain_orphan; got kind for: ${ownedByOther}`);
   });
 });
 
@@ -5776,6 +6833,302 @@ describe("NonRetryableError", () => {
   test("non-retryable errors are classified as expected by isExpectedError", () => {
     assert.ok(isExpectedError("Domain test.dot is owned by a different account (0xabc)"));
     assert.ok(isExpectedError("Account 5Grw... is not authorized for Bulletin storage"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DotNS.setContenthashAndTextRecord
+// ---------------------------------------------------------------------------
+describe("DotNS.setContenthashAndTextRecord", () => {
+  test("submits the CID and executable manifest in one atomic batch", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    let contenthashReads = 0;
+    let textReads = 0;
+    d.getContenthash = async () => (contenthashReads++ === 0 ? "0xold" : "0x1234");
+    d.getTextRecord = async () => (textReads++ === 0 ? "old manifest" : "new manifest");
+
+    let submitted;
+    d.submitBatchedContractCalls = async (calls, _status, label, options) => {
+      submitted = { calls, label, options };
+      return { kind: "hash", hash: "0xbatch" };
+    };
+
+    const result = await d.setContenthashAndTextRecord(
+      "app.example",
+      "0x1234",
+      "executable",
+      "new manifest",
+    );
+
+    assert.strictEqual(submitted.calls.length, 2);
+    assert.deepStrictEqual(
+      submitted.calls.map(({ functionName }) => functionName),
+      ["setText", "setContenthash"],
+    );
+    assert.deepStrictEqual(submitted.calls[0].args.slice(1), ["executable", "new manifest"]);
+    assert.strictEqual(submitted.calls[1].args[1], "0x1234");
+    assert.strictEqual(submitted.label, "Utility.batch_all(setContenthash+setText)");
+    assert.strictEqual(await submitted.options.verifyEffect(), true);
+    assert.deepStrictEqual(result, {
+      node: result.node,
+      contenthashSkipped: false,
+      textSkipped: false,
+      txHash: "0xbatch",
+    });
+  });
+
+  test("skips the batch only when both resolver records already match", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.getContenthash = async () => "0x1234";
+    d.getTextRecord = async () => "manifest";
+    d.submitBatchedContractCalls = async () => {
+      assert.fail("unchanged resolver state must not submit a batch");
+    };
+
+    const result = await d.setContenthashAndTextRecord(
+      "app.example",
+      "0x1234",
+      "executable",
+      "manifest",
+    );
+
+    assert.strictEqual(result.contenthashSkipped, true);
+    assert.strictEqual(result.textSkipped, true);
+    assert.strictEqual(result.txHash, "skipped");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1164: DotNS.ensureResolverAndSetTextRecord — the skip/single-write/batch
+// trichotomy, tested via the same instance-stubbing pattern as the sibling
+// DotNS.setContenthashAndTextRecord block above (no live chain needed:
+// contractCallNullable/getTextRecord/ensureContentResolver/setTextRecord/
+// submitBatchedContractCalls are all plain instance methods, stubbable
+// directly).
+// ---------------------------------------------------------------------------
+describe("DotNS.ensureResolverAndSetTextRecord", () => {
+  const RESOLVER = "0xBBBB000000000000000000000000000000BBBB";
+
+  function baseInstance() {
+    const d = new DotNS();
+    d.connected = true;
+    d._contracts = { DOTNS_REGISTRY: "0xAAAA000000000000000000000000000000AAAA", DOTNS_CONTENT_RESOLVER: RESOLVER };
+    return d;
+  }
+
+  test("neither stale: skips entirely, no chain write of any kind", async () => {
+    const d = baseInstance();
+    d.contractCallNullable = async () => RESOLVER;
+    d.getTextRecord = async () => "manifest json";
+    d.ensureContentResolver = async () => assert.fail("resolver already matches — must not write");
+    d.setTextRecord = async () => assert.fail("text already matches — must not write");
+    d.submitBatchedContractCalls = async () => assert.fail("neither field is stale — must not batch");
+
+    const result = await d.ensureResolverAndSetTextRecord("app.example", "manifest", "manifest json");
+    assert.deepStrictEqual(result, { node: result.node, resolverWritten: false, textWritten: false },
+      ">> FAIL: ensureResolverAndSetTextRecord both-unchanged: expected a pure skip, 0 writes");
+  });
+
+  test("only the resolver is stale: delegates to ensureContentResolver, never batches", async () => {
+    const d = baseInstance();
+    d.contractCallNullable = async () => "0xSomeOtherResolver000000000000000000000";
+    d.getTextRecord = async () => "manifest json";
+    let ensureContentResolverCalls = 0;
+    d.ensureContentResolver = async (domainName) => { ensureContentResolverCalls++; assert.strictEqual(domainName, "app.example"); return { changed: true }; };
+    d.setTextRecord = async () => assert.fail("text already matches — must not write");
+    d.submitBatchedContractCalls = async () => assert.fail("only one field is stale — must not batch");
+
+    const result = await d.ensureResolverAndSetTextRecord("app.example", "manifest", "manifest json");
+    assert.strictEqual(ensureContentResolverCalls, 1,
+      ">> FAIL: ensureResolverAndSetTextRecord resolver-only: ensureContentResolver must be called exactly once");
+    assert.deepStrictEqual(result, { node: result.node, resolverWritten: true, textWritten: false },
+      ">> FAIL: ensureResolverAndSetTextRecord resolver-only: expected resolverWritten:true, textWritten:false");
+  });
+
+  test("only the text is stale: delegates to setTextRecord, never batches", async () => {
+    const d = baseInstance();
+    d.contractCallNullable = async () => RESOLVER;
+    d.getTextRecord = async () => "old manifest json";
+    d.ensureContentResolver = async () => assert.fail("resolver already matches — must not write");
+    let setTextRecordCalls = 0;
+    d.setTextRecord = async (domainName, key, value) => {
+      setTextRecordCalls++;
+      assert.strictEqual(domainName, "app.example");
+      assert.strictEqual(key, "manifest");
+      assert.strictEqual(value, "new manifest json");
+      return { value, txHash: "0xtexttx" };
+    };
+    d.submitBatchedContractCalls = async () => assert.fail("only one field is stale — must not batch");
+
+    const result = await d.ensureResolverAndSetTextRecord("app.example", "manifest", "new manifest json");
+    assert.strictEqual(setTextRecordCalls, 1,
+      ">> FAIL: ensureResolverAndSetTextRecord text-only: setTextRecord must be called exactly once");
+    assert.deepStrictEqual(result, { node: result.node, resolverWritten: false, textWritten: true },
+      ">> FAIL: ensureResolverAndSetTextRecord text-only: expected resolverWritten:false, textWritten:true");
+  });
+
+  test("both stale: batches setResolver+setText in ONE Utility.batch_all, in that order", async () => {
+    const d = baseInstance();
+    let resolverReads = 0;
+    d.contractCallNullable = async () => (resolverReads++ === 0 ? "0xSomeOtherResolver000000000000000000000" : RESOLVER);
+    let textReads = 0;
+    d.getTextRecord = async () => (textReads++ === 0 ? "old manifest json" : "new manifest json");
+    d.ensureContentResolver = async () => assert.fail("both fields stale — must batch, not delegate to ensureContentResolver alone");
+    d.setTextRecord = async () => assert.fail("both fields stale — must batch, not delegate to setTextRecord alone");
+    let submitted;
+    d.submitBatchedContractCalls = async (calls, _status, label, options) => {
+      submitted = { calls, label, options };
+      return { kind: "hash", hash: "0xbatch" };
+    };
+
+    const result = await d.ensureResolverAndSetTextRecord("app.example", "manifest", "new manifest json");
+    assert.strictEqual(submitted.calls.length, 2,
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: must submit exactly 2 inner calls");
+    assert.deepStrictEqual(submitted.calls.map(({ functionName }) => functionName), ["setResolver", "setText"],
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: inner call order must be [setResolver, setText]");
+    assert.strictEqual(submitted.calls[0].args[1], RESOLVER,
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: setResolver's target arg must be the content resolver address");
+    assert.strictEqual(submitted.calls[1].args[1], "manifest",
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: setText's key arg must be the text-record key");
+    assert.strictEqual(submitted.calls[1].args[2], "new manifest json",
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: setText's value arg must be the new value");
+    assert.strictEqual(submitted.label, "Utility.batch_all(setResolver+setText[manifest])",
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: unexpected batch label");
+    assert.strictEqual(submitted.options.independentCalls, true,
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: must pass independentCalls: true — setResolver and setText have no on-chain data dependency on each other");
+    assert.strictEqual(await submitted.options.verifyEffect(), true,
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: verifyEffect must re-read both values and confirm the write");
+    assert.deepStrictEqual(result, { node: result.node, resolverWritten: true, textWritten: true },
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: expected resolverWritten:true, textWritten:true");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1164: DotNS.submitBatchedContractCalls — independentCalls opt-in and the
+// multi-dry-run/max-selection it enables. Drives the private method directly
+// with a fake clientWrapper and captures what actually gets passed to
+// client.tx.Revive.call — the literal args the submitted extrinsic is built
+// from, not an intermediate.
+// ---------------------------------------------------------------------------
+describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#1164)", () => {
+  test("without independentCalls, dry-runs ONLY the head call (default, dependent-calls-safe behavior)", async () => {
+    // #1164 regression guard: registerSubdomain's batch (setSubnodeOwner then
+    // setResolver, both DOTNS_REGISTRY) has a genuine on-chain data dependency —
+    // setResolver's authorization check only passes once setSubnodeOwner has
+    // actually applied. Dry-running setResolver on its own (against
+    // pre-setSubnodeOwner state) reverts with flags=1 data=0x1648fd01 — verified
+    // live against paseo-next-v2 while developing #1164's independentCalls
+    // option. Without `independentCalls: true`, submitBatchedContractCalls MUST
+    // dry-run only the head call, never the second — this pins that default.
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    let estimateCalls = 0;
+    d.clientWrapper = {
+      ensureAccountMapped: async () => {},
+      estimateGasForCall: async () => {
+        estimateCalls++;
+        return { success: true, gasRequired: { referenceTime: 1_000_000_000n, proofSize: 50_000n }, storageDeposit: 0n };
+      },
+      client: {
+        tx: {
+          Revive: { call: () => ({ decodedCall: {} }) },
+          Utility: { batch_all: (args) => ({ signSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }) },
+        },
+      },
+      signAndSubmitWithRetry: async (buildBatch) => { buildBatch(); return { kind: "hash", hash: "0xbatch" }; },
+    };
+
+    const abiOne = [{ type: "function", name: "setSubnodeOwner", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    const abiTwo = [{ type: "function", name: "setResolver", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    await d["submitBatchedContractCalls"](
+      [
+        { contractAddress: "0xAAAA000000000000000000000000000000AAAA", abi: abiOne, functionName: "setSubnodeOwner", args: [] },
+        { contractAddress: "0xBBBB000000000000000000000000000000BBBB", abi: abiTwo, functionName: "setResolver", args: [] },
+      ],
+      () => {},
+      "test batch",
+      // no independentCalls — the default, dependent-calls-safe path.
+    );
+
+    assert.strictEqual(estimateCalls, 1,
+      ">> FAIL: submitBatchedContractCalls default dry-run scope: without independentCalls, exactly ONE call (the head) must be dry-run — dry-running the second call independently would see pre-first-call on-chain state and could revert a call that will actually succeed once batched (registerSubdomain's setResolver dependency, #1164)");
+  });
+
+  // ensureResolverAndSetTextRecord's batched branch is this codebase's first
+  // CROSS-contract batch (a small setResolver head call ahead of a
+  // potentially much larger setText tail call). A head-only dry-run estimate
+  // could under-provision the tail call. This pins the fix: with
+  // independentCalls:true, submitBatchedContractCalls dry-runs EVERY inner
+  // call and declares the component-wise MAX across all of them — proven
+  // here with per-call estimates that deliberately differ (a small head, a
+  // large tail), so a regression back to "head estimate only" would
+  // under-declare and this test would catch it.
+  //
+  // Both weight_limit and storage_deposit_limit are routed through their
+  // respective buffer helpers (weightLimitFor / storageDepositLimitFor,
+  // bulletin #1522/#1491/#1518) applied to the MAX estimate computed here —
+  // so both expected values below are the 20%-buffered max, not the raw one.
+  test("declares the LARGER of two differing per-call estimates, not just the head call's", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    const capturedCalls = [];
+    // storageDeposit values deliberately both exceed computeStorageDepositLimit's
+    // REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT floor (2e12) so the floor can't mask
+    // which estimate actually won the max-selection.
+    const estimates = [
+      { success: true, gasRequired: { referenceTime: 1_000_000_000n, proofSize: 50_000n }, storageDeposit: 2_000_000_000_000n },
+      { success: true, gasRequired: { referenceTime: 9_000_000_000n, proofSize: 900_000n }, storageDeposit: 20_000_000_000_000n },
+    ];
+    let estimateCallIndex = 0;
+    d.clientWrapper = {
+      ensureAccountMapped: async () => {},
+      estimateGasForCall: async () => estimates[estimateCallIndex++],
+      client: {
+        tx: {
+          Revive: {
+            call: (args) => { capturedCalls.push(args); return { decodedCall: { marker: capturedCalls.length } }; },
+          },
+          Utility: {
+            batch_all: (args) => ({ signSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }),
+          },
+        },
+      },
+      signAndSubmitWithRetry: async (buildBatch) => {
+        buildBatch();
+        return { kind: "hash", hash: "0xbatch" };
+      },
+    };
+
+    const abiHead = [{ type: "function", name: "setResolver", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    const abiTail = [{ type: "function", name: "setText", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    await d["submitBatchedContractCalls"](
+      [
+        { contractAddress: "0xAAAA000000000000000000000000000000AAAA", abi: abiHead, functionName: "setResolver", args: [] },
+        { contractAddress: "0xBBBB000000000000000000000000000000BBBB", abi: abiTail, functionName: "setText", args: [] },
+      ],
+      () => {},
+      "test batch",
+      // independentCalls: true — only the caller can assert its inner calls have
+      // no on-chain data dependency on each other (see ensureResolverAndSetTextRecord).
+      { independentCalls: true },
+    );
+
+    assert.strictEqual(estimateCallIndex, 2,
+      ">> FAIL: submitBatchedContractCalls estimate count: every inner call must be dry-run individually, not just the head call");
+    assert.strictEqual(capturedCalls.length, 2,
+      ">> FAIL: submitBatchedContractCalls call count: both inner calls must reach client.tx.Revive.call");
+    for (const call of capturedCalls) {
+      assert.deepStrictEqual(call.weight_limit, { ref_time: (9_000_000_000n * 120n) / 100n, proof_size: (900_000n * 120n) / 100n },
+        ">> FAIL: submitBatchedContractCalls max-estimate weight_limit: must declare the LARGER (tail-call) buffered estimate, not the head call's smaller one — a head-only estimate would under-provision the tail call");
+      assert.strictEqual(call.storage_deposit_limit, (20_000_000_000_000n * 120n) / 100n,
+        ">> FAIL: submitBatchedContractCalls max-estimate storage_deposit_limit: must declare the LARGER (tail-call) buffered storage deposit, not the head call's smaller one");
+    }
   });
 });
 
@@ -6279,7 +7632,6 @@ describe("registerSubdomain verifyEffect", () => {
           },
         },
       },
-      estimateGasForCall: async () => ({ success: true }),
     };
     return d;
   }
@@ -6339,7 +7691,6 @@ describe("registerSubdomain verifyEffect", () => {
           },
         },
       },
-      estimateGasForCall: async () => ({ success: true }),
     };
 
     await d.registerSubdomain("mywallet", "myapp");
@@ -6352,308 +7703,6 @@ describe("registerSubdomain verifyEffect", () => {
       "verifyEffect must return true once checkSubdomainOwnership returns owned:true >> FAIL: registerSubdomain verifyEffect: expected true on ownership confirmed");
     assert.ok(checkCalls >= 1,
       "verifyEffect must call checkSubdomainOwnership at least once >> FAIL: registerSubdomain verifyEffect: checkSubdomainOwnership not called");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 19b-iii. publishLabel/unpublishLabel verifyEffect
-// ---------------------------------------------------------------------------
-describe("publishLabel/unpublishLabel verifyEffect", () => {
-  const PUBLISHER_ADDR = "0xa616254fd98724c7a3d295c98ca393a486096b68";
-
-  function makeDotnsForPublish() {
-    const d = new DotNS();
-    d.connected = true;
-    d.rpc = null;
-    d.substrateAddress = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
-    d.evmAddress = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
-    d.signer = {};
-    d["_contracts"] = { PUBLISHER: PUBLISHER_ADDR };
-    d.clientWrapper = {
-      client: {
-        query: {
-          Timestamp: {
-            Now: { getValue: async () => 1_000_000n },
-          },
-        },
-      },
-    };
-    return d;
-  }
-
-  test("publishLabel passes verifyEffect to contractTransaction", async () => {
-    const d = makeDotnsForPublish();
-
-    const capturedOpts = [];
-    // contractCall: first call is the isPublished pre-check (return false so we
-    // proceed to the tx); subsequent calls are the post-tx read-back (return true).
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      return contractCallCount === 1 ? false : true;
-    };
-    d.contractTransaction = async (_addr, _value, _abi, _fn, _args, _cb, opts) => {
-      capturedOpts.push(opts ?? {});
-      return { kind: "hash", hash: "0xpublishtx" };
-    };
-
-    await d.publishLabel("myappx00");
-
-    assert.strictEqual(capturedOpts.length, 1,
-      "contractTransaction must be called once >> FAIL: publishLabel verifyEffect: contractTransaction not called");
-    assert.strictEqual(typeof capturedOpts[0].verifyEffect, "function",
-      "publishLabel must pass verifyEffect to contractTransaction >> FAIL: publishLabel verifyEffect: verifyEffect not passed — nonce-advance false-positive guard missing");
-  });
-
-  test("publishLabel verifyEffect returns true once isPublished returns true", async () => {
-    const d = makeDotnsForPublish();
-
-    let capturedVerifyEffect = null;
-    // contractCall counter: call 1 = pre-check (false), call 2+ = post-tx read-back (true)
-    // The verifyEffect itself also calls contractCall internally.
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      // pre-check (1st call) → false; everything else → true
-      return contractCallCount === 1 ? false : true;
-    };
-    d.contractTransaction = async (_addr, _value, _abi, _fn, _args, _cb, opts) => {
-      capturedVerifyEffect = opts?.verifyEffect ?? null;
-      return { kind: "hash", hash: "0xpublishtx2" };
-    };
-
-    // Wire up clientWrapper so verifyEffect chain-time polling works
-    let tsCall = 0;
-    d.clientWrapper = {
-      client: {
-        query: {
-          Timestamp: {
-            Now: {
-              getValue: async () => {
-                tsCall++;
-                return tsCall === 1 ? 1_000_000n : 1_005_000n;
-              },
-            },
-          },
-        },
-      },
-    };
-
-    await d.publishLabel("myappx00");
-
-    assert.ok(capturedVerifyEffect !== null,
-      "verifyEffect closure must be captured >> FAIL: publishLabel verifyEffect: closure not captured");
-
-    // Reset tsCall so the verifyEffect invocation gets a fresh timeline
-    tsCall = 0;
-    const result = await capturedVerifyEffect();
-    assert.strictEqual(result, true,
-      "verifyEffect must return true once isPublished returns true >> FAIL: publishLabel verifyEffect: expected true when publish confirmed on-chain");
-  });
-
-  test("publishLabel verifyEffect returns false when clientWrapper is null (teardown guard)", async () => {
-    const d = makeDotnsForPublish();
-
-    let capturedVerifyEffect = null;
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      return contractCallCount === 1 ? false : true;
-    };
-    d.contractTransaction = async (_addr, _value, _abi, _fn, _args, _cb, opts) => {
-      capturedVerifyEffect = opts?.verifyEffect ?? null;
-      return { kind: "hash", hash: "0xpublishteardown" };
-    };
-
-    await d.publishLabel("myappx00");
-
-    // Simulate session torn down before verifyEffect is invoked
-    d.connected = false;
-    d.clientWrapper = null;
-
-    assert.ok(capturedVerifyEffect !== null,
-      "verifyEffect must be captured >> FAIL: publishLabel verifyEffect: closure not captured");
-    const result = await capturedVerifyEffect();
-    assert.strictEqual(result, false,
-      "verifyEffect must return false when session is torn down >> FAIL: publishLabel verifyEffect: teardown guard missing — crash risk on disconnect");
-  });
-
-  test("unpublishLabel passes verifyEffect to contractTransaction", async () => {
-    const d = makeDotnsForPublish();
-
-    const capturedOpts = [];
-    // contractCall: call 1 = isPublished pre-check (return true so we proceed);
-    // call 2+ = post-tx read-back (return false = successfully unpublished).
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      return contractCallCount === 1 ? true : false;
-    };
-    d.contractTransaction = async (_addr, _value, _abi, _fn, _args, _cb, opts) => {
-      capturedOpts.push(opts ?? {});
-      return { kind: "hash", hash: "0xunpublishtx" };
-    };
-
-    await d.unpublishLabel("myappx00");
-
-    assert.strictEqual(capturedOpts.length, 1,
-      "contractTransaction must be called once >> FAIL: unpublishLabel verifyEffect: contractTransaction not called");
-    assert.strictEqual(typeof capturedOpts[0].verifyEffect, "function",
-      "unpublishLabel must pass verifyEffect to contractTransaction >> FAIL: unpublishLabel verifyEffect: verifyEffect not passed — nonce-advance false-positive guard missing");
-  });
-
-  test("unpublishLabel verifyEffect returns true once isPublished returns false", async () => {
-    const d = makeDotnsForPublish();
-
-    let capturedVerifyEffect = null;
-    // contractCall counter: call 1 = pre-check (true), call 2+ → false (removed)
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      return contractCallCount === 1 ? true : false;
-    };
-    d.contractTransaction = async (_addr, _value, _abi, _fn, _args, _cb, opts) => {
-      capturedVerifyEffect = opts?.verifyEffect ?? null;
-      return { kind: "hash", hash: "0xunpublishtx2" };
-    };
-
-    let tsCall = 0;
-    d.clientWrapper = {
-      client: {
-        query: {
-          Timestamp: {
-            Now: {
-              getValue: async () => {
-                tsCall++;
-                return tsCall === 1 ? 1_000_000n : 1_005_000n;
-              },
-            },
-          },
-        },
-      },
-    };
-
-    await d.unpublishLabel("myappx00");
-
-    assert.ok(capturedVerifyEffect !== null,
-      "verifyEffect closure must be captured >> FAIL: unpublishLabel verifyEffect: closure not captured");
-
-    tsCall = 0;
-    const result = await capturedVerifyEffect();
-    assert.strictEqual(result, true,
-      "verifyEffect must return true once isPublished returns false >> FAIL: unpublishLabel verifyEffect: expected true when unpublish confirmed on-chain");
-  });
-
-  test("unpublishLabel verifyEffect returns false when clientWrapper is null (teardown guard)", async () => {
-    const d = makeDotnsForPublish();
-
-    let capturedVerifyEffect = null;
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      return contractCallCount === 1 ? true : false;
-    };
-    d.contractTransaction = async (_addr, _value, _abi, _fn, _args, _cb, opts) => {
-      capturedVerifyEffect = opts?.verifyEffect ?? null;
-      return { kind: "hash", hash: "0xunpublishteardown" };
-    };
-
-    await d.unpublishLabel("myappx00");
-
-    d.connected = false;
-    d.clientWrapper = null;
-
-    assert.ok(capturedVerifyEffect !== null,
-      "verifyEffect must be captured >> FAIL: unpublishLabel verifyEffect: closure not captured");
-    const result = await capturedVerifyEffect();
-    assert.strictEqual(result, false,
-      "verifyEffect must return false when session is torn down >> FAIL: unpublishLabel verifyEffect: teardown guard missing — crash risk on disconnect");
-  });
-
-  test("publishLabel throws when post-tx read-back shows still-unpublished (nonce-advance phantom-success)", async () => {
-    const d = makeDotnsForPublish();
-    // contractCall: call 1 = pre-check (false → proceed to tx); call 2 = post-tx
-    // read-back (false → the publish tx silently did NOT land). The stubbed
-    // contractTransaction resolves without invoking verifyEffect, modelling a
-    // nonce-advance resolution that never actually mutated the registry.
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      return false;
-    };
-    d.contractTransaction = async () => ({ kind: "nonce-advanced" });
-
-    await assert.rejects(
-      () => d.publishLabel("myappx00"),
-      /Post-publish verification failed/,
-      ">> FAIL: publishLabel read-back: phantom-success not caught — must throw when isPublished is still false after the publish tx",
-    );
-    assert.ok(contractCallCount >= 2,
-      "post-tx read-back must run after the tx >> FAIL: publishLabel read-back: isPublished not re-read after contractTransaction");
-  });
-
-  test("unpublishLabel throws when post-tx read-back shows still-published (nonce-advance phantom-success)", async () => {
-    const d = makeDotnsForPublish();
-    // contractCall: call 1 = pre-check (true → currently published, proceed to tx);
-    // call 2 = post-tx read-back (true → the unpublish tx silently did NOT land).
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      return true;
-    };
-    d.contractTransaction = async () => ({ kind: "nonce-advanced" });
-
-    await assert.rejects(
-      () => d.unpublishLabel("myappx00"),
-      /Post-unpublish verification failed/,
-      ">> FAIL: unpublishLabel read-back: phantom-success not caught — must throw when isPublished is still true after the unpublish tx",
-    );
-    assert.ok(contractCallCount >= 2,
-      "post-tx read-back must run after the tx >> FAIL: unpublishLabel read-back: isPublished not re-read after contractTransaction");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 19c. PUBLISHER_ABI + decodePublisherRevert + PublisherNotSupportedError
-// ---------------------------------------------------------------------------
-describe("Publisher: ABI + revert decoding", () => {
-  test("PUBLISHER_ABI exposes publish/unpublish/isPublished + the 4 errors", () => {
-    const fnNames = PUBLISHER_ABI.filter((e) => e.type === "function").map((e) => e.name).sort();
-    const errNames = PUBLISHER_ABI.filter((e) => e.type === "error").map((e) => e.name).sort();
-    assert.deepStrictEqual(fnNames, ["isPublished", "publish", "unpublish"]);
-    assert.deepStrictEqual(errNames, ["CooldownActive", "EmptyLabel", "NoPersonhood", "NotOwner"]);
-  });
-
-  test("decodePublisherRevert identifies the 4 known errors from raw hex data", () => {
-    const cases = [
-      { errorName: "EmptyLabel", args: [] },
-      { errorName: "NoPersonhood", args: [] },
-      { errorName: "CooldownActive", args: [1700000000n] },
-      { errorName: "NotOwner", args: ["0x35cdb23ff7fc86e8dccd577ca309bfea9c978d20", 42n] },
-    ];
-    for (const c of cases) {
-      const data = encodeErrorResult({ abi: PUBLISHER_ABI, errorName: c.errorName, args: c.args });
-      // Both the raw hex form and the structured-error form must work.
-      assert.strictEqual(decodePublisherRevert(data)?.name, c.errorName);
-      assert.strictEqual(decodePublisherRevert({ revertData: data })?.name, c.errorName);
-    }
-  });
-
-  test("decodePublisherRevert returns null for nullish / empty / unknown inputs", () => {
-    assert.strictEqual(decodePublisherRevert(null), null);
-    assert.strictEqual(decodePublisherRevert(undefined), null);
-    assert.strictEqual(decodePublisherRevert({}), null);
-    assert.strictEqual(decodePublisherRevert("0x"), null);
-    // 0xdeadbeef is not a Publisher error selector.
-    assert.strictEqual(decodePublisherRevert("0xdeadbeef"), null);
-  });
-
-  test("PublisherNotSupportedError carries env name and identifies via instanceof", () => {
-    const e = new PublisherNotSupportedError("paseo-next");
-    assert.ok(e instanceof PublisherNotSupportedError);
-    assert.ok(e instanceof Error);
-    assert.match(e.message, /paseo-next/);
-    assert.match(e.message, /Publisher contract is not configured/);
   });
 });
 
@@ -7657,13 +8706,6 @@ describe("buildCliFlagsSummary", () => {
   test("empty when no flags set", () => {
     assert.strictEqual(buildCliFlagsSummary({}), "");
   });
-
-  test("reports --publish / --unpublish / --fail-on-publish-error presence", () => {
-    const s = buildCliFlagsSummary({ publish: true, unpublish: true, failOnPublishError: true });
-    assert.ok(s.includes("--publish"));
-    assert.ok(s.includes("--unpublish"));
-    assert.ok(s.includes("--fail-on-publish-error"));
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -8034,6 +9076,100 @@ describe("nightly verify_pool_distribution wiring (#516)", () => {
       "nightly-report must include nightly-verify-pool-distribution in needs:",
     );
   });
+
+  test("e2e.yml's failure-signature grep matches both prefixes bin/polkadot-app-deploy prints (port of bulletin #1499)", () => {
+    const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf8");
+    const m = wf.match(/\| grep -aE '([^']+)'/);
+    assert.ok(m, ">> FAIL: e2e.yml signatures: no failure-signature grep found in the report job");
+    const pattern = new RegExp(m[1]);
+    // bin/polkadot-app-deploy prints `Deployment failed${noRetry ? " (not retryable)" : ""}:`,
+    // so a pattern ending at the colon silently drops every non-retryable abort:
+    // funding gates, already-owned domains, config errors.
+    const lines = [
+      "Deployment failed: chunk upload timed out after 180s",
+      "Deployment failed (not retryable): DotNS signer has 178.7007 PAS free; needs 211.1000 PAS for register.",
+    ];
+    for (const line of lines) {
+      assert.match(line, pattern,
+        `>> FAIL: e2e.yml signatures: the report's grep misses "${line}", so the issue body reads "no failure signature found"`);
+    }
+  });
+});
+
+describe("e2e.yml published-version tier (bulletin #1621)", () => {
+  // #1621: the published-version tier ran main HEAD's harness against an older
+  // published dist, so any new export on HEAD redded every leg. The harness must
+  // come from the tag of the version under test; a smoke job reds once if it
+  // cannot load.
+  describe("e2e.yml: harness comes from the tag under test (#1621)", () => {
+    const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf8");
+    const HARNESS_STEP = "Use the test harness from the tag under test (#1621)";
+    const jobNames = [...wf.slice(wf.search(/^jobs:\s*$/m)).matchAll(/^ {2}([\w-]+):\s*$/gm)].map((m) => m[1]);
+    const jobIf = (block) => (block.match(/^ {4}if:[\s\S]*?(?=^ {4}[\w-]+:)/m) ?? [""])[0];
+    // Jobs that run the harness against an installed (published) dist.
+    const installedDistJobs = jobNames.filter((j) =>
+      /ln -sfn? node_modules\/@parity\/polkadot-app-deploy\/dist dist/.test(jobBlock(wf, j)));
+
+    test("build-nightly emits harness-ref=v<version> only for a resolved version, and fails if the tag is missing", () => {
+      const b = jobBlock(wf, "build-nightly");
+      assert.match(b, /harness-ref: \$\{\{ steps\.version\.outputs\.harness-ref \}\}/,
+        ">> FAIL: harness-at-tag: build-nightly must expose harness-ref as a job output");
+      assert.match(b, /if \[ -n "\$V" \]; then\s+HARNESS_REF="v\$V"/,
+        ">> FAIL: harness-at-tag: harness-ref must be keyed off the resolved version $V, not the cron string");
+      assert.match(b, /else\s+HARNESS_REF=""\s+fi/,
+        ">> FAIL: harness-at-tag: the source-build path (empty $V) must leave harness-ref empty");
+      assert.match(b, /git ls-remote --exit-code --tags origin "refs\/tags\/\$HARNESS_REF"/,
+        ">> FAIL: harness-at-tag: build-nightly must verify the tag exists on origin");
+      assert.match(b, /::error::git tag \$HARNESS_REF not found[^\n]*\n\s+exit 1/,
+        ">> FAIL: harness-at-tag: a missing tag must fail build-nightly loudly");
+    });
+
+    test("every harness-on-installed-dist job is the expected one, and each overlays the tag before installing", () => {
+      assert.deepEqual([...installedDistJobs].sort(), [
+        "nightly-harness-smoke", "nightly-pr-coverage", "nightly-s-grandpa-reupload",
+        "nightly-s-mortality", "nightly-s-reserved-invariant", "nightly-s8", "nightly-s9",
+      ].sort(),
+      ">> FAIL: harness-at-tag: the set of jobs symlinking an installed dist changed — a new one must overlay the tag harness (and be added here)");
+      for (const j of installedDistJobs) {
+        const b = jobBlock(wf, j);
+        const at = b.indexOf(`- name: ${HARNESS_STEP}`);
+        assert.ok(at !== -1, `>> FAIL: harness-at-tag: ${j} runs the harness against an installed dist but has no "${HARNESS_STEP}" step`);
+        assert.ok(at < b.indexOf("npm install --no-save"), `>> FAIL: harness-at-tag: ${j} must overlay the tag harness BEFORE npm install (the install reads the tag's package.json)`);
+        const step = b.slice(at, b.indexOf("\n      - name:", at + 1));
+        assert.match(step, /git checkout "\$HARNESS_REF" -- \. ':\(exclude\)\.github'/,
+          `>> FAIL: harness-at-tag: ${j} must check out the tag tree but keep .github (workflow + composite actions) at HEAD`);
+        assert.match(b, /HARNESS_REF: \$\{\{ needs\.build-nightly\.outputs\.harness-ref \}\}/,
+          `>> FAIL: harness-at-tag: ${j} must take its ref from build-nightly's harness-ref`);
+      }
+    });
+
+    test("the smoke job runs the harness with E2E unset and the scenario jobs gate on it without a matrix ref in job-level if:", () => {
+      const smoke = jobBlock(wf, "nightly-harness-smoke");
+      assert.match(smoke, /unset E2E\b[\s\S]*node --test test\/e2e\.test\.js/,
+        ">> FAIL: harness-at-tag: the smoke job must import the harness with E2E unset");
+      assert.match(smoke, /needs\.build-nightly\.outputs\.harness-ref != ''/,
+        ">> FAIL: harness-at-tag: the smoke job must run only on the published-version path");
+      assert.match(smoke, />> FAIL: harness-import smoke:/,
+        ">> FAIL: harness-at-tag: the smoke job must end with a >> FAIL: signature line");
+      for (const j of installedDistJobs.filter((n) => n !== "nightly-harness-smoke")) {
+        const b = jobBlock(wf, j);
+        assert.ok(parseNeedsRefs(b).includes("nightly-harness-smoke"), `>> FAIL: harness-at-tag: ${j} must need nightly-harness-smoke`);
+        assert.match(jobIf(b), /contains\(fromJSON\('\["success","skipped"\]'\), needs\.nightly-harness-smoke\.result\)/,
+          `>> FAIL: harness-at-tag: ${j} must skip when the smoke job failed (always() would otherwise run it)`);
+      }
+      for (const j of jobNames) {
+        assert.ok(!/\bmatrix\./.test(jobIf(jobBlock(wf, j))), `>> FAIL: harness-at-tag: ${j} references matrix in a job-level if:, which GitHub rejects for the whole workflow`);
+      }
+    });
+
+    test("nightly-report lists the smoke job and classifies it as a non-env row", () => {
+      const r = jobBlock(wf, "nightly-report");
+      assert.ok(parseNeedsRefs(r).includes("nightly-harness-smoke"), ">> FAIL: harness-at-tag: nightly-report must need nightly-harness-smoke");
+      assert.match(r, /NIGHTLY_HARNESS_SMOKE:\s+\$\{\{ needs\.nightly-harness-smoke\.result \}\}/, ">> FAIL: harness-at-tag: report must read the smoke result");
+      assert.match(r, /\| Harness-import smoke[^\n]*\$NIGHTLY_HARNESS_SMOKE/, ">> FAIL: harness-at-tag: report must render a smoke row");
+      assert.match(r, /index\(name,"harness-import smoke"\)>0/, ">> FAIL: harness-at-tag: the smoke job must classify as META, not as an env");
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -8252,6 +9388,27 @@ describe("isAutoReauthorizeAllowed", () => {
     assert.strictEqual(isAutoReauthorizeAllowed(null), false,
       ">> FAIL: isAutoReauthorizeAllowed: null env must not be allowed");
   });
+
+  // bulletin #1362/#1095: a declared-but-unrecognized `network` (missing
+  // field, or a hand-edit typo/case mismatch like "Mainnet") must never be
+  // allowed, even with the flag set. Pins the allowlist (`=== "testnet"`)
+  // over a denylist (`!== "mainnet"`) shape — the denylist would let
+  // anything that wasn't literally "mainnet" through.
+  test("a config typo on network (e.g. \"Mainnet\") is never allowed, even with the flag set", () => {
+    assert.strictEqual(
+      isAutoReauthorizeAllowed({ network: "Mainnet", bulletinAutoAuthorize: true }),
+      false,
+      ">> FAIL: isAutoReauthorizeAllowed: an unrecognized network value must fail CLOSED — a denylist (network !== \"mainnet\") would let this typo through",
+    );
+  });
+
+  test("a resolved env with a missing network field is never allowed, even with the flag set", () => {
+    assert.strictEqual(
+      isAutoReauthorizeAllowed({ bulletinAutoAuthorize: true }),
+      false,
+      ">> FAIL: isAutoReauthorizeAllowed: an env with no network field at all must fail CLOSED, not default-allow",
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -8443,6 +9600,73 @@ describe("remaining quota helpers", () => {
     assert.strictEqual(remainingTransactions(exhausted), 0n,
       ">> FAIL: remainingTransactions: an over-consumed allowance must report 0, never a negative number");
   });
+
+  test("remainingStoreBytes subtracts STORE bytes used, ignoring the renew counter", () => {
+    const auth = {
+      expiration: 10, transactionsAllowance: 10, transactionsUsed: 0,
+      bytesAllowance: 1_000n, bytesUsed: 400n, bytesPermanentUsed: 900n,
+    };
+    assert.strictEqual(remainingStoreBytes(auth), 600n,
+      ">> FAIL: remainingStoreBytes: must report bytesAllowance - bytesUsed (the priority-boost-relevant STORE counter), ignoring bytesPermanentUsed entirely — that's remainingRenewBytes' job");
+  });
+
+  test("remainingStoreBytes clamps at zero instead of reporting a negative budget", () => {
+    const over = {
+      expiration: 10, transactionsAllowance: 10, transactionsUsed: 0,
+      bytesAllowance: 100n, bytesUsed: 250n, bytesPermanentUsed: 0n,
+    };
+    assert.strictEqual(remainingStoreBytes(over), 0n,
+      ">> FAIL: remainingStoreBytes: store bytes can legitimately exceed the allowance (the pallet saturates, never gates) — must report 0, never negative");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// quotaHeadroomDimensions — bulletin #1547: which quota dimension(s) of `auth`
+// fall short of a caller's stated needs. Distinct from isAuthorizationSufficient
+// (expiry-only, unchanged) — this only compares quota, and callers must confirm
+// existence + non-expiry separately first.
+// ---------------------------------------------------------------------------
+describe("quotaHeadroomDimensions (bulletin #1547)", () => {
+  function mkAuth({ txsAllowance = 1000, txsUsed = 0, bytesAllowance = 100_000_000n, bytesUsed = 0n } = {}) {
+    return {
+      expiration: 999_999, transactionsAllowance: txsAllowance, transactionsUsed: txsUsed,
+      bytesAllowance, bytesUsed, bytesPermanentUsed: 0n,
+    };
+  }
+
+  test("fully sufficient auth (plenty of both) reports no exhausted dimensions", () => {
+    const auth = mkAuth();
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth, { transactions: 5, bytes: 1_000n }), [],
+      ">> FAIL: quotaHeadroomDimensions: an account with far more than needed in both dimensions must report empty");
+  });
+
+  test("transactions below needs is flagged, bytes untouched", () => {
+    const auth = mkAuth({ txsAllowance: 10, txsUsed: 9 }); // 1 left
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth, { transactions: 5 }), ["transactions"],
+      ">> FAIL: quotaHeadroomDimensions: 1 remaining tx against a need of 5 must flag 'transactions'");
+  });
+
+  test("bytes below needs is flagged only when needs.bytes is provided", () => {
+    const auth = mkAuth({ bytesAllowance: 1_000n, bytesUsed: 900n }); // 100 left
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth, { transactions: 1, bytes: 500n }), ["bytes"],
+      ">> FAIL: quotaHeadroomDimensions: 100 remaining store bytes against a need of 500 must flag 'bytes'");
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth, { transactions: 1 }), [],
+      ">> FAIL: quotaHeadroomDimensions: omitting needs.bytes must skip the bytes check entirely, not treat it as a need of 0");
+  });
+
+  test("both dimensions below needs are both flagged", () => {
+    const auth = mkAuth({ txsAllowance: 10, txsUsed: 10, bytesAllowance: 1_000n, bytesUsed: 1_000n });
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth, { transactions: 1, bytes: 1n }), ["transactions", "bytes"],
+      ">> FAIL: quotaHeadroomDimensions: an account exhausted on both counters must report both dimensions");
+  });
+
+  test("DEFAULT_AUTHORIZATION_NEEDS is small enough that a fresh 1000tx/100MB grant clears it", () => {
+    const auth = mkAuth();
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth), [],
+      ">> FAIL: DEFAULT_AUTHORIZATION_NEEDS must not falsely flag a freshly-granted, fully-unused authorization");
+    assert.deepStrictEqual(DEFAULT_AUTHORIZATION_NEEDS, { transactions: 1 },
+      ">> FAIL: DEFAULT_AUTHORIZATION_NEEDS must stay a small, documented constant (regression pin — a silent bump here changes every pre-chunking call site's behavior)");
+  });
 });
 
 describe("fetchPoolAuthorizations reads authorization state through the runtime API", () => {
@@ -8510,6 +9734,63 @@ describe("ensureAuthorized quota awareness", () => {
       "should throw mainnet error when auth is expired",
     );
   });
+
+  // bulletin #1547 (check/warn half only): an unexpired-but-quota-low account is a
+  // DIFFERENT, softer condition than missing/expired — the chain never gates `store` on
+  // quota. polkadot-app-deploy never self-authorizes, so unlike bulletin-deploy there is
+  // no testnet top-up branch here at all: every quota-exhausted-but-unexpired account
+  // gets the same result — warn via the return value, never throw, never grant.
+  test("unexpired but quota-exhausted → returns quotaExhausted:true naming the dimension, and does NOT throw", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK + 100, txsAllowance: 10, txsUsed: 10 }); // 0 left, unexpired
+    const api = buildApi({ auth }); // no tx.* stub at all — a grant-path bug would crash on missing tx.*
+    const result = await ensureAuthorized(api, ADDRESS, "test", { needs: { transactions: 5 } });
+    assert.deepStrictEqual(result, { quotaExhausted: true, dimensions: ["transactions"] },
+      ">> FAIL: bulletin #1547: an exhausted, unexpired account must report quotaExhausted:true naming the dimension, and must NOT throw");
+  });
+
+  test("never grants: an api stub with no tx.* at all must not be touched for a quota-exhausted account", async () => {
+    _resetTestnetCacheForTests();
+    // Deliberately no `tx` property anywhere on this stub. If ensureAuthorized ever tried
+    // to sign+submit an authorize_account extrinsic (the bulletin-deploy behavior this
+    // port explicitly excludes), it would throw a TypeError reading api.tx.* — this test
+    // pins that it never reaches for it.
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK + 100, txsAllowance: 1, txsUsed: 1, bytesAllowance: 10n, bytesUsed: 10n });
+    const api = buildApi({ auth });
+    const result = await ensureAuthorized(api, ADDRESS, "test", { needs: { transactions: 5, bytes: 100n } });
+    assert.strictEqual(result.quotaExhausted, true);
+    assert.deepStrictEqual(result.dimensions.sort(), ["bytes", "transactions"],
+      ">> FAIL: bulletin #1547: both dimensions exhausted must both be reported");
+  });
+
+  test("sufficient quota (needs met) → returns quotaExhausted:false", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK + 100, txsAllowance: 1000, txsUsed: 0 });
+    const api = buildApi({ auth });
+    const result = await ensureAuthorized(api, ADDRESS, "test", { needs: { transactions: 500 } });
+    assert.deepStrictEqual(result, { quotaExhausted: false, dimensions: [] },
+      ">> FAIL: bulletin #1547: a fully-sufficient account must report quotaExhausted:false");
+  });
+
+  test("default needs (no opts.needs passed) does not flag a freshly-granted account", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK + 100, txsAllowance: 1000, txsUsed: 0 });
+    const api = buildApi({ auth });
+    const result = await ensureAuthorized(api, ADDRESS, "test"); // no needs at all — exercises DEFAULT_AUTHORIZATION_NEEDS
+    assert.deepStrictEqual(result, { quotaExhausted: false, dimensions: [] });
+  });
+
+  test("precheckedAuth skips the read entirely", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK + 100, txsAllowance: 10, txsUsed: 10 });
+    const api = { ...authApi(async () => { throw new Error("must not read — precheckedAuth was supplied"); }) };
+    const result = await ensureAuthorized(api, ADDRESS, "test", {
+      needs: { transactions: 1 },
+      precheckedAuth: { auth: { expiration: MOCK_BLOCK + 100, transactionsAllowance: 10, transactionsUsed: 10, bytesAllowance: 100n, bytesUsed: 0n, bytesPermanentUsed: 0n }, currentBlock: MOCK_BLOCK },
+    });
+    assert.deepStrictEqual(result, { quotaExhausted: true, dimensions: ["transactions"] },
+      ">> FAIL: bulletin #1547: precheckedAuth must be used directly instead of re-reading via the api");
+  });
 });
 
 
@@ -8561,6 +9842,162 @@ describe("ensureAuthorized throws (does not self-authorize) when the account is 
       /cannot grant it/,
       "should throw mainnet message when auth is expired on mainnet",
     );
+  });
+
+  // bulletin #1362/#1095: opts.network must override a contradictory
+  // spec_name in BOTH directions — this is the acceptance-criteria example
+  // from the issue.
+  test("opts.network:\"mainnet\" overrides a testnet-looking spec_name → mainnet message", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK - 1 });
+    const api = buildApi({ auth, specName: "bulletin-paseo" }); // spec_name says testnet
+    await assert.rejects(
+      () => ensureAuthorized(api, ADDRESS, "test", { network: "mainnet" }), // env says mainnet
+      /cannot grant it/,
+      ">> FAIL: ensureAuthorized: opts.network:\"mainnet\" must win over a testnet-looking spec_name (mainnet message expected)",
+    );
+  });
+
+  test("opts.network:\"testnet\" overrides a mainnet-looking spec_name → testnet message", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK - 1 });
+    const api = buildApi({ auth, specName: "polkadot-bulletin" }); // spec_name says mainnet
+    await assert.rejects(
+      () => ensureAuthorized(api, ADDRESS, "test", { network: "testnet" }), // env says testnet
+      /no longer self-authorizes/,
+      ">> FAIL: ensureAuthorized: opts.network:\"testnet\" must win over a mainnet-looking spec_name (testnet message expected)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bulletin #1362/#1095 port: deploy.ts must thread bulletinNetwork (derived
+// from the resolved env's environments.json `network` field) into every
+// ensureAuthorized call site and into the deploy.is_testnet detectTestnet
+// read, or a config-mistake network never reaches the money-movement gates.
+// ---------------------------------------------------------------------------
+describe("deploy.ts threads bulletinNetwork/envNetwork into every testnet-detection call site (#1362/#1095)", () => {
+  test("deploy.ts normalizes envNetwork = resolved.network ?? \"unknown\" and assigns bulletinNetwork from it", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    assert.ok(/envNetwork\s*=\s*resolved\.network\s*\?\?\s*"unknown"/.test(src),
+      ">> FAIL: #1362/#1095: deploy.ts must normalize envNetwork = resolved.network ?? \"unknown\" once an env was resolved, so a config gap (field missing) fails closed instead of falling through to spec_name");
+    assert.ok(/bulletinNetwork\s*=\s*envNetwork/.test(src),
+      ">> FAIL: #1362/#1095: deploy.ts must assign bulletinNetwork from envNetwork, or the env's declared network never reaches ensureAuthorized/detectTestnet");
+  });
+
+  test("every ensureAuthorized call site in deploy.ts passes network: bulletinNetwork", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    // Window-based (not a single-paren regex): storeChunkedContent's call site
+    // spans multiple lines with nested object literals (needs/precheckedAuth),
+    // so a `[^)]*\)` match would stop at the first inner `)` rather than the
+    // call's real closing paren. Each call site's opts object is well within
+    // 400 chars of its opening paren in practice.
+    const callStarts = [...src.matchAll(/ensureAuthorized\(/g)].map((m) => m.index);
+    assert.ok(callStarts.length > 0, ">> FAIL: #1362/#1095: expected at least one ensureAuthorized call site in deploy.ts");
+    const missing = callStarts
+      .map((i) => src.slice(i, i + 400))
+      .filter((window) => !/network:\s*bulletinNetwork/.test(window));
+    assert.deepStrictEqual(missing, [],
+      `>> FAIL: #1362/#1095: every ensureAuthorized call site must pass network: bulletinNetwork; ${missing.length} of ${callStarts.length} do not. A missed site silently falls back to a live spec_name read instead of the declared env. Offending: ${missing.join(" | ")}`);
+  });
+
+  test("deploy.ts threads envNetwork into the deploy.is_testnet telemetry detectTestnet call", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    assert.ok(/detectTestnet\(provider\.unsafeApi,\s*envNetwork\)/.test(src),
+      ">> FAIL: #1362/#1095: the deploy.is_testnet telemetry read must pass envNetwork into detectTestnet, not rely solely on a live spec_name read");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DotNS.isTestnet() — bulletin #1362/#1095: same network-overrides-spec_name
+// contract as detectTestnet above, but on the instance used by
+// attemptTestnetTopUp's Alice/Bob dev-phrase transfer path.
+// ---------------------------------------------------------------------------
+describe("DotNS.isTestnet() (bulletin #1362/#1095: network field overrides spec_name)", () => {
+  function withSpecName(specName) {
+    return { client: { constants: { System: { Version: async () => ({ spec_name: { asText: () => specName } }) } } } };
+  }
+
+  test("network:\"mainnet\" wins even when spec_name looks like a testnet", async () => {
+    const d = new DotNS();
+    d._network = "mainnet";
+    d.clientWrapper = withSpecName("bulletin-paseo");
+    d.ensureConnected = () => {};
+    assert.strictEqual(
+      await d.isTestnet(),
+      false,
+      ">> FAIL: DotNS.isTestnet: network:\"mainnet\" must never be overridden by a testnet-looking spec_name — attemptTestnetTopUp must never fire on a declared-mainnet env",
+    );
+  });
+
+  test("network:\"testnet\" wins even when spec_name looks like mainnet", async () => {
+    const d = new DotNS();
+    d._network = "testnet";
+    d.clientWrapper = withSpecName("polkadot-bulletin");
+    d.ensureConnected = () => {};
+    assert.strictEqual(await d.isTestnet(), true,
+      ">> FAIL: DotNS.isTestnet: network:\"testnet\" must win over a mainnet-looking spec_name");
+  });
+
+  test("network null (no env context at all) falls back to the spec_name read (unchanged pre-fix behavior)", async () => {
+    const d = new DotNS();
+    d._network = null;
+    d.clientWrapper = withSpecName("bulletin-paseo");
+    d.ensureConnected = () => {};
+    assert.strictEqual(await d.isTestnet(), true,
+      ">> FAIL: DotNS.isTestnet: with no network signal, a testnet-looking spec_name must still resolve true");
+  });
+
+  test("network:\"unknown\" (env resolved, field genuinely absent) fails safe: not-a-testnet, even against a testnet-looking spec_name", () => {
+    // resolveDotnsConnectOptions/deploy.ts normalize a resolved-but-field-less
+    // env to "unknown" before it ever reaches connect() — this is the literal
+    // "field ABSENT" scenario, and it must fail safe (not-a-testnet) rather
+    // than falling through to spec_name.
+    return (async () => {
+      const d = new DotNS();
+      d._network = "unknown";
+      d.clientWrapper = withSpecName("bulletin-paseo");
+      d.ensureConnected = () => {};
+      assert.strictEqual(await d.isTestnet(), false,
+        ">> FAIL: DotNS.isTestnet: a resolved-but-network-less env must fail CLOSED (not-testnet), never fall through to a spec_name guess");
+    })();
+  });
+
+  test("a declared-but-unrecognized network value (e.g. a typo) fails safe: not-a-testnet", async () => {
+    const d = new DotNS();
+    d._network = "Mainnet"; // config typo — must not be treated as "no env context"
+    d.clientWrapper = withSpecName("bulletin-paseo");
+    d.ensureConnected = () => {};
+    assert.strictEqual(await d.isTestnet(), false,
+      ">> FAIL: DotNS.isTestnet: an unrecognized-but-declared network value must fail CLOSED (not-testnet), not silently fall back to spec_name on a config typo");
+  });
+
+  test("an explicit network is never overridden by a stale spec_name-derived instance cache", async () => {
+    const d = new DotNS();
+    // Simulate a stale cache from an earlier env-less isTestnet() call that read a
+    // testnet-looking spec_name before connect() ever supplied a network.
+    d._testnetCache = true;
+    d._network = "mainnet";
+    d.clientWrapper = withSpecName("bulletin-paseo");
+    d.ensureConnected = () => {};
+    assert.strictEqual(
+      await d.isTestnet(),
+      false,
+      ">> FAIL: DotNS.isTestnet: an explicit network:\"mainnet\" must win over a stale _testnetCache=true left by an earlier spec_name-derived read",
+    );
+  });
+
+  // connect() does a live chain probe end-to-end (no injectable transport), so
+  // this pins the wiring by source inspection rather than executing connect().
+  test("connect() assigns options.network onto the instance before any chain call", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf-8");
+    const connectIdx = src.indexOf("async connect(options: DotNSConnectOptions = {}): Promise<this> {");
+    const networkAssignIdx = src.indexOf("this._network = options.network;");
+    assert.ok(connectIdx !== -1, ">> FAIL: DotNS.connect: could not locate the connect() method signature");
+    assert.ok(networkAssignIdx !== -1,
+      ">> FAIL: DotNS.connect: must assign `this._network = options.network` so isTestnet() can read the resolved env's network");
+    assert.ok(connectIdx < networkAssignIdx,
+      ">> FAIL: DotNS.connect: the network assignment must live inside connect(), not elsewhere");
   });
 });
 
@@ -8721,6 +10158,93 @@ describe("isTestnetSpecName", () => {
 });
 
 // ---------------------------------------------------------------------------
+// detectTestnet(api, network) — bulletin #1362/#1095: the environments.json
+// `network` field must be authoritative over the chain's spec_name for
+// money-movement gates (isAutoReauthorizeAllowed, ensureAuthorized's error
+// branch). spec_name stays as the fallback ONLY when no env `network` is
+// available (e.g. a raw library caller pointed at a custom RPC).
+// ---------------------------------------------------------------------------
+describe("detectTestnet (bulletin #1362/#1095: network field overrides spec_name)", () => {
+  function apiWithSpecName(specName) {
+    return { constants: { System: { Version: async () => ({ spec_name: { asText: () => specName } }) } } };
+  }
+
+  test("network:\"mainnet\" wins even when spec_name looks like a testnet", async () => {
+    _resetTestnetCacheForTests();
+    const api = apiWithSpecName("bulletin-paseo");
+    assert.strictEqual(
+      await detectTestnet(api, "mainnet"),
+      false,
+      ">> FAIL: detectTestnet: network:\"mainnet\" must never be overridden by a testnet-looking spec_name — this is the exact lying-mirror scenario #1095 exists to close",
+    );
+  });
+
+  test("network:\"testnet\" wins even when spec_name looks like mainnet", async () => {
+    _resetTestnetCacheForTests();
+    const api = apiWithSpecName("polkadot-bulletin");
+    assert.strictEqual(
+      await detectTestnet(api, "testnet"),
+      true,
+      ">> FAIL: detectTestnet: network:\"testnet\" must win over a mainnet-looking spec_name (declared env context takes priority)",
+    );
+  });
+
+  test("network undefined (no env context at all) falls back to spec_name (unchanged pre-fix behavior)", async () => {
+    _resetTestnetCacheForTests();
+    assert.strictEqual(await detectTestnet(apiWithSpecName("bulletin-paseo"), undefined), true,
+      ">> FAIL: detectTestnet: with no network signal, a testnet-looking spec_name must still resolve true (fallback for env-less callers)");
+    _resetTestnetCacheForTests();
+    assert.strictEqual(await detectTestnet(apiWithSpecName("polkadot-bulletin"), undefined), false,
+      ">> FAIL: detectTestnet: with no network signal, a mainnet-looking spec_name must still resolve false");
+  });
+
+  // An env WAS resolved (e.g. via --env) but its environments.json entry is
+  // missing the `network` field — deploy.ts normalizes this to the
+  // "unknown" sentinel (never leaves it undefined) specifically so it lands
+  // here, not in the spec_name-fallback branch above.
+  test("network:\"unknown\" (env resolved, field genuinely absent) fails safe: not-a-testnet, even against a testnet-looking spec_name", async () => {
+    _resetTestnetCacheForTests();
+    assert.strictEqual(
+      await detectTestnet(apiWithSpecName("bulletin-paseo"), "unknown"),
+      false,
+      ">> FAIL: detectTestnet: a resolved-but-network-less env must fail CLOSED (not-testnet), never fall through to a spec_name guess",
+    );
+  });
+
+  test("a declared-but-unrecognized network value (e.g. a typo) fails safe: not-a-testnet", async () => {
+    _resetTestnetCacheForTests();
+    assert.strictEqual(
+      await detectTestnet(apiWithSpecName("bulletin-paseo"), "Mainnet"),
+      false,
+      ">> FAIL: detectTestnet: an unrecognized-but-declared network value must fail CLOSED (not-testnet), not silently fall back to spec_name on a config typo",
+    );
+  });
+
+  test("an explicit network is never overridden by a stale spec_name-derived cache entry", async () => {
+    _resetTestnetCacheForTests();
+    // First call with NO network populates the module cache from spec_name (testnet-looking → true).
+    assert.strictEqual(await detectTestnet(apiWithSpecName("bulletin-paseo"), undefined), true);
+    // A later call on what is declared network:"mainnet" must still return false — the cache
+    // populated by the env-less call above must not leak into (or be read by) this one.
+    assert.strictEqual(
+      await detectTestnet(apiWithSpecName("bulletin-paseo"), "mainnet"),
+      false,
+      ">> FAIL: detectTestnet: an explicit network:\"mainnet\" call must not inherit a stale testnet verdict cached by an earlier env-less call",
+    );
+  });
+
+  test("unrecognized/absent network + unreadable chain fails safe (not-testnet)", async () => {
+    _resetTestnetCacheForTests();
+    const brokenApi = { constants: { System: { Version: async () => { throw new Error("rpc down"); } } } };
+    assert.strictEqual(
+      await detectTestnet(brokenApi, undefined),
+      false,
+      ">> FAIL: detectTestnet: when the network signal is absent AND the chain read fails, the safe default is not-testnet (fail closed on money-movement gates)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // formatPasBalance — Asset Hub Paseo + Bulletin both use tokenDecimals: 10
 // (verified via system_properties). Pin the divisor so a future change to
 // 1e12 (DOT decimals) can't silently underreport balance 100×.
@@ -8814,6 +10338,31 @@ describe("estimateUploadBytes", () => {
 // MNEMONIC env-var fallback.
 // ---------------------------------------------------------------------------
 describe("resolveDotnsConnectOptions (#209)", () => {
+  // The seam between describeContractSources and the error messages. Each half is
+  // tested on its own; if contractSources stops being forwarded here the map
+  // arrives empty and every error silently reports "built-in default address"
+  // instead of the real origin, which is wrong rather than broken.
+  test("contractSources forwards on both the external-signer and mnemonic branches", () => {
+    const sources = { POP_RULES: "/home/ops/envs.json (environment gamingnet)" };
+    const ext = resolveDotnsConnectOptions(
+      { signer: {}, signerAddress: "5Foo" },
+      undefined, undefined, { POP_RULES: "0x" + "1".repeat(40) }, undefined, "gamingnet", undefined, undefined, undefined, sources,
+    );
+    assert.deepStrictEqual(ext.contractSources, sources,
+      ">> FAIL: the external-signer branch must forward contractSources, or a phone/session deploy loses every address origin");
+    const mnem = resolveDotnsConnectOptions(
+      { mnemonic: "bottom drive obey ..." },
+      undefined, undefined, { POP_RULES: "0x" + "1".repeat(40) }, undefined, "gamingnet", undefined, undefined, undefined, sources,
+    );
+    assert.deepStrictEqual(mnem.contractSources, sources,
+      ">> FAIL: the mnemonic branch must forward contractSources");
+  });
+
+  test("contractSources is omitted when empty, like every other optional tail", () => {
+    const r = resolveDotnsConnectOptions({ mnemonic: "m" }, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {});
+    assert.ok(!("contractSources" in r), ">> FAIL: an empty map must not be sent, so DotNS keeps its own default");
+  });
+
   test("external signer wins; mnemonic + derivationPath are not forwarded", () => {
     const fakeSigner = { kind: "fake-signer" };
     const r = resolveDotnsConnectOptions({
@@ -8873,6 +10422,77 @@ describe("resolveDotnsConnectOptions (#209)", () => {
   test("omits registerStorageDeposit when not provided", () => {
     const r = resolveDotnsConnectOptions({});
     assert.strictEqual(r.registerStorageDeposit, undefined);
+  });
+
+  // bulletin #1362/#1095: the resolved env's `network` field must thread
+  // through to DotNS.connect — appended as the LAST positional param in this
+  // port (rather than inserted before contractSources, as bulletin-deploy
+  // does), so the manifest/publish.ts call site (a separate lane) doesn't
+  // need renumbering.
+  test("passes network when provided", () => {
+    const r = resolveDotnsConnectOptions({}, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "mainnet");
+    assert.strictEqual(r.network, "mainnet",
+      ">> FAIL: resolveDotnsConnectOptions network: explicit network arg must forward verbatim");
+  });
+
+  test("omits network when not provided", () => {
+    const r = resolveDotnsConnectOptions({});
+    assert.strictEqual(r.network, undefined,
+      ">> FAIL: resolveDotnsConnectOptions network: omitted network must stay undefined (DotNS.isTestnet() then falls back to spec_name, not silently defaulting to testnet or mainnet)");
+  });
+
+  test("deploy.ts passes envNetwork into every deploy()-internal resolveDotnsConnectOptions call site (#1362/#1095)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    const calls = src.match(/resolveDotnsConnectOptions\([^;]*?\)(?=[,)])/gs) ?? [];
+    assert.ok(calls.length > 0, ">> FAIL: #1362/#1095: expected at least one resolveDotnsConnectOptions call site in deploy.ts");
+    const missing = calls.filter((c) => !/,\s*envNetwork\)\s*$/.test(c.trim()));
+    assert.deepStrictEqual(missing, [],
+      `>> FAIL: #1362/#1095: every resolveDotnsConnectOptions call site in deploy.ts must end with envNetwork as the last argument, or DotNS.connect() never learns the declared env network and isTestnet() silently falls back to spec_name. Offending: ${missing.join(" | ")}`);
+  });
+
+  // bulletin #1221 Part 2: every deploy()-internal connect must size the
+  // first auto-map top-up via topUpTargetFor(..., envRegisterStorageDeposit,
+  // AUTO_MAP_RENT_HEADROOM), so a fresh signer mid-deploy (including the
+  // owner-path reconnect) needs only one top-up instead of two.
+  test("deploy.ts sizes autoMapTopUpTarget via topUpTargetFor(..., envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM) on every deploy()-internal connect (#1221 Part 2)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    const deployFnStart = src.indexOf("export async function deploy(");
+    assert.ok(deployFnStart !== -1, ">> FAIL: #1221: could not locate deploy() to scope the call-site search");
+    const deployFnSrc = src.slice(deployFnStart);
+    const calls = [...deployFnSrc.matchAll(/resolveDotnsConnectOptions\([^;]*?\)(?=[,)])/gs)];
+    assert.ok(calls.length >= 3,
+      `>> FAIL: #1221: expected at least 3 resolveDotnsConnectOptions call sites inside deploy(), found ${calls.length}`);
+    const missing = calls.filter((m) => {
+      const after = deployFnSrc.slice(m.index + m[0].length, m.index + m[0].length + 400);
+      return !/autoMapTopUpTarget:\s*topUpTargetFor\([^,]+,\s*envRegisterStorageDeposit\s*,\s*AUTO_MAP_RENT_HEADROOM\s*\)/.test(after);
+    }).map((m) => m[0]);
+    assert.deepStrictEqual(missing, [],
+      `>> FAIL: #1221: every deploy()-internal resolveDotnsConnectOptions call must be followed by an autoMapTopUpTarget: topUpTargetFor(<action>, envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM) sibling key, or a fresh signer mid-deploy still does two top-ups. Offending: ${missing.join(" | ")}`);
+  });
+
+  test("deploy.ts uses autoMapPlannedActionFor (not a hardcoded 'register') at every post-preflight connect (#1221)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    const deployFnStart = src.indexOf("export async function deploy(");
+    assert.ok(deployFnStart !== -1, ">> FAIL: #1221: could not locate deploy() to scope the call-site search");
+    const deployFnSrc = src.slice(deployFnStart);
+    const realActionCalls = deployFnSrc.match(/topUpTargetFor\(\s*autoMapPlannedActionFor\(dotnsPreflight\)\s*,\s*envRegisterStorageDeposit\s*,\s*AUTO_MAP_RENT_HEADROOM\s*\)/g) ?? [];
+    assert.strictEqual(realActionCalls.length, 2,
+      `>> FAIL: #1221: expected exactly 2 post-preflight connects (owner-path reconnect + main signer connect) to use autoMapPlannedActionFor(dotnsPreflight), found ${realActionCalls.length}`);
+    const hardcodedRegisterCalls = deployFnSrc.match(/topUpTargetFor\(\s*["']register["']\s*,\s*envRegisterStorageDeposit\s*,\s*AUTO_MAP_RENT_HEADROOM\s*\)/g) ?? [];
+    assert.strictEqual(hardcodedRegisterCalls.length, 1,
+      `>> FAIL: #1221: expected exactly 1 connect (the preflight connect, which runs before plannedAction is known) to use a hardcoded "register", found ${hardcodedRegisterCalls.length}`);
+  });
+
+  test("autoMapPlannedActionFor returns the real plannedAction, falling back to 'register' for null/abort (#1221)", async () => {
+    const { autoMapPlannedActionFor } = await import("../dist/deploy.js");
+    assert.strictEqual(autoMapPlannedActionFor(null), "register",
+      ">> FAIL: autoMapPlannedActionFor null: preflight didn't run — must fall back to the conservative 'register'");
+    assert.strictEqual(autoMapPlannedActionFor({ plannedAction: "abort" }), "register",
+      ">> FAIL: autoMapPlannedActionFor abort: can't reach this in practice, but must still fall back defensively rather than pass 'abort' to topUpTargetFor");
+    assert.strictEqual(autoMapPlannedActionFor({ plannedAction: "already-owned-by-recipient" }), "already-owned-by-recipient",
+      ">> FAIL: autoMapPlannedActionFor owned: must pass through the real action, not override it with 'register'");
+    assert.strictEqual(autoMapPlannedActionFor({ plannedAction: "already-owned-by-us" }), "already-owned-by-us");
+    assert.strictEqual(autoMapPlannedActionFor({ plannedAction: "register" }), "register");
   });
 });
 
@@ -9109,8 +10729,43 @@ describe("parseDomainName", () => {
     assert.throws(() => parseDomainName("sub.ab.dot"), /must be 3-63 chars/);
   });
 
-  test("rejects more than one level of subdomains", () => {
-    assert.throws(() => parseDomainName("a.b.c.dot"), /only one level/);
+  // Replaces the former "rejects more than one level of subdomains" test
+  // (bulletin-deploy #1443): that limit was ours, not the protocol's. The
+  // registry's setSubnodeOwner validates the sub-label and parent path with
+  // DIFFERENT rules — require(subLabel.isSingleLabel()) but
+  // require(parentLabel.isNamePath()) — deliberately: the sub-label must be
+  // single, the parent may be an arbitrarily deep dotted path, resolved
+  // recursively on-chain by _parentNamehash. DotNS's own v0.7.0 README
+  // documents this as intended: "A subname ... can in turn carry subnames,
+  // so the registry is the place the name hierarchy actually lives." The
+  // first label is always the sublabel; every label after it is the parent
+  // path, joined with dots.
+  test("parses a nested (depth-2) subname: first label is the sublabel, the rest join into the parent path", () => {
+    const result = parseDomainName("worker.app.supafaust.dot");
+    assert.deepStrictEqual(result, {
+      isSubdomain: true,
+      label: "worker.app.supafaust",
+      sublabel: "worker",
+      parentLabel: "app.supafaust",
+      fullName: "worker.app.supafaust.dot",
+    });
+  });
+
+  // Subname depth is OBSERVED, not gated (bulletin-deploy #1449, folded into
+  // #1443): parseDomainName accepts any depth — there is no cap and no
+  // override flag. A caller (src/deploy.ts) that wants a heads-up on
+  // unusually deep nesting prints an informational NOTE and records a
+  // telemetry attribute after parsing; the parser itself stays pure and
+  // never refuses on depth grounds.
+  test("parses an arbitrarily deep nested subname (4+ labels before the tld) — no depth cap", () => {
+    const result = parseDomainName("www.blog.staff.example.dot");
+    assert.deepStrictEqual(result, {
+      isSubdomain: true,
+      label: "www.blog.staff.example",
+      sublabel: "www",
+      parentLabel: "blog.staff.example",
+      fullName: "www.blog.staff.example.dot",
+    }, ">> FAIL: subname depth: a 4-label name must parse — there is no depth cap");
   });
 
   test("rejects invalid characters in subdomain", () => {
@@ -9133,7 +10788,7 @@ describe("parseDomainName", () => {
     const input = "tick3t-tb-ui-improvements-v400.dot";
     const result = parseDomainName(input);
     assert.strictEqual(result.fullName, input, `>> FAIL: parseDomainName-relocated: "${input}" must survive parse intact (no rewrite, no refusal) — the property moved to preflight.`);
-    const r = classifyRegistrability(result.label);
+    const r = classifyRegistrability(result.label, "poprules-startingPrice");
     assert.strictEqual(r.registrable, false, `>> FAIL: parseDomainName-relocated: "${input}": classifyRegistrability should still flag it`);
     assert.strictEqual(r.rule, "trailing-digits", `>> FAIL: parseDomainName-relocated: "${input}": expected rule trailing-digits, got ${r.rule}`);
   });
@@ -9146,7 +10801,7 @@ describe("parseDomainName", () => {
     const input = "my-sub00.parent-app999.dot";
     const result = parseDomainName(input);
     assert.strictEqual(result.fullName, input, `>> FAIL: parseDomainName-relocated: "${input}" must survive parse intact.`);
-    const r = classifyRegistrability(result.parentLabel);
+    const r = classifyRegistrability(result.parentLabel, "poprules-startingPrice");
     assert.strictEqual(r.registrable, false, `>> FAIL: parseDomainName-relocated: parent "${result.parentLabel}": classifyRegistrability should flag it`);
     assert.strictEqual(r.rule, "trailing-digits", `>> FAIL: parseDomainName-relocated: parent "${result.parentLabel}": expected rule trailing-digits, got ${r.rule}`);
   });
@@ -9169,7 +10824,7 @@ describe("parseDomainName", () => {
         `>> FAIL: parseDomainName-1185-repro: "${input}" must round-trip to itself exactly.`);
       assert.notStrictEqual(result.fullName, oldRewrittenFullName,
         `>> FAIL: parseDomainName-1185-repro: "${input}" must not resolve to the old silently-rewritten name "${oldRewrittenFullName}".`);
-      assert.strictEqual(classifyRegistrability(result.label).registrable, false,
+      assert.strictEqual(classifyRegistrability(result.label, "poprules-startingPrice").registrable, false,
         `>> FAIL: parseDomainName-1185-repro: "${input}": classifyRegistrability should flag this label as non-registrable`);
     }
   });
@@ -9198,14 +10853,14 @@ describe("parseDomainName", () => {
     const r = parseDomainName("app.staging999.dot");
     assert.strictEqual(r.fullName, "app.staging999.dot",
       ">> FAIL: parseDomainName-no-bleed: parse must succeed unchanged post-#1185.");
-    const parentRegistrability = classifyRegistrability(r.parentLabel);
+    const parentRegistrability = classifyRegistrability(r.parentLabel, "poprules-startingPrice");
     assert.strictEqual(parentRegistrability.registrable, false,
       ">> FAIL: parseDomainName-no-bleed: classifyRegistrability must flag the PARENT (not exempt like the sublabel).");
     assert.strictEqual(parentRegistrability.rule, "trailing-digits",
       `>> FAIL: parseDomainName-no-bleed: expected rule trailing-digits for the parent, got ${parentRegistrability.rule}`);
     // Sanity: a compliant parent alongside the same sublabel shape is registrable.
     const compliant = parseDomainName("app.staging00.dot");
-    assert.strictEqual(classifyRegistrability(compliant.parentLabel).registrable, true,
+    assert.strictEqual(classifyRegistrability(compliant.parentLabel, "poprules-startingPrice").registrable, true,
       ">> FAIL: parseDomainName-no-bleed: a compliant parent (0/2 trailing digits) must be registrable.");
   });
 
@@ -9372,6 +11027,90 @@ const stubSigner = {};
 const STUB_SS58 = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
 const ONE_BYTE_CHUNK = new Uint8Array([0x42]);
 
+// ---------------------------------------------------------------------------
+// storeChunkedContent's quota-exhausted warning (bulletin #1547, check/warn
+// half only). polkadot-app-deploy never self-authorizes Bulletin storage, so
+// unlike bulletin-deploy there is no telemetry/re-grant path here — just a
+// console.warn and a guaranteed non-throw.
+// ---------------------------------------------------------------------------
+describe("storeChunkedContent: quota-exhausted warning (bulletin #1547, check/warn half)", () => {
+  function authStubApi(authFields) {
+    return {
+      query: { System: { Number: { getValue: async () => 1000 } } },
+      ...authApi(async () => runtimeAuth({ expiresAt: 9_999_999, ...authFields }), { can_store: async () => true }),
+      tx: {
+        TransactionStorage: {
+          store_with_cid_config: () => ({
+            signSubmitAndWatch: (_signer, _opts) => normalSubscribable(),
+          }),
+        },
+      },
+    };
+  }
+
+  test("quota-exhausted, unexpired account → warns, does NOT throw", async () => {
+    const savedWarn = console.warn;
+    const warnings = [];
+    console.warn = (...args) => warnings.push(args.join(" "));
+    try {
+      // txsAllowance:1/txsUsed:1 → 0 remaining, unexpired → quota-only exhaustion (transactions).
+      const api = authStubApi({ txsAllowance: 1, txsUsed: 1, bytesAllowance: 100_000_000n, bytesUsed: 0n });
+      await storeChunkedContent([ONE_BYTE_CHUNK], {
+        client: { destroy() {} },
+        unsafeApi: api,
+        signer: stubSigner,
+        ss58: STUB_SS58,
+        fetchNonce: async () => 100,
+      });
+      assert.ok(warnings.some(w => /exhausted/i.test(w)),
+        ">> FAIL: bulletin #1547: a one-line warning naming the exhausted allowance must be printed");
+      assert.ok(!warnings.some(w => /granting|granted|signAndSubmit/i.test(w)),
+        ">> FAIL: bulletin #1547 (check/warn half only): the warning must not claim or perform any re-authorization");
+    } finally {
+      console.warn = savedWarn;
+    }
+  });
+
+  test("sufficient quota → no warning, deploy proceeds silently on the auth front", async () => {
+    const savedWarn = console.warn;
+    const warnings = [];
+    console.warn = (...args) => warnings.push(args.join(" "));
+    try {
+      const api = authStubApi({ txsAllowance: 1000, txsUsed: 0, bytesAllowance: 100_000_000n, bytesUsed: 0n });
+      await storeChunkedContent([ONE_BYTE_CHUNK], {
+        client: { destroy() {} },
+        unsafeApi: api,
+        signer: stubSigner,
+        ss58: STUB_SS58,
+        fetchNonce: async () => 100,
+      });
+      assert.ok(!warnings.some(w => /exhausted/i.test(w)),
+        ">> FAIL: bulletin #1547: a fully-sufficient account must not print an exhausted-quota warning");
+    } finally {
+      console.warn = savedWarn;
+    }
+  });
+});
+
+// probeChunks client for the #1656 chain-evidence fallback: every
+// TransactionByContentHash key is present at the best block (block 500), every
+// other key (cross-validation's Transactions[block] read) is absent. Callers
+// must _resetProbeSession() + _bypassMetadataCheckForTest() first.
+const CONTENT_HASH_KEY_PREFIX = "0x" + Buffer.concat([
+  Buffer.from(Twox128(new TextEncoder().encode("TransactionStorage"))),
+  Buffer.from(Twox128(new TextEncoder().encode("TransactionByContentHash"))),
+]).toString("hex");
+function presentProbeClient() {
+  const present = (() => { const b = Buffer.alloc(8); b.writeUInt32LE(500, 0); b.writeUInt32LE(1, 4); return "0x" + b.toString("hex"); })();
+  return {
+    destroy() {},
+    _request: async (method, params) => {
+      if (method !== "state_queryStorageAt") throw new Error(`stub: ${method}`);
+      return [{ changes: params[0].map((k) => [k, k.startsWith(CONTENT_HASH_KEY_PREFIX) ? present : null]) }];
+    },
+  };
+}
+
 describe("watchTransaction found:false handling", () => {
   test("normal success: reconnect NOT called", async () => {
     let reconnectCalled = false;
@@ -9415,37 +11154,44 @@ describe("watchTransaction found:false handling", () => {
     assert.strictEqual(reconnectCalled, false, "reconnect must NOT be called when waiting events are followed by success");
   });
 
-  // isValid:false + nonce advanced: tx was actually included even though the
-  // pool said invalid (peer disagreement). tryNonceFallback resolves the
-  // chunk; reconnect is NOT called because the WS subscription itself was
-  // healthy — only the tx was a problem.
-  test("isValid:false + nonce advanced: chunk resolves via fallback, no reconnect", async () => {
+  // isValid:false + CID present at best: tx was actually included even though
+  // the pool said invalid (peer disagreement). The best-block probe resolves
+  // the chunk; reconnect is NOT called because the WS subscription itself was
+  // healthy — only the tx was a problem. Pre-#1656 this was decided by the
+  // nonce advancing, which counts the pool's own pending tx: a false positive.
+  test("isValid:false + CID present at best: chunk resolves via the chain fallback, no reconnect", async () => {
+    _resetProbeSession(); _bypassMetadataCheckForTest();
     let reconnectCalled = false;
     const reconnect = async () => {
       reconnectCalled = true;
-      return { client: { destroy() {} }, unsafeApi: makeStubApi(normalSubscribable), signer: stubSigner, ss58: STUB_SS58 };
+      return { client: presentProbeClient(), unsafeApi: makeStubApi(normalSubscribable), signer: stubSigner, ss58: STUB_SS58 };
     };
 
-    let nonceCalls = 0;
-    const fakeFetchNonce = async () => {
-      nonceCalls++;
-      // call 1 = startNonce query; call 2+ = nonce advanced → chunk "included"
-      return nonceCalls === 1 ? 100 : 101;
-    };
+    let txCalls = 0;
+    const api = makeSequencedStubApi(poolRejectSubscribable, normalSubscribable);
+    const origStore = api.tx.TransactionStorage.store_with_cid_config;
+    api.tx.TransactionStorage.store_with_cid_config = (...a) => { txCalls++; return origStore(...a); };
+    const fakeFetchNonce = async () => 100;
 
     await storeChunkedContent([ONE_BYTE_CHUNK], {
-      client: { destroy() {} },
-      unsafeApi: makeSequencedStubApi(poolRejectSubscribable, normalSubscribable),
+      client: presentProbeClient(),
+      unsafeApi: api,
       signer: stubSigner,
       ss58: STUB_SS58,
       reconnect,
       fetchNonce: fakeFetchNonce,
+      skipRootStore: true,
     });
 
     assert.strictEqual(reconnectCalled, false, "reconnect must NOT fire on a tx-level rejection — the WS sub was healthy");
+    assert.strictEqual(txCalls, 1, ">> FAIL: chain fallback: the chunk was found at best, so it must not be resubmitted");
   });
 
-  test("connection error + nonce advanced marks failed chunk stored without retrying it again", async () => {
+  // Pre-#1656 the consumed nonce alone marked chunk 2 stored. Now it only
+  // routes chunk 2 to the post-batch verify loop, which accepts it because the
+  // best-block probe finds it (so still no resubmit).
+  test("connection error + nonce advanced: failed chunk goes to verification and is accepted on a best-block probe, without a resubmit", async () => {
+    _resetProbeSession(); _bypassMetadataCheckForTest();
     let reconnectCalled = false;
     let txCalls = 0;
     const countingApi = () => makeStubApi(() => {
@@ -9455,7 +11201,7 @@ describe("watchTransaction found:false handling", () => {
     });
     const reconnect = async () => {
       reconnectCalled = true;
-      return { client: { destroy() {} }, unsafeApi: countingApi(), signer: stubSigner, ss58: STUB_SS58 };
+      return { client: presentProbeClient(), unsafeApi: countingApi(), signer: stubSigner, ss58: STUB_SS58 };
     };
 
     let nonceCalls = 0;
@@ -9467,7 +11213,7 @@ describe("watchTransaction found:false handling", () => {
     };
 
     await storeChunkedContent([new Uint8Array([0x41]), new Uint8Array([0x42])], {
-      client: { destroy() {} },
+      client: presentProbeClient(),
       unsafeApi: countingApi(),
       signer: stubSigner,
       ss58: STUB_SS58,
@@ -9476,7 +11222,7 @@ describe("watchTransaction found:false handling", () => {
     });
 
     assert.strictEqual(reconnectCalled, true, "connection failure should reconnect once");
-    assert.strictEqual(txCalls, 3, "must submit chunk 1, chunk 2, and root only; chunk 2 must not be retried after nonce fallback stores it");
+    assert.strictEqual(txCalls, 2, "must submit chunk 1 and chunk 2 only (the root is found at best); chunk 2 must not be retried once the verify probe finds it");
   });
 
   test("authorization read reconnects when stale client passes System.Number but account_authorization is disjointed", async () => {
@@ -9508,7 +11254,7 @@ describe("watchTransaction found:false handling", () => {
 // ---------------------------------------------------------------------------
 import { resolveStateDir, stateFilePath, loadRunState, writeRunState, shouldSkipStaleWarning, shouldShowOomHint, probablyOomRssMb } from "../dist/run-state.js";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const BIN_PATH = path.resolve(fileURLToPath(import.meta.url), "../../bin/polkadot-app-deploy");
 
@@ -9906,13 +11652,18 @@ describe("verifyNonceAdvanced source structure (issue #153, AC#1)", () => {
     },
   );
 
-  test("src/deploy.ts: tryNonceFallback uses verifyNonceAdvanced (not bare fetchNonce for verify sites)",
+  // #1656: the Bulletin watcher used verifyNonceAdvanced as its timeout
+  // fallback. system_accountNextIndex counts the deploy's own pending tx, so a
+  // pending chunk read as included. The fallback is now a best-block CID probe;
+  // verifyNonceAdvanced stays for the DotNS path (dotns.ts), which pairs it
+  // with an effect check.
+  test("src/deploy.ts: the Bulletin watcher falls back to a best-block CID probe, never to the pool-aware nonce",
     () => {
       const src = fs.readFileSync("src/deploy.ts", "utf-8");
-      assert.ok(
-        src.includes("verifyNonceAdvanced"),
-        "tryNonceFallback must use verifyNonceAdvanced for cross-RPC nonce verification",
-      );
+      assert.ok(!src.includes("verifyNonceAdvanced"),
+        ">> FAIL: #1656: deploy.ts must not decide Bulletin inclusion with verifyNonceAdvanced (system_accountNextIndex counts pending txs)");
+      assert.match(src, /tryChainFallback/, ">> FAIL: #1656: watchTransaction must keep a chain-evidence fallback");
+      assert.match(src, /cidPresentAtBest\(/, ">> FAIL: #1656: chunk and root watches must probe their CID at the best block");
     },
   );
 
@@ -10087,6 +11838,281 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     return [...pathsMatch[1].matchAll(/^ {6}- (.+)$/gm)].map(match => match[1].trim().replace(/^['"](.*)['"]$/, "$1"));
   }
 
+  // Port of bulletin #1638 (#1622): a lost runner used to file a "nothing to fix" issue
+  // each time. nightly-report classifies its own attempt (shared script) and
+  // DEFERS the issue on a first-attempt SCHEDULED all-runner-loss run.
+  // cattery-scheduler[bot] owns re-running (#1645). e2e-runner-loss-rerun.yml
+  // used to POST rerun-failed-jobs, which double-fired with cattery and filed
+  // spurious issues when refused (#1650). It is now a watchdog that re-runs
+  // nothing and files the deferred issue when no newer attempt appears. This
+  // test used to assert the re-run POST, actions: write and the
+  // steps.rerun.outcome fallback. Those were the bugs, so it now asserts
+  // their absence and the watchdog contract instead.
+  test(".github/workflows: runner-loss issue is deferred on schedule + attempt 1 + all-runner-loss, and the watchdog files it without re-running anything (#1622, #1645, #1650, #1651)", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const report = jobBlock(e2e, "nightly-report");
+    const steps = report.split(/\n(?= {6}- )/);
+    const classifyStep = steps.find((step) => /- name: Classify runner loss$/m.test(step));
+    const deferStep = steps.find((step) => /- name: Defer the failure issue to the runner-loss watchdog$/m.test(step));
+    const openStep = steps.find((step) => /- name: Open failure issue$/m.test(step));
+    assert.ok(classifyStep, ">> FAIL: runner-loss: nightly-report must have a 'Classify runner loss' step");
+    assert.ok(deferStep, ">> FAIL: runner-loss: nightly-report must have the 'Defer the failure issue to the runner-loss watchdog' step the watchdog reads");
+    assert.match(classifyStep, /id: runner-loss/, ">> FAIL: runner-loss: the classify step must expose id runner-loss");
+    assert.match(classifyStep, /node \.github\/scripts\/classify-runner-loss\.cjs/,
+      ">> FAIL: runner-loss: nightly-report must use the shared classifier script, not a re-inlined copy");
+    assert.match(classifyStep, /continue-on-error: true/,
+      ">> FAIL: runner-loss: a classifier failure must never block the failure issue");
+    assert.match(classifyStep, /RUN_ATTEMPT: \$\{\{ github\.run_attempt \}\}/,
+      ">> FAIL: runner-loss: nightly-report must classify its own attempt (#1645)");
+    assert.doesNotMatch(deferStep, /continue-on-error/,
+      ">> FAIL: runner-loss: the defer step must not be continue-on-error, or a failed deferral would read as success to the watchdog");
+    assert.match(deferStep, /id: runner-loss-defer/, ">> FAIL: runner-loss: the defer step must expose id runner-loss-defer");
+
+    // The defer gate must be exactly 'the issue would be filed, but every red leg is a lost runner'.
+    // If it drifted from Open's gate, a night could be neither filed nor deferred.
+    const gate = (step) => (step.match(/^ {8}if: >\n((?: {10}.*\n?)+)/m) ?? [])[1]?.replace(/\s+/g, " ").trim() ?? "";
+    const openGate = gate(openStep);
+    const deferGate = gate(deferStep);
+    assert.match(openGate, /steps\.runner-loss-defer\.outcome != 'success'$/,
+      ">> FAIL: runner-loss: Open failure issue must be skipped only when the defer step succeeded");
+    const shared = openGate
+      .replace(/ && steps\.runner-loss-defer\.outcome != 'success'$/, "")
+      .replace("(github.event_name == 'schedule' || github.event_name == 'release')", "github.event_name == 'schedule' && github.run_attempt == 1");
+    assert.equal(deferGate, `${shared} && steps.runner-loss.outputs.verdict == 'all-runner-loss'`,
+      ">> FAIL: runner-loss: the defer gate must equal Open failure issue's gate restricted to schedule + attempt 1 + all-runner-loss");
+    assert.doesNotMatch(report, /actions\/runs\/[^\s"]*rerun-failed-jobs/,
+      ">> FAIL: runner-loss: nightly-report must not POST rerun-failed-jobs");
+
+    const rr = fs.readFileSync(".github/workflows/e2e-runner-loss-rerun.yml", "utf-8");
+    const rrCode = rr.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+    assert.match(rr, /workflow_run:\s*\n\s*workflows: \["E2E \(Paseo Bulletin\)"\]\s*\n\s*types: \[completed\]/,
+      ">> FAIL: runner-loss: the watchdog must trigger on completion of the E2E workflow");
+    assert.match(rr, /github\.event\.workflow_run\.event == 'schedule'/, ">> FAIL: runner-loss: the watchdog is schedule-only, like the deferral");
+    assert.match(rr, /github\.event\.workflow_run\.conclusion != 'success'/,
+      ">> FAIL: runner-loss: the watchdog must look at every non-green scheduled attempt (a cancelled-only run concludes cancelled)");
+    assert.doesNotMatch(rrCode, /rerun-failed-jobs/, ">> FAIL: runner-loss: the watchdog must not re-run anything (cattery owns re-running, #1645/#1650)");
+    assert.doesNotMatch(rrCode, /actions: write/, ">> FAIL: runner-loss: the watchdog must not hold actions: write");
+    assert.match(rrCode, /actions: read/, ">> FAIL: runner-loss: the watchdog needs actions: read");
+    assert.match(rrCode, /node \.github\/scripts\/runner-loss-watchdog\.cjs/, ">> FAIL: runner-loss: the watchdog must use the shared script");
+    assert.match(rrCode, /RUN_ATTEMPT: \$\{\{ github\.event\.workflow_run\.run_attempt \|\| inputs\.run_attempt \}\}/,
+      ">> FAIL: runner-loss: the watchdog must judge the triggering attempt (#1645)");
+    assert.match(rrCode, /steps\.decide\.outputs\.decision == 'file' \|\| steps\.decide\.outcome == 'failure'/,
+      ">> FAIL: runner-loss: the filing step must also run when the decision step failed (fail closed, #1651)");
+    assert.match(rrCode, /labels: \[\$label\]/, ">> FAIL: runner-loss: the watchdog's issue must carry the night's dedup label (#1650)");
+    assert.match(rr, /dry_run:[\s\S]*?default: true/, ">> FAIL: runner-loss: workflow_dispatch dry_run must default to true");
+  });
+
+  // #1652: the in-run runner-loss verdict must count exactly the jobs
+  // nightly-report waits for. The API exposes job display names, not ids, so
+  // EXCLUDE_JOBS lists the names of every job OUTSIDE needs. This guards that
+  // list against the needs line: a new job outside needs that is missing from
+  // it would be counted (possibly still running), and a needs job that matches
+  // it would be ignored.
+  test(".github/workflows: nightly-report's EXCLUDE_JOBS matches every job outside its needs and none inside (#1652)", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const report = jobBlock(e2e, "nightly-report");
+    const needs = new Set(parseNeedsRefs(report));
+    const raw = (report.match(/^ {10}EXCLUDE_JOBS: (.*)$/m) ?? [])[1];
+    assert.ok(raw, ">> FAIL: #1652: the Classify runner loss step must set EXCLUDE_JOBS");
+    const exclude = new RegExp(raw);
+    const jobsSection = e2e.slice(e2e.match(/^jobs:\s*$/m).index);
+    const ids = [...jobsSection.matchAll(/^ {2}([\w-]+):\s*$/gm)].map((m) => m[1]);
+    assert.ok(ids.length > 20, ">> FAIL: #1652: could not enumerate e2e.yml jobs");
+    for (const id of ids) {
+      if (id === "nightly-report") continue;
+      const name = (jobBlock(e2e, id).match(/^ {4}name: (.*)$/m) ?? [])[1];
+      assert.ok(name, `>> FAIL: #1652: job ${id} has no name:`);
+      // The static part of the name, before any \${{ }} (matrix/outputs).
+      const stem = name.split("${{")[0];
+      if (needs.has(id)) {
+        assert.ok(!exclude.test(stem), `>> FAIL: #1652: job ${id} ("${name}") is in nightly-report needs but EXCLUDE_JOBS matches it, so its red legs would be ignored`);
+      } else {
+        assert.ok(exclude.test(stem) || /E2E Report/.test(stem), `>> FAIL: #1652: job ${id} ("${name}") is outside nightly-report needs but EXCLUDE_JOBS does not match it, so it would be counted while possibly still running`);
+      }
+    }
+  });
+
+  // Port of bulletin #1427/#1392: a registry ECONNRESET during an install
+  // reds a leg before any product code runs. Every npm install/ci step in
+  // this repo's workflows must go through the pinned retry mechanism.
+  // Two accepted shapes here: the local composite action
+  // (.github/actions/npm-retry) for jobs that run in THIS repo's own
+  // checkout, or the pinned nick-fields/retry action directly for
+  // deploy.yml, a reusable workflow consumed by other repos — a local
+  // action reference there resolves against the CALLER's checkout, which
+  // does not have this repo's .github/actions/ directory. Unlike bulletin,
+  // this repo's publish.yml does NOT hold id-token: write (it dispatches to
+  // npm_publish_automation instead of publishing directly), so it uses the
+  // composite action like every other same-repo job rather than a
+  // hand-rolled shell loop.
+  test("workflow npm installs are retried, and the local action is resolvable", () => {
+    const PIN = "nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60";
+    const LOCAL = "./.github/actions/npm-retry";
+    const action = fs.readFileSync(".github/actions/npm-retry/action.yml", "utf8");
+    assert.match(action, new RegExp(`uses: ${PIN}`),
+      ">> FAIL: npm-retry action: must pin the same retry action the workflows pin");
+
+    // Matches the single-line `- run: npm ci` form as well as a block script.
+    const installRe = /(?:^|\n)\s*(?:- run: )?(?:[A-Z_]+=\S+\s+)?(?:cd \S+ && )?npm\s+(?:ci|install|i)\b/;
+    const workflows = fs.readdirSync(".github/workflows").filter((f) => /\.ya?ml$/.test(f));
+    assert.ok(workflows.length >= 4,
+      `>> FAIL: workflow lint: expected to scan several workflows, found ${workflows.length}`);
+    let jobsScanned = 0;
+    for (const name of workflows) {
+      const file = `.github/workflows/${name}`;
+      const wf = fs.readFileSync(file, "utf8");
+      if (file.endsWith("deploy.yml")) continue; // asserted separately below
+      const unretried = wf.split(/\n(?= {6}- )/).filter((step) => {
+        const code = step.replace(/^\s*#.*$/gm, "");
+        return installRe.test(code) && !code.includes(LOCAL);
+      });
+      assert.deepStrictEqual(unretried.map((step) => step.trim().split("\n").slice(0, 2).join(" ")), [],
+        `>> FAIL: ${file}: every npm install step must use ${LOCAL}`);
+
+      // The local action is read from the workspace root, so a job using it must
+      // check this repo out there. Reuses the shared parser (also used by
+      // jobBlock() above and scripts/e2e-ensure-authorized.mjs) rather than a
+      // second hand-rolled job-splitting regex — see workflow-jobs.mjs's own
+      // header on why a second copy of this parser is a drift hazard.
+      const blocks = extractJobBlocks(wf);
+      assert.ok(blocks.size >= 1, `>> FAIL: ${file}: parsed ${blocks.size} jobs, so the checkout check would examine nothing`);
+      for (const [jobName, job] of blocks) {
+        jobsScanned++;
+        const use = job.indexOf(`uses: ${LOCAL}`);
+        if (use === -1) continue;
+        // Whole step blocks, so an `if:` written before `uses:` is seen too.
+        // A checkout puts the action on disk when it lands at the workspace root
+        // (no path:) and is either this repo implicitly or named explicitly.
+        const otherRepo = /^ {8,}repository: (?!paritytech\/polkadot-app-deploy\s*$)/m;
+        const rootCheckout = job.split(/\n(?= {6}- )/).find((step) =>
+          /uses: actions\/checkout@/.test(step)
+          && !/^ {8,}path:/m.test(step)
+          && !otherRepo.test(step)
+          && !/^ {6,8}(?:- )?if:/m.test(step));
+        assert.ok(rootCheckout && job.indexOf(rootCheckout) < use,
+          `>> FAIL: ${file}: job "${jobName}" uses ${LOCAL} without an unconditional checkout of this repo at the workspace root first, so the action cannot resolve`);
+      }
+    }
+    assert.ok(jobsScanned > 20, `>> FAIL: workflow lint: only ${jobsScanned} jobs scanned, the parse is not finding them`);
+
+    // deploy.yml runs in the caller's checkout, where a local action of ours
+    // does not exist and a private-repo reference is unreadable.
+    const deploy = fs.readFileSync(".github/workflows/deploy.yml", "utf8");
+    assert.ok(!deploy.includes(LOCAL),
+      ">> FAIL: deploy.yml: must not reference our local action — it runs in the caller's checkout");
+    const install = deploy.split(/\n(?= {6}- )/).find((step) => /- name: Install polkadot-app-deploy$/m.test(step));
+    assert.ok(install && install.includes(`uses: ${PIN}`),
+      ">> FAIL: deploy.yml: the Install polkadot-app-deploy step must run under the pinned retry action");
+  });
+
+  // #214: a restored actions/setup-node npm cache can already contain a
+  // corrupted tarball (cache HIT, not a fresh-download truncation), so npm
+  // ci fails with EINTEGRITY / "seems to be corrupted" / ENOENT stat'ing its
+  // own _cacache content file. A bare nick-fields/retry attempt re-reads the
+  // same poisoned entry and fails identically. Both the local composite
+  // action and deploy.yml's direct nick-fields/retry usage must clear the
+  // npm cache via on_retry_command — but only when the failed attempt's
+  // output actually looks like corruption, never on an unrelated failure.
+  test("npm-retry clears a corrupted npm cache before retrying, and only then (#214)", () => {
+    const action = fs.readFileSync(".github/actions/npm-retry/action.yml", "utf8");
+    const actionCommand = extractBlockScalar(action, "command");
+    const actionOnRetry = extractBlockScalar(action, "on_retry_command");
+    assert.ok(actionCommand && /pipefail/.test(actionCommand) && /tee "\$\{RUNNER_TEMP\}/.test(actionCommand),
+      ">> FAIL: npm-retry action: command must capture attempt output (pipefail + tee) for on_retry_command to inspect");
+    assert.ok(actionOnRetry && /npm cache clean --force/.test(actionOnRetry),
+      ">> FAIL: npm-retry action: on_retry_command must clean the npm cache on a corrupted-cache signature");
+
+    const deploy = fs.readFileSync(".github/workflows/deploy.yml", "utf8");
+    const install = deploy.split(/\n(?= {6}- )/).find((step) => /- name: Install polkadot-app-deploy$/m.test(step));
+    assert.ok(install, ">> FAIL: deploy.yml: Install polkadot-app-deploy step not found");
+    const deployCommand = extractBlockScalar(install, "command");
+    const deployOnRetry = extractBlockScalar(install, "on_retry_command");
+    assert.ok(deployCommand && /pipefail/.test(deployCommand) && /tee "\$\{RUNNER_TEMP\}/.test(deployCommand),
+      ">> FAIL: deploy.yml: Install polkadot-app-deploy's command must capture output the same way as the local action (#214)");
+    assert.ok(deployOnRetry && /npm cache clean --force/.test(deployOnRetry),
+      ">> FAIL: deploy.yml: Install polkadot-app-deploy's on_retry_command must clean the npm cache the same way as the local action (#214)");
+
+    // Exercise the actual on_retry_command scripts (not a reimplementation of
+    // their logic) against a real corrupted-cache log and a real unrelated-
+    // failure log, proving the grep gate fires only when it should.
+    const CORRUPTION_LOG = [
+      "npm warn tarball tarball data for smoldot@3.3.2.tgz (sha512-Zl4h/0gs...) seems to be corrupted. Trying again.",
+      "npm warn tar zlib: unexpected end of file",
+      "npm error code ENOENT",
+      "npm error syscall stat",
+      "npm error path /home/runner/.npm/_cacache/content-v2/sha512/66/5e/21ff482cc3",
+    ].join("\n");
+    // ENOENT and _cacache land on separate lines in real npm output (as
+    // above), so a naive `ENOENT.*_cacache` grep never matches across a line
+    // break. This scenario omits the "seems to be corrupted" line entirely,
+    // so it only passes if the `_cacache` alternative alone is doing real
+    // work — pinning the exact bug a same-line-anchored pattern would hide.
+    const ENOENT_ONLY_LOG = [
+      "npm error code ENOENT",
+      "npm error syscall stat",
+      "npm error path /home/runner/.npm/_cacache/content-v2/sha512/66/5e/21ff482cc3",
+    ].join("\n");
+    // CORRUPTION_LOG above matches through "seems to be corrupted" (or
+    // _cacache); on its own it can't prove the EINTEGRITY alternative is
+    // still doing anything. This scenario has neither of those and no
+    // _cacache path, so it only passes if EINTEGRITY alone fires the clean.
+    const EINTEGRITY_ONLY_LOG = [
+      "npm error code EINTEGRITY",
+      "npm error integrity checksum failed when using sha512: wanted sha512-abc123 but got sha512-def456",
+    ].join("\n");
+    const UNRELATED_LOG = "npm error code ECONNRESET\nnpm error network request to https://registry... failed";
+
+    // nick-fields/retry's on_retry_command runs via Node's execSync with no
+    // `shell` option (verified against the pinned SHA's dist/index.js), which
+    // defaults to /bin/sh — dash on the Ubuntu runners these workflows use,
+    // NOT bash. A bash function export (`npm() { ...; }; export -f npm`)
+    // only works in bash, so it would validate a script that could silently
+    // break under the real interpreter. Stub npm as an executable on PATH and
+    // run the script through `sh` instead, matching production exactly.
+    function ranCacheClean(onRetryScript, logContents) {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "npm-retry-"));
+      fs.writeFileSync(path.join(tmp, "npm-retry-output.log"), logContents);
+      const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "npm-retry-bin-"));
+      const npmStub = "#!/bin/sh\n"
+        + `if [ "$1" = "cache" ] && [ "$2" = "clean" ]; then echo CLEANED > "${tmp}/cleaned"; exit 0; fi\n`
+        + "exit 0\n";
+      const npmPath = path.join(binDir, "npm");
+      fs.writeFileSync(npmPath, npmStub);
+      fs.chmodSync(npmPath, 0o755);
+      spawnSync("sh", ["-c", onRetryScript], {
+        encoding: "utf8",
+        timeout: 10_000,
+        env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, RUNNER_TEMP: tmp },
+      });
+      return fs.existsSync(path.join(tmp, "cleaned"));
+    }
+
+    for (const [label, onRetryScript] of [["npm-retry action", actionOnRetry], ["deploy.yml Install step", deployOnRetry]]) {
+      assert.ok(ranCacheClean(onRetryScript, CORRUPTION_LOG),
+        `>> FAIL: ${label}: a corrupted-cache signature in the captured log did not trigger npm cache clean --force before the next attempt`);
+      assert.ok(ranCacheClean(onRetryScript, ENOENT_ONLY_LOG),
+        `>> FAIL: ${label}: an ENOENT-under-_cacache log with no "seems to be corrupted" line did not trigger npm cache clean --force (the corruption signature spans multiple lines in real npm output, so a same-line-anchored pattern silently never fires)`);
+      assert.ok(ranCacheClean(onRetryScript, EINTEGRITY_ONLY_LOG),
+        `>> FAIL: ${label}: an EINTEGRITY-only log (no "seems to be corrupted", no _cacache path) did not trigger npm cache clean --force`);
+      assert.ok(!ranCacheClean(onRetryScript, UNRELATED_LOG),
+        `>> FAIL: ${label}: an unrelated failure (ECONNRESET) triggered npm cache clean --force, which should only fire on a corrupted-cache signature`);
+    }
+
+    // Exercise the actual `command` block too: pipefail must propagate a
+    // failure through the tee, or a corrupted npm ci would report success.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "npm-retry-cmd-"));
+    const runInterpolated = actionCommand.replace("${{ inputs.run }}", "npm ci");
+    const failingScript = [
+      `RUNNER_TEMP="${tmp}"`,
+      `npm() { echo "npm error code ENOENT"; return 254; }`,
+      "export -f npm",
+      runInterpolated,
+    ].join("\n");
+    const result = spawnSync("bash", ["-c", failingScript], { encoding: "utf8", timeout: 10_000 });
+    assert.notEqual(result.status, 0,
+      ">> FAIL: npm-retry action: command block reports success even though the piped npm ci failed — pipefail is not propagating the exit code through tee");
+  });
+
   for (const file of [".github/workflows/e2e.yml", ".github/workflows/deploy.yml"]) {
     test(`${file}: every directly-runnable job declares timeout-minutes`, () => {
       const jobs = parseJobs(fs.readFileSync(file, "utf-8"));
@@ -10133,7 +12159,8 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
   // gone, (2) the discriminator job exists and is wired the same skip-safe way
   // as detect-noop-push, (3) every heavy job's `if:` actually references its
   // output, and (4) the discriminator's classification logic itself is
-  // correct — extracted from the live workflow file and executed against
+  // correct — imported from .github/scripts/classify-version-bump.cjs (the
+  // same script the workflows run) and executed against
   // fixtures, not re-implemented as a parallel copy that could drift from
   // what actually ships.
   for (const file of [".github/workflows/e2e.yml"]) {
@@ -10188,44 +12215,49 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     test("chain-call-encoding keeps its E2E=1 live-chain assertion after gating", () => {
       const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
       const block = jobBlock(wf, "chain-call-encoding");
-      assert.match(block, /E2E=1 node --test test\/e2e-chain-calls\.test\.js/,
+      // Allows an optional --test-timeout=<ms> safety net (#1595) between
+      // `--test` and the target file, without tolerating the E2E=1 gate or
+      // the target file itself being weakened or dropped.
+      assert.match(block, /E2E=1 node --test(?: --test-timeout=\d+)? test\/e2e-chain-calls\.test\.js/,
         ">> FAIL: deps-discriminator: chain-call-encoding must still run with E2E=1 — cause: the live-chain assertion step was weakened or dropped while adding the gate");
     });
 
-    // ---- Classification logic: extract the real embedded script from the
-    // live workflow (not a parallel re-implementation) and execute it
-    // against fixture package.json/package-lock.json pairs, so a change to
-    // the actual shipped logic is what gets tested.
-    function extractClassifyScript(wf) {
-      const block = jobBlock(wf, "detect-deps-change");
-      const scriptMatch = block.match(/cat > classify-deps-change\.cjs <<'JSEOF'\n([\s\S]*?)\n\s*JSEOF/);
-      assert.ok(scriptMatch, ">> FAIL: deps-discriminator: could not find the classify-deps-change.cjs heredoc in detect-deps-change — cause: heredoc markers renamed or removed");
-      return scriptMatch[1];
-    }
-
-    function runClassifier({ basePkg, headPkg, baseLock, headLock }) {
+    // #1595 follow-up (port of bulletin PR #1596): the job used to always
+    // default to paseo-next-v2 (PAD_ENV unset), so a dead primary-env
+    // endpoint hung/failed this job even when select-env's probe+fallback
+    // would have routed every other E2E job to a healthy env. Same pattern
+    // as the analogous BULLETIN_DEPLOY_ENV test in bulletin-deploy's test.js.
+    test("chain-call-encoding reads PAD_ENV from select-env, not hardcoded paseo-next-v2", () => {
       const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
-      const script = extractClassifyScript(wf);
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "deps-classify-"));
-      const write = (name, val) => fs.writeFileSync(path.join(dir, name), val === undefined ? "" : JSON.stringify(val));
-      write("base_pkg.json", basePkg);
-      write("head_pkg.json", headPkg);
-      write("base_lock.json", baseLock);
-      write("head_lock.json", headLock);
-      fs.writeFileSync(path.join(dir, "classify-deps-change.cjs"), script);
-      const outputFile = path.join(dir, "github_output");
-      fs.writeFileSync(outputFile, "");
-      execSync("node classify-deps-change.cjs", { cwd: dir, env: { ...process.env, GITHUB_OUTPUT: outputFile } });
-      const outText = fs.readFileSync(outputFile, "utf-8");
-      const outputs = Object.fromEntries(
-        outText.trim().split("\n").filter(Boolean).map((line) => {
-          const idx = line.indexOf("=");
-          return [line.slice(0, idx), line.slice(idx + 1)];
-        }),
+      const block = jobBlock(wf, "chain-call-encoding");
+      const needsLine = block.match(/^\s{4}needs:\s*\[([^\]]*)\]/m);
+      assert.ok(needsLine, "chain-call-encoding must declare a needs: [...] array");
+      const needsRefs = needsLine[1].split(",").map((s) => s.trim());
+      assert.ok(needsRefs.includes("select-env"), "chain-call-encoding must declare select-env as a need");
+      assert.match(
+        block,
+        /needs\.select-env\.result == 'success'/,
+        "chain-call-encoding's if: must gate on needs.select-env.result == 'success'",
       );
-      fs.rmSync(dir, { recursive: true, force: true });
-      return outputs;
-    }
+      assert.match(
+        block,
+        /PAD_ENV:\s*\$\{\{\s*needs\.select-env\.outputs\.selected_env\s*\}\}/,
+        "chain-call-encoding's PAD_ENV must reference needs.select-env.outputs.selected_env",
+      );
+      assert.doesNotMatch(
+        block,
+        /PAD_ENV:\s*paseo-next-v2/,
+        "chain-call-encoding must NOT hardcode PAD_ENV=paseo-next-v2",
+      );
+    });
+
+    // ---- Classification logic: the classifier is no longer an inline
+    // heredoc — it lives in the shared .github/scripts/classify-version-bump.cjs,
+    // which both e2e.yml's detect-deps-change and tests.yml's
+    // classify-version-bump job invoke (see the describe block below for the
+    // wiring assertions). Exercise the actual shipped module directly rather
+    // than re-extracting a heredoc or reimplementing the logic in the test.
+    const { classifyVersionBump } = require("../.github/scripts/classify-version-bump.cjs");
 
     const PKG_V1 = { name: "@parity/polkadot-app-deploy", version: "0.16.0-rc.3", dependencies: { viem: "^2.30.5" } };
     const LOCK_V1 = {
@@ -10238,17 +12270,17 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     test("classifier: version field only (package.json + lockfile) -> is_version_only=true", () => {
       const headPkg = { ...PKG_V1, version: "0.16.0" };
       const headLock = { ...LOCK_V1, version: "0.16.0", packages: { "": { ...LOCK_V1.packages[""], version: "0.16.0" } } };
-      const out = runClassifier({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
-      assert.strictEqual(out.is_version_only, "true",
-        `>> FAIL: deps-classifier: a pure version bump was classified as is_version_only=${out.is_version_only} — cause: version-field stripping did not neutralize the diff`);
+      const result = classifyVersionBump({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
+      assert.strictEqual(result, true,
+        `>> FAIL: deps-classifier: a pure version bump was classified as is_version_only=${result} — cause: version-field stripping did not neutralize the diff`);
     });
 
     test("classifier: dependency version bump (viem ^2.30.5 -> ^2.55.10) -> is_version_only=false", () => {
       const headPkg = { ...PKG_V1, dependencies: { viem: "^2.55.10" } };
       const headLock = { ...LOCK_V1, packages: { "": { ...LOCK_V1.packages[""], dependencies: { viem: "^2.55.10" } } } };
-      const out = runClassifier({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
-      assert.strictEqual(out.is_version_only, "false",
-        `>> FAIL: deps-classifier: a viem dependency bump was classified as is_version_only=${out.is_version_only} — cause: dependency-field diff not detected, this is the exact #190 regression`);
+      const result = classifyVersionBump({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
+      assert.strictEqual(result, false,
+        `>> FAIL: deps-classifier: a viem dependency bump was classified as is_version_only=${result} — cause: dependency-field diff not detected, this is the exact #190 regression`);
     });
 
     test("classifier: mixed version bump + dependency change in the same diff -> is_version_only=false (not safe to skip)", () => {
@@ -10258,9 +12290,9 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
         version: "0.16.0",
         packages: { "": { ...LOCK_V1.packages[""], version: "0.16.0", dependencies: { viem: "^2.55.10" } } },
       };
-      const out = runClassifier({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
-      assert.strictEqual(out.is_version_only, "false",
-        `>> FAIL: deps-classifier: a version bump mixed with a dependency change was classified as is_version_only=${out.is_version_only} — cause: mixed changes must never be treated as safe-to-skip`);
+      const result = classifyVersionBump({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
+      assert.strictEqual(result, false,
+        `>> FAIL: deps-classifier: a version bump mixed with a dependency change was classified as is_version_only=${result} — cause: mixed changes must never be treated as safe-to-skip`);
     });
 
     test("classifier: lockfile-tree-only change (no package.json diff, resolved tree changed) -> is_version_only=false", () => {
@@ -10271,15 +12303,107 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
           "node_modules/viem": { version: "2.30.6", resolved: "https://registry.npmjs.org/viem/-/viem-2.30.6.tgz" },
         },
       };
-      const out = runClassifier({ basePkg: PKG_V1, headPkg: PKG_V1, baseLock: LOCK_V1, headLock });
-      assert.strictEqual(out.is_version_only, "false",
-        `>> FAIL: deps-classifier: a lockfile-tree-only change (package.json untouched) was classified as is_version_only=${out.is_version_only} — cause: classifier only compared package.json, ignoring the lockfile's resolved tree`);
+      const result = classifyVersionBump({ basePkg: PKG_V1, headPkg: PKG_V1, baseLock: LOCK_V1, headLock });
+      assert.strictEqual(result, false,
+        `>> FAIL: deps-classifier: a lockfile-tree-only change (package.json untouched) was classified as is_version_only=${result} — cause: classifier only compared package.json, ignoring the lockfile's resolved tree`);
+    });
+
+    test("classifier: nested lockfile package's own version field changes (node_modules/viem 2.30.5 -> 2.30.6, packages[\"\"] untouched) -> is_version_only=false", () => {
+      // stripVersionFields only deletes .version at the document root and
+      // packages[""].version — a nested package's own .version must never
+      // be stripped, or a real dependency version bump recorded only in the
+      // resolved tree would be silently neutralized the same way the
+      // release version bump is meant to be.
+      const baseLock = {
+        ...LOCK_V1,
+        packages: { "": LOCK_V1.packages[""], "node_modules/viem": { version: "2.30.5" } },
+      };
+      const headLock = {
+        ...LOCK_V1,
+        packages: { "": LOCK_V1.packages[""], "node_modules/viem": { version: "2.30.6" } },
+      };
+      const result = classifyVersionBump({ basePkg: PKG_V1, headPkg: PKG_V1, baseLock, headLock });
+      assert.strictEqual(result, false,
+        `>> FAIL: deps-classifier: a nested lockfile package's own version bump was classified as is_version_only=${result} — cause: version-field stripping must be scoped to the document root + packages[""] only, never a nested package`);
     });
 
     test("classifier: neither file changed (ordinary source PR) -> is_version_only=false, never gates off a normal PR", () => {
-      const out = runClassifier({ basePkg: PKG_V1, headPkg: PKG_V1, baseLock: LOCK_V1, headLock: LOCK_V1 });
-      assert.strictEqual(out.is_version_only, "false",
-        `>> FAIL: deps-classifier: an untouched package.json/lock pair was classified as is_version_only=${out.is_version_only} — cause: "no diff" must not be conflated with "version-only diff", or every ordinary source PR would skip E2E`);
+      const result = classifyVersionBump({ basePkg: PKG_V1, headPkg: PKG_V1, baseLock: LOCK_V1, headLock: LOCK_V1 });
+      assert.strictEqual(result, false,
+        `>> FAIL: deps-classifier: an untouched package.json/lock pair was classified as is_version_only=${result} — cause: "no diff" must not be conflated with "version-only diff", or every ordinary source PR would skip E2E`);
+    });
+  });
+
+  // Unit-Tests-gating follow-up (port of bulletin-deploy's #1307 follow-up):
+  // "Unit Tests" is a required status check here too, and package.json/
+  // package-lock.json were never path-filtered for it (see the "runs on all
+  // paths" test above) — a dependency bump must still run Unit Tests. That
+  // meant every version-only release/RC bump PR paid for a full `npm ci` +
+  // `npm test` too. tests.yml now carries its own classify-version-bump job
+  // — same shape as e2e.yml's detect-deps-change, same shared script — and
+  // unit-tests gates on it the same way the heavy E2E jobs gate on
+  // detect-deps-change. This does NOT reintroduce a paths-ignore (still
+  // absent, still asserted above) — it's a job-level `if:` on a
+  // content-aware classification, which reports 'skipped' rather than
+  // never running, so the required check still resolves.
+  describe("tests.yml: Unit Tests gates on the shared version-bump classifier", () => {
+    test("defines a classify-version-bump job, gated to pull_request/push, exposing is_version_only via the shared script", () => {
+      const wf = fs.readFileSync(".github/workflows/tests.yml", "utf-8");
+      const block = jobBlock(wf, "classify-version-bump");
+      assert.match(block, /if:\s*github\.event_name == 'pull_request' \|\| github\.event_name == 'push'/,
+        ">> FAIL: unit-tests-gating: classify-version-bump must run only on pull_request/push — cause: missing or widened `if:` guard");
+      assert.match(block, /is_version_only:\s*\$\{\{\s*steps\.classify\.outputs\.is_version_only\s*\}\}/,
+        ">> FAIL: unit-tests-gating: classify-version-bump must expose an is_version_only output — cause: outputs: block missing or renamed");
+      assert.match(block, /node \.github\/scripts\/classify-version-bump\.cjs/,
+        ">> FAIL: unit-tests-gating: classify-version-bump must invoke the shared .github/scripts/classify-version-bump.cjs, not a re-inlined copy of the classifier");
+    });
+
+    test("unit-tests needs classify-version-bump and gates via the skipped-or-not-version-only pattern", () => {
+      const wf = fs.readFileSync(".github/workflows/tests.yml", "utf-8");
+      const block = jobBlock(wf, "unit-tests");
+      const needsMatch = block.match(/^\s{4}needs:\s*(?:\[([^\]]*)\]|(\S+))\s*$/m);
+      assert.ok(needsMatch, ">> FAIL: unit-tests-gating: unit-tests has no needs: — cause: needs: line missing or mis-indented");
+      const refs = (needsMatch[1] ?? needsMatch[2]).split(",").map((s) => s.trim());
+      assert.ok(refs.includes("classify-version-bump"),
+        ">> FAIL: unit-tests-gating: unit-tests's needs: does not include classify-version-bump — cause: gate not wired, a version-only bump would still run Unit Tests");
+      assert.match(block, /always\(\)/,
+        ">> FAIL: unit-tests-gating: unit-tests's if: must start with always() — otherwise GitHub auto-skips it whenever classify-version-bump is itself skipped (workflow_dispatch)");
+      assert.match(block, /needs\.classify-version-bump\.result == 'skipped'/,
+        ">> FAIL: unit-tests-gating: unit-tests's if: does not treat a skipped classify-version-bump (workflow_dispatch) as pass-through");
+      assert.match(block, /needs\.classify-version-bump\.outputs\.is_version_only != 'true'/,
+        ">> FAIL: unit-tests-gating: unit-tests's if: does not gate on is_version_only — cause: missing or misspelled output reference, a version-only bump would not be skipped");
+    });
+
+    // Branch protection here requires a status check literally named
+    // "Unit Tests" (same convention as bulletin-deploy). GitHub's own docs
+    // confirm a job skipped via `if:` reports conclusion 'success' for
+    // required-check purposes ("A job that is skipped will report its
+    // status as 'Success'. It will not prevent a pull request from merging,
+    // even if it is a required check." — Actions docs, "Using conditions to
+    // control job execution"), so gating this job's `if:` is safe — but only
+    // as long as the job keeps this exact display name.
+    test("unit-tests keeps its job name exactly \"Unit Tests\" (required status check name)", () => {
+      const wf = fs.readFileSync(".github/workflows/tests.yml", "utf-8");
+      const block = jobBlock(wf, "unit-tests");
+      assert.match(block, /^ {4}name: Unit Tests\s*$/m,
+        ">> FAIL: unit-tests-gating: unit-tests's name: must stay exactly \"Unit Tests\" — renaming it breaks the required-status-check match on branch protection");
+    });
+
+    test("e2e.yml's detect-deps-change still exposes is_version_only via the shared script (not reimplemented separately from tests.yml's copy)", () => {
+      const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+      const block = jobBlock(wf, "detect-deps-change");
+      assert.match(block, /is_version_only:\s*\$\{\{\s*steps\.classify\.outputs\.is_version_only\s*\}\}/,
+        ">> FAIL: unit-tests-gating: e2e.yml's detect-deps-change must still expose is_version_only — cause: output dropped while extracting the shared script");
+      assert.match(block, /node \.github\/scripts\/classify-version-bump\.cjs/,
+        ">> FAIL: unit-tests-gating: e2e.yml's detect-deps-change must invoke the shared .github/scripts/classify-version-bump.cjs");
+    });
+
+    test("the shared classifier script file exists and exports classifyVersionBump", () => {
+      assert.ok(fs.existsSync(".github/scripts/classify-version-bump.cjs"),
+        ">> FAIL: unit-tests-gating: .github/scripts/classify-version-bump.cjs is missing");
+      const mod = require("../.github/scripts/classify-version-bump.cjs");
+      assert.strictEqual(typeof mod.classifyVersionBump, "function",
+        ">> FAIL: unit-tests-gating: .github/scripts/classify-version-bump.cjs must export classifyVersionBump as a function");
     });
   });
 
@@ -10400,8 +12524,8 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     assert.ok(job, "nightly-pr-coverage job must exist");
     assert.match(job, /^ {4}runs-on:\s*ubuntu-latest$/m,
       "nightly-pr-coverage runs on ubuntu-latest");
-    // 15 matrix legs covering 13 distinct scenario names (s1 and s-inc each appear twice).
-    for (const sc of ["s1", "s3", "s7", "s8", "s-inc", "s-inc-roundtrip", "s-inc-portability", "s-inc-asset-rotation", "s-content-only", "s-manifest-env", "s-transfer", "s-transfer-subname"]) {
+    // 17 matrix legs covering 15 distinct scenario names (s1 and s-inc each appear twice).
+    for (const sc of ["s1", "s3", "s7", "s8", "s-inc", "s-inc-roundtrip", "s-inc-portability", "s-inc-asset-rotation", "s-content-only", "s-manifest-env", "s-product-manifest", "s-manifest-pvm", "s-transfer", "s-transfer-subname"]) {
       assert.match(job, new RegExp(`scenario:\\s*${sc.replace(/-/g, "-")}\\b`),
         `nightly-pr-coverage matrix must include scenario ${sc}`);
     }
@@ -10423,8 +12547,8 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     // not here.
     assert.match(
       job,
-      /scenario:\s*s-content-only,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*8\s*}/,
-      "nightly-pr-coverage must wire scenario s-content-only to signer pool, merkle js, poolIndex 8",
+      /scenario:\s*s-content-only,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*13\s*}/,
+      "nightly-pr-coverage must wire scenario s-content-only to signer pool, merkle js, poolIndex 13 (not 8: bulletin #1637)",
     );
 
     // #1094: manifest publish on a non-default env (PAD_ENV is always set
@@ -10433,6 +12557,13 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
       job,
       /scenario:\s*s-manifest-env,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*9\s*}/,
       "nightly-pr-coverage must wire scenario s-manifest-env to signer pool, merkle js, poolIndex 9",
+    );
+
+    // App v2 PolkaVM manifest publish + executable-record read-back.
+    assert.match(
+      job,
+      /scenario:\s*s-manifest-pvm,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*12\s*}/,
+      "nightly-pr-coverage must wire scenario s-manifest-pvm to signer pool, merkle js, poolIndex 12",
     );
 
     // S-TRANSFER existed in test/e2e.test.js and scripts/e2e-pass.sh but had
@@ -10468,6 +12599,97 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
     const report = jobBlock(e2e, "nightly-report");
     assert.match(report, /nightly-pr-coverage/, "nightly-report needs: must include nightly-pr-coverage");
+  });
+
+  // ---- release gate installs the published tarball, not a tag source-build
+  // (issue #270). nightly-pr-coverage used to always self-checkout + `npm ci`
+  // (triggering the prepare/build script) and drive test/e2e.test.js against
+  // the local source-built bin/polkadot-app-deploy — on a release run this
+  // validated the tagged source tree, never the bytes `npm install` actually
+  // gives consumers. Every other nightly scenario job (nightly-s8, nightly-s9,
+  // etc.) already branches on build-nightly's test-version/ref outputs via a
+  // BULLETIN_DEPLOY_REF/BULLETIN_DEPLOY_VERSION job-level env + a source-build
+  // step gated on BULLETIN_DEPLOY_REF != '' vs. an npm-install step gated on
+  // BULLETIN_DEPLOY_REF == ''; this job now follows the exact same convention.
+
+  test(".github/workflows/e2e.yml: nightly-pr-coverage wires BULLETIN_DEPLOY_REF/VERSION from build-nightly outputs", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const job = jobBlock(e2e, "nightly-pr-coverage");
+    assert.ok(job, "nightly-pr-coverage job must exist");
+
+    assert.match(
+      job,
+      /^ {6}BULLETIN_DEPLOY_VERSION:\s*\$\{\{\s*needs\.build-nightly\.outputs\.test-version\s*\}\}/m,
+      "nightly-pr-coverage's job-level env must set BULLETIN_DEPLOY_VERSION from build-nightly's test-version output",
+    );
+    assert.match(
+      job,
+      /^ {6}BULLETIN_DEPLOY_REF:\s*\$\{\{\s*needs\.build-nightly\.outputs\.polkadot-app-deploy-ref\s*\}\}/m,
+      "nightly-pr-coverage's job-level env must set BULLETIN_DEPLOY_REF from build-nightly's polkadot-app-deploy-ref output",
+    );
+
+    // DEPLOY_TAG must also come from build-nightly's resolved output (which is
+    // "e2e-ci-release" on a release run) rather than a hardcoded "nightly"
+    // string that would mislabel deploy spans/telemetry during a release gate.
+    assert.match(
+      job,
+      /^ {6}DEPLOY_TAG:\s*\$\{\{\s*needs\.build-nightly\.outputs\.deploy-tag\s*\}\}/m,
+      "nightly-pr-coverage's job-level env must set DEPLOY_TAG from build-nightly's deploy-tag output, not hardcode e2e-ci-nightly",
+    );
+    assert.doesNotMatch(job, /DEPLOY_TAG:\s*e2e-ci-nightly\b/, "nightly-pr-coverage must not hardcode DEPLOY_TAG=e2e-ci-nightly");
+  });
+
+  test(".github/workflows/e2e.yml: nightly-pr-coverage installs the published RC from npm on release, not a source build", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const job = jobBlock(e2e, "nightly-pr-coverage");
+    assert.ok(job, "nightly-pr-coverage job must exist");
+
+    // The source-build step must now be gated off (skipped on release/pinned
+    // dispatch), matching the convention every sibling nightly-s* job uses.
+    assert.match(
+      job,
+      /- name: Build polkadot-app-deploy from source\s*\n\s*if:\s*env\.BULLETIN_DEPLOY_REF\s*!=\s*''/,
+      "nightly-pr-coverage must gate its source-build step on BULLETIN_DEPLOY_REF != ''",
+    );
+
+    // The install-from-npm step must be gated on the complementary condition,
+    // resolve V from BULLETIN_DEPLOY_VERSION (falling back to latest only for
+    // an unpinned workflow_dispatch — never silently on a release run, since
+    // build-nightly always resolves a concrete version for the release event),
+    // and must not silently no-op.
+    assert.match(
+      job,
+      /- name: Install polkadot-app-deploy from npm\s*\n\s*if:\s*env\.BULLETIN_DEPLOY_REF\s*==\s*''/,
+      "nightly-pr-coverage must gate its npm-install step on BULLETIN_DEPLOY_REF == ''",
+    );
+    assert.match(
+      job,
+      /V="\$\{BULLETIN_DEPLOY_VERSION:-latest\}"/,
+      "nightly-pr-coverage's install step must resolve V from BULLETIN_DEPLOY_VERSION",
+    );
+    assert.match(
+      job,
+      /npm install --no-save "@parity\/polkadot-app-deploy@\$\{V\}" ws/,
+      "nightly-pr-coverage must npm-install @parity/polkadot-app-deploy at the resolved version",
+    );
+
+    // The test driver (test/e2e.test.js) and bin/polkadot-app-deploy resolve
+    // imports from ../dist — the installed package's dist must be symlinked
+    // in so those imports run against the published tarball, not local source.
+    assert.match(
+      job,
+      /ln -sf node_modules\/@parity\/polkadot-app-deploy\/dist dist/,
+      "nightly-pr-coverage's install step must symlink the npm-installed package's dist/ over the local one",
+    );
+
+    // Job name must report the tested version rather than a blanket "@ HEAD"
+    // once a release/pinned-dispatch run is actually installing from npm.
+    assert.match(
+      job,
+      /^ {4}name:\s*Nightly @ \$\{\{\s*needs\.build-nightly\.outputs\.test-version\s*\|\|\s*'HEAD'\s*\}\}/m,
+      "nightly-pr-coverage's job name must reflect the tested version, falling back to 'HEAD'",
+    );
+    assert.doesNotMatch(job, /^ {4}name:\s*Nightly @ HEAD\b/m, "nightly-pr-coverage must not hardcode 'Nightly @ HEAD' in its job name");
   });
 
   // ---- publish-wait gate (issue #23) -------------------------------------
@@ -10596,7 +12818,7 @@ describe("e2e.yml: nightly-report per-environment status (issue #1055)", () => {
   // Fixtures live at the literal /tmp paths the real workflow step hardcodes
   // (it isn't parametrized — that's the thing under test), so this suite
   // owns cleanup before AND after to avoid leaking fixture state.
-  const FIXTURE_PATHS = ["/tmp/s1-legs.tsv", "/tmp/s2-legs.tsv", "/tmp/all-nightly-legs.tsv", "/tmp/fail-signatures.tsv", "/tmp/report-body.md"];
+  const FIXTURE_PATHS = ["/tmp/s1-legs.tsv", "/tmp/s2-legs.tsv", "/tmp/all-nightly-legs.tsv", "/tmp/fail-signatures.tsv", "/tmp/report-body.md", "/tmp/readiness-section.md"];
   function cleanFixtures() {
     for (const p of FIXTURE_PATHS) fs.rmSync(p, { force: true });
   }
@@ -10662,6 +12884,72 @@ describe("e2e.yml: nightly-report per-environment status (issue #1055)", () => {
       // (c) one-line failure signature per failing leg, in the body.
       assert.match(body, /Failure signatures/, ">> FAIL: report body must include a Failure signatures section");
       assert.ok(body.includes(failSig), ">> FAIL: report body must include the exact >> FAIL: one-line signature for the failing leg");
+    } finally {
+      cleanFixtures();
+      if (summaryPath) fs.rmSync(summaryPath, { force: true });
+    }
+  });
+
+  test("a not-ready env gets an Environment readiness section with the values read and its canary result (#1624)", () => {
+    cleanFixtures();
+    let summaryPath;
+    try {
+      const report = jobBlock(fs.readFileSync(E2E_YAML_PATH, "utf-8"), "nightly-report");
+      const script = stepRunScript(report, "Render report body");
+      fs.writeFileSync("/tmp/s1-legs.tsv", "");
+      fs.writeFileSync("/tmp/s2-legs.tsv", "");
+      fs.writeFileSync("/tmp/all-nightly-legs.tsv", [
+        "Nightly S1 pool/js on parity-default (paseo-next-v2)\tsuccess\tpaseo-next-v2",
+        "Nightly S1 direct/js on parity-default (preview)\tsuccess\tpreview",
+        "Nightly S1 direct/kubo on parity-default (preview)\tfailure\tpreview",
+      ].join("\n") + "\n");
+      fs.writeFileSync("/tmp/fail-signatures.tsv", "");
+      summaryPath = path.join(os.tmpdir(), `bd-step-summary-${process.pid}.md`);
+      fs.writeFileSync(summaryPath, "");
+      const scriptPath = path.join(os.tmpdir(), `bd-render-report-${process.pid}.sh`);
+      fs.writeFileSync(scriptPath, script);
+      const notReady = { preview: [{ check: "funding", reason: "//e2e-direct has 1.0000 PAS, below the 30.0000 PAS floor" }] };
+      const res = spawnSync("bash", [scriptPath], {
+        encoding: "utf-8",
+        env: {
+          ...process.env, TAG: "e2e-nightly", VERSION: "0.11.0", RUN_URL: "https://example/run/1",
+          SELECTED_ENV: "paseo-next-v2", HEALTHY_ENVS: '["paseo-next-v2"]',
+          NOT_READY: JSON.stringify(notReady), GITHUB_STEP_SUMMARY: summaryPath,
+        },
+      });
+      assert.equal(res.status, 0, `render script exited ${res.status}\nstderr:\n${res.stderr}`);
+      const body = fs.readFileSync("/tmp/report-body.md", "utf-8");
+      assert.match(body, /## Environment readiness/, ">> FAIL: env-readiness: a non-empty not_ready must add the section");
+      assert.match(body, /\| preview \| funding \| \/\/e2e-direct has 1\.0000 PAS, below the 30\.0000 PAS floor \| 1 failure, 1 success \|/,
+        ">> FAIL: env-readiness: the row must name the env, failed check, values read and the S1 direct canary result");
+      // The section is also what the env-not-ready issue is built from.
+      assert.match(fs.readFileSync("/tmp/readiness-section.md", "utf-8"), /Environment readiness/);
+    } finally {
+      cleanFixtures();
+      if (summaryPath) fs.rmSync(summaryPath, { force: true });
+    }
+  });
+
+  test("with nothing not-ready the report has no Environment readiness section (#1624)", () => {
+    cleanFixtures();
+    let summaryPath;
+    try {
+      const report = jobBlock(fs.readFileSync(E2E_YAML_PATH, "utf-8"), "nightly-report");
+      const script = stepRunScript(report, "Render report body");
+      for (const f of ["/tmp/s1-legs.tsv", "/tmp/s2-legs.tsv", "/tmp/fail-signatures.tsv"]) fs.writeFileSync(f, "");
+      fs.writeFileSync("/tmp/all-nightly-legs.tsv", "Nightly S1 pool/js on parity-default (paseo-next-v2)\tsuccess\tpaseo-next-v2\n");
+      summaryPath = path.join(os.tmpdir(), `bd-step-summary-${process.pid}.md`);
+      fs.writeFileSync(summaryPath, "");
+      const scriptPath = path.join(os.tmpdir(), `bd-render-report-${process.pid}.sh`);
+      fs.writeFileSync(scriptPath, script);
+      for (const notReady of ["{}", ""]) {
+        const res = spawnSync("bash", [scriptPath], {
+          encoding: "utf-8",
+          env: { ...process.env, TAG: "e2e-nightly", VERSION: "0.11.0", RUN_URL: "https://example/run/1", SELECTED_ENV: "paseo-next-v2", HEALTHY_ENVS: '["paseo-next-v2"]', NOT_READY: notReady, GITHUB_STEP_SUMMARY: summaryPath },
+        });
+        assert.equal(res.status, 0, `render script exited ${res.status}\nstderr:\n${res.stderr}`);
+        assert.doesNotMatch(fs.readFileSync("/tmp/report-body.md", "utf-8"), /Environment readiness/, `>> FAIL: env-readiness: NOT_READY=${JSON.stringify(notReady)} must not add the section`);
+      }
     } finally {
       cleanFixtures();
       if (summaryPath) fs.rmSync(summaryPath, { force: true });
@@ -10856,6 +13144,265 @@ describe("manifest (incremental-upload-v2)", () => {
     test("treats unknown extensions as volatile (fail-safe)", () => {
       assert.equal(classifyFile("data.json"), "volatile");
       assert.equal(classifyFile("notes.txt"), "volatile");
+    });
+
+    // #1355 root cause: CONTENT_HASH_RE's hash-segment character class was
+    // `[A-Za-z0-9]` — it excluded the "_" and "-" that Vite/Rollup's
+    // base64url-alphabet hashes actually contain, so bundle files whose hash
+    // suffix happened to include either character fell through to
+    // "volatile" and were fully re-uploaded on every deploy despite an
+    // unchanged CID. Widened to `[A-Za-z0-9_-]`. These are real filenames
+    // from test/fixtures/realistic-vite/v1/assets/ that failed under the
+    // old class — see the full-fixture sweep below for all 14.
+    test("treats real Vite/Rollup base64url hash suffixes (with _ or -) as stable (#1355)", () => {
+      const names = [
+        "assets/_md-BChABl-9.js",
+        "assets/index-B_NQy5Da.js",
+        "assets/errors-CHrKVge_.js",
+        "assets/bulletin_metadata-ZWUBSZT2-BukF-JIi.js",
+        "assets/substrate-client-w5-JehSV.js",
+        "assets/get-sync-provider-euY2_EAo.js",
+        "assets/descriptors-7XDUQZP4-Q_l81UXa.js",
+        "assets/metadataTypes-25EYWYSO-DB9fHAu_.js",
+        "assets/passet_metadata-7H7LGTAU-BnXlGKH_.js",
+        "assets/sm-provider-B_oHyEGq.js",
+      ];
+      for (const n of names) {
+        assert.equal(classifyFile(n), "stable", `expected ${n} to classify stable`);
+      }
+    });
+
+    // Full-fixture sweep: pin the exact counts from the PR description.
+    // 59 real Vite-emitted filenames; 14 failed the pre-#1355 alnum-only
+    // class, 0 fail the widened [A-Za-z0-9_-] class.
+    test("classifies every file in the realistic-vite v1 assets fixture as stable", () => {
+      const dir = path.resolve("test/fixtures/realistic-vite/v1/assets");
+      const names = fs.readdirSync(dir).map((f) => `assets/${f}`);
+      assert.equal(names.length, 59, "fixture file count changed — update the pinned expectation");
+      const failing = names.filter((n) => classifyFile(n) !== "stable");
+      assert.deepEqual(failing, [], `expected 0 misclassified; got ${failing.length}: ${failing.join(", ")}`);
+    });
+
+    // Negative side: the widened class must not start treating plainly
+    // non-hashed filenames as content-hashed. The dangerous direction for
+    // this heuristic is guessing "stable" for content that actually changes
+    // between deploys (mutable content silently lands in the cached
+    // section). These have no bundler-hash-shaped segment at all.
+    test("still treats plain, non-hashed filenames as volatile (negative)", () => {
+      assert.equal(classifyFile("index.html"), "volatile");
+      assert.equal(classifyFile("about/index.html"), "volatile");
+      assert.equal(classifyFile("notes.txt"), "volatile");
+      assert.equal(classifyFile("data.json"), "volatile");
+      assert.equal(classifyFile("styles.css"), "volatile");
+      assert.equal(classifyFile("readme.md"), "volatile");
+      assert.equal(classifyFile("robots.txt"), "volatile");
+    });
+
+    // Known, accepted trade-off (pre-existing for the alnum-only class too —
+    // e.g. "vendor-bundle.js" already matched "bundle" as a 6-char pseudo-hash
+    // before this change): any dash-delimited segment of 6-16 characters
+    // drawn from [A-Za-z0-9_-] looks like a hash to this heuristic, whether
+    // or not it actually is one. Widening the class to include "-" extends
+    // that same pre-existing weakness to segments that span an internal "-",
+    // e.g. a date-stamped export name. Documented here, not silently
+    // widened away — a stricter heuristic would need real hash-entropy
+    // detection, out of scope for a name-based fix.
+    test("documents the accepted false-positive surface from widening the hash class", () => {
+      assert.equal(classifyFile("vendor-bundle.js"), "stable"); // pre-existing, not new
+      assert.equal(classifyFile("report-2026-09-04.json"), "stable"); // new surface: multi-hyphen numeric run now bridges via "-"
+    });
+
+    // #1390: CONTENT_HASH_RE's hash-segment length was capped at {6,16}.
+    // webpack's `output.hashDigestLength` defaults to 20, and md5-style
+    // digests are 32 hex characters — both longer than the old cap, so a
+    // stock webpack build had every content-hashed JS/CSS asset
+    // misclassified "volatile" and re-uploaded on every deploy despite
+    // being byte-identical. Cap raised from 16 to 32: exactly covers
+    // md5-length (32 hex) digests, the longest hash shape actually in use
+    // by mainstream bundlers, while still refusing an unbounded segment
+    // (see the "one char over the new cap" case below). Table reproduced
+    // verbatim from the issue body, confirmed failing under the pre-fix
+    // regex before this change.
+    test("treats webpack-default (20-char) and md5-style (32-char) hash suffixes as stable (#1390)", () => {
+      assert.equal(classifyFile("index-a1b2c3d4.js"), "stable", ">> FAIL: vite/rollup 8-char base64url hash: expected stable");
+      assert.equal(classifyFile("main.a1b2c3d4e5f6a7b8.js"), "stable", ">> FAIL: 16 hex (old cap boundary): expected stable");
+      assert.equal(classifyFile("main.a1b2c3d4e5f6a7b81.js"), "stable", ">> FAIL: 17 hex (one over the old cap): expected stable after raising the bound");
+      assert.equal(classifyFile("main.a1b2c3d4e5f6a7b8c9d0.js"), "stable", ">> FAIL: 20 hex (webpack output.hashDigestLength default): expected stable");
+      assert.equal(classifyFile("main.a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6.js"), "stable", ">> FAIL: 32 hex (md5-style digest): expected stable");
+      assert.equal(classifyFile("app.abcdefghijklmnopqrst.css"), "stable", ">> FAIL: 20 alnum: expected stable");
+    });
+
+    // Negative: each branch's cap must still be finite and independent —
+    // one character past either bound must stay volatile. Proves the fix
+    // raised each ceiling rather than removing it (the issue explicitly
+    // warns against widening "so far that a normal word-with-digits
+    // filename becomes stable").
+    test("still treats a segment one character over either branch's cap as volatile (#1390)", () => {
+      assert.equal(
+        classifyFile("main.a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e.js"),
+        "volatile",
+        ">> FAIL: 33 hex (one over the hex branch's new cap): expected volatile, cap must stay finite"
+      );
+      assert.equal(
+        classifyFile("app.abcdefghijklmnopqrstu.css"),
+        "volatile",
+        ">> FAIL: 21 non-hex alnum (one over the alnum branch's cap): expected volatile, cap must stay finite"
+      );
+    });
+
+    // Negative: the alnum/base64url branch is capped at 20 (webpack's
+    // hashDigestLength default), not reused from the hex branch's 32 —
+    // deliberately narrower, since that branch already accepts ordinary
+    // words and "-" (per #1355 above). A 21-32 char ordinary,
+    // descriptive-looking filename segment must stay volatile: raising
+    // the hex cap for real md5 digests must not also make a longer plain
+    // word look like a hash.
+    test("still treats a long ordinary (non-hash) filename segment as volatile, even within the raised hex cap's range (#1390)", () => {
+      assert.equal(
+        classifyFile("data-longdescriptivefilename.json"),
+        "volatile",
+        ">> FAIL: 23-char ordinary word segment (non-hex, within 20<len<=32): expected volatile — alnum branch capped at 20, not 32"
+      );
+    });
+
+    // A word ending in digits is the shape most likely to be mistaken for a
+    // hash once the caps go up. index.html / data.json / styles.css are
+    // already covered by the "plain, non-hashed filenames" negative above,
+    // so only the new shape is asserted here.
+    test("still treats a word-with-trailing-digits filename as volatile after raising the caps (#1390)", () => {
+      assert.equal(classifyFile("changelog2026.md"), "volatile", ">> FAIL: word+digits, no delimiter before it: expected volatile");
+    });
+
+    // The vite branch of classifyFileHeuristic used to re-test CONTENT_HASH_RE
+    // on a string the function had already rejected one line earlier, against
+    // the same non-global regex — it could never return "stable", so it went.
+    // An assets/ path is classified on its filename alone, exactly as any
+    // other path is.
+    test("classifies an unhashed vite assets/ path on its name alone, with or without the framework hint (#1390)", () => {
+      assert.equal(classifyFileHeuristic("assets/logo.png", "vite"), "stable", ">> FAIL: assets/logo.png: .png is in STABLE_EXTENSIONS, so it is stable with or without the hint");
+      assert.equal(classifyFileHeuristic("assets/data.json", "vite"), "volatile", ">> FAIL: unhashed assets/data.json under vite: expected volatile, same as without the hint");
+      for (const path of ["assets/data.json", "assets/logo.png", "assets/index-a1b2c3d4.js", "assets/style.css"]) {
+        assert.equal(
+          classifyFileHeuristic(path, "vite"),
+          classifyFileHeuristic(path, null),
+          `>> FAIL: ${path}: the vite hint must not change classification — its branch only ever re-tested a regex that had already failed`
+        );
+      }
+    });
+  });
+
+  // Per-framework rule table (#1527/#1528 Phase 1). Replaces the one global
+  // regex with narrow, framework-scoped rules that run BEFORE the global
+  // fallback. C2: each rule set narrows (scopes a claim to a path prefix the
+  // bundler owns) rather than widens a pattern that applies everywhere. Each
+  // exclusion below is a file with a STABLE PATH but MUTABLE CONTENT — the
+  // expensive C2 error a wrong "stable" classification causes.
+  describe("classifyFileHeuristic: per-framework rule table (#1527/#1528 Phase 1)", () => {
+    test("next: _next/static/ is stable, the same basename outside the prefix is not", () => {
+      assert.equal(classifyFileHeuristic("_next/static/chunks/x.js", "next"), "stable",
+        ">> FAIL: next stablePrefix: _next/static/chunks/x.js expected stable");
+      assert.equal(classifyFileHeuristic("_next/server/x.js", "next"), "volatile",
+        ">> FAIL: next stablePrefix: _next/server/x.js is outside _next/static/, expected volatile (no content hash in name)");
+    });
+
+    test("next: _buildManifest.js and _ssgManifest.js stay volatile even under _next/static/", () => {
+      assert.equal(
+        classifyFileHeuristic("_next/static/AbCdEf123456/_buildManifest.js", "next"),
+        "volatile",
+        ">> FAIL: _buildManifest.js has no hash in its own name and its path is only unique while the build id is — must stay volatile even inside the stable prefix"
+      );
+      assert.equal(
+        classifyFileHeuristic("_next/static/AbCdEf123456/_ssgManifest.js", "next"),
+        "volatile",
+        ">> FAIL: _ssgManifest.js: same reasoning as _buildManifest.js"
+      );
+    });
+
+    test("nuxt: separator-less hash-shaped basenames under _nuxt/ are stable", () => {
+      assert.equal(classifyFileHeuristic("_nuxt/CJPnFZM_2.js", "nuxt"), "stable",
+        ">> FAIL: nuxt scopedHashRe: _nuxt/CJPnFZM_2.js expected stable (#1527)");
+    });
+
+    test("nuxt: _nuxt/builds/latest.json stays volatile — fixed filename, re-read to detect a new deployment", () => {
+      assert.equal(
+        classifyFileHeuristic("_nuxt/builds/latest.json", "nuxt"),
+        "volatile",
+        ">> FAIL: _nuxt/builds/latest.json: 'latest' is ordinary word-shaped, not hash-shaped — a blanket _nuxt/ stablePrefix would wrongly cache this mutable file, which is the C2 expensive error this design exists to avoid"
+      );
+    });
+
+    test("nuxt: _nuxt/builds/meta/<buildId>.json is stable — unique per build, so its content never changes under that name", () => {
+      assert.equal(classifyFileHeuristic("_nuxt/builds/meta/2f8a9c1d3e.json", "nuxt"), "stable",
+        ">> FAIL: nuxt build-id-named meta file expected stable (hash-shaped basename)");
+    });
+
+    test("polkavm-app: game/ and LICENSES/ are stable, app.polkavm and manifest.json stay volatile", () => {
+      assert.equal(classifyFileHeuristic("game/freedoom1.wad", "polkavm-app"), "stable",
+        ">> FAIL: polkavm-app stablePrefix game/: freedoom1.wad expected stable (never changes)");
+      assert.equal(classifyFileHeuristic("LICENSES/gpl-2.0.txt", "polkavm-app"), "stable",
+        ">> FAIL: polkavm-app stablePrefix LICENSES/: gpl-2.0.txt expected stable (never changes)");
+      assert.equal(
+        classifyFileHeuristic("app.polkavm", "polkavm-app"),
+        "volatile",
+        ">> FAIL: app.polkavm is the executable — changes every release, has no content hash in its name, must stay volatile"
+      );
+      assert.equal(
+        classifyFileHeuristic("manifest.json", "polkavm-app"),
+        "volatile",
+        ">> FAIL: manifest.json is version metadata — changes every release, must stay volatile"
+      );
+    });
+
+    test("determinism: classifyFileHeuristic(p, f) depends only on (p, f)", () => {
+      const cases = [
+        ["_next/static/chunks/x.js", "next"],
+        ["_next/static/AbCdEf123456/_buildManifest.js", "next"],
+        ["_nuxt/CJPnFZM_2.js", "nuxt"],
+        ["_nuxt/builds/latest.json", "nuxt"],
+        ["game/freedoom1.wad", "polkavm-app"],
+        ["app.polkavm", "polkavm-app"],
+        ["index.html", null],
+      ];
+      // Interleaved, not back-to-back: two adjacent calls with identical
+      // arguments cannot diverge for a pure string function, so repeating
+      // them proves nothing. Classifying every other case in between is what
+      // would catch a per-instance cache or a regex carrying lastIndex state.
+      const first = cases.map(([p, f]) => classifyFileHeuristic(p, f));
+      for (let i = 0; i < cases.length; i++) {
+        const [p, f] = cases[i];
+        assert.equal(
+          classifyFileHeuristic(p, f),
+          first[i],
+          `>> FAIL: classifyFileHeuristic(${p}, ${f}) changed after classifying every other case in between — it is carrying state across calls, so classification is not a pure function of (path, framework)`,
+        );
+      }
+    });
+
+    // Fallback: an unknown framework must classify EXACTLY as `null` does —
+    // the global fallback stays untouched for the majority (unknown) case.
+    // Corpus spans the #1390 table plus the #1355 realistic-vite fixture, plus
+    // each framework's own path shapes WITHOUT the matching hint (must not
+    // accidentally trip a rule that shouldn't apply).
+    test("unknown framework classifies exactly as no framework hint, across the #1390 table + realistic-vite fixture", () => {
+      const names = [
+        "index.html", "about/index.html", "notes.txt", "data.json", "styles.css", "readme.md", "robots.txt",
+        "index-a1b2c3d4.js", "main.a1b2c3d4e5f6a7b8.js", "main.a1b2c3d4e5f6a7b81.js",
+        "main.a1b2c3d4e5f6a7b8c9d0.js", "main.a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6.js",
+        "app.abcdefghijklmnopqrst.css", "vendor-bundle.js", "report-2026-09-04.json",
+        "changelog2026.md", "data-longdescriptivefilename.json",
+        "_next/static/chunks/x.js", "_next/static/AbCdEf123456/_buildManifest.js",
+        "_nuxt/CJPnFZM_2.js", "_nuxt/builds/latest.json",
+        "game/freedoom1.wad", "app.polkavm", "manifest.json",
+      ];
+      const dir = path.resolve("test/fixtures/realistic-vite/v1/assets");
+      const fixtureNames = fs.readdirSync(dir).map((f) => `assets/${f}`);
+      for (const n of [...names, ...fixtureNames]) {
+        assert.equal(
+          classifyFileHeuristic(n, "some-unrecognised-bundler"),
+          classifyFileHeuristic(n, null),
+          `>> FAIL: ${n}: an unknown framework must classify identically to no framework hint — the global fallback must stay untouched`
+        );
+      }
     });
   });
 
@@ -11240,6 +13787,25 @@ describe("merkle backends — JS vs Kubo (incremental-upload-v2)", () => {
     } finally { fs.rmSync(dir, { recursive: true }); }
   });
 
+  test("a failing ipfs call falls back to the JS backend (bulletin #1557)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kubo-fallback-"));
+    const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "kubo-shim-"));
+    const prevPath = process.env.PATH;
+    try {
+      buildFixture({ targetDir: dir, seed: "kubo-fallback" });
+      fs.writeFileSync(path.join(shimDir, "ipfs"), '#!/bin/sh\necho "simulated ipfs failure" >&2\nexit 1\n', { mode: 0o755 });
+      process.env.PATH = `${shimDir}${path.delimiter}${prevPath}`;
+
+      const got = await merkleizeBackend(dir, true, "Phase B");
+      const expected = await merkleizeJSBackend(dir);
+      assert.equal(got.rootCid, expected.rootCid, ">> FAIL: kubo fallback: rootCid diverged from the JS backend");
+    } finally {
+      process.env.PATH = prevPath;
+      fs.rmSync(dir, { recursive: true });
+      fs.rmSync(shimDir, { recursive: true });
+    }
+  });
+
   test("hidden directories (.bulletin-deploy/) are included in both JS and Kubo backends", { skip: !hasIPFS() }, async () => {
     // Regression test for the Kubo --hidden flag fix: before the fix, ipfs add -r
     // without --hidden silently excluded dot-prefixed directories, so the embedded
@@ -11404,6 +13970,46 @@ describe("manifest-fetch (gateway-based)", () => {
     // No domain → no cache attempt. Hardcoded fake gateway that won't resolve.
     const r = await fetchPreviousManifest("bafyx", { gateway: "https://unreachable.invalid", timeoutMs: 100 });
     assert.equal(r.source, "heuristic_fallback");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bulletin #1537: fetchPreviousManifest must distinguish "no gateway
+// configured" from "every configured gateway failed". Both used to collapse
+// to the same source + reason ("heuristic_fallback" / "all gateways
+// exhausted: unknown"), so a caller that forgot to pass a gateway got
+// byte-identical output to a real outage.
+// ---------------------------------------------------------------------------
+describe("manifest-fetch: no-gateway vs all-gateways-failed distinguishability (bulletin #1537)", () => {
+  test("no gateway configured yields a reason distinct from a failed gateway's reason", async () => {
+    const noGateway = await fetchPreviousManifest("bafyx1534", {});
+    const failedGateway = await fetchPreviousManifest("bafyx1534", {
+      gateway: "https://unreachable.invalid",
+      timeoutMs: 100,
+    });
+
+    assert.equal(noGateway.source, "heuristic_fallback",
+      ">> FAIL: bulletin #1537 no-gateway source: fetchPreviousManifest with no gateway configured must still return heuristic_fallback");
+    assert.equal(failedGateway.source, "heuristic_fallback",
+      ">> FAIL: bulletin #1537 failed-gateway source: fetchPreviousManifest with a failing gateway must return heuristic_fallback");
+    assert.notEqual(noGateway.reason, failedGateway.reason,
+      ">> FAIL: bulletin #1537 distinguishability: no-gateway reason must differ from the all-gateways-failed reason, or a caller that forgot to pass a gateway is indistinguishable from a real outage");
+    assert.doesNotMatch(noGateway.reason, /all gateways exhausted/,
+      ">> FAIL: bulletin #1537 distinguishability: no-gateway reason must not reuse the all-gateways-exhausted category, or a missing gateway still reads as an outage");
+    assert.doesNotMatch(failedGateway.reason, /no gateway configured/,
+      ">> FAIL: bulletin #1537 distinguishability: a configured-but-failing gateway must not be reported as unconfigured");
+  });
+
+  test("no-gateway reason string names the misconfiguration explicitly", async () => {
+    const r = await fetchPreviousManifest("bafyx1534b", {});
+    assert.match(r.reason, /no gateway configured/i,
+      ">> FAIL: bulletin #1537 no-gateway reason wording: reason string must explicitly name the missing-gateway misconfiguration, not a generic exhaustion message");
+  });
+
+  test("no-gateway case is observable via a distinguishing span attribute, not just the return value", () => {
+    const src = fs.readFileSync("src/manifest-fetch.ts", "utf8");
+    assert.match(src, /\boutcome:\s*["']no_gateway_configured["']/,
+      ">> FAIL: bulletin #1537 telemetry: manifest-fetch.ts must pass outcome: \"no_gateway_configured\" into the manifest.fetch span attributes so the no-gateway case is visible in Sentry traces, not only in the return value");
   });
 });
 
@@ -11769,6 +14375,28 @@ describe("chunk-probe (incremental-upload-v2)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// partitionFinalityProbe (bulletin #1445) — present: null is "could not
+// measure", not "absent". A probe that returned null for every chunk must
+// not be reported as a pass.
+// ---------------------------------------------------------------------------
+describe("partitionFinalityProbe (bulletin #1445)", () => {
+  const r = (cid, present, failureReason) => ({ cid, present, ...(failureReason ? { failureReason } : {}) });
+
+  test("an unmeasurable chunk is reported, not treated as absent", () => {
+    const { absent, indeterminate, reason } = partitionFinalityProbe(["a", "b", "c"].map((c) => r(c, null, "metadata_error")));
+    assert.deepStrictEqual(absent, [], ">> FAIL: null routed into absent would re-upload chunks nobody said were missing (bulletin #1445)");
+    assert.deepStrictEqual(indeterminate, ["a", "b", "c"], ">> FAIL: null must be reported, or the checkmark prints for a probe that never ran (bulletin #1445)");
+    assert.equal(reason, "metadata_error", ">> FAIL: the failure reason must survive for triage");
+  });
+
+  test("only a measured absence is absent", () => {
+    const { absent, indeterminate } = partitionFinalityProbe([r("a", true), r("b", false), r("c", null, "rpc_error")]);
+    assert.deepStrictEqual(absent, ["b"], ">> FAIL: only present === false may re-upload");
+    assert.deepStrictEqual(indeterminate, ["c"], ">> FAIL: only present === null is indeterminate");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // classifyFinalityGap (#1049) — pure function, no chain I/O.
 // ---------------------------------------------------------------------------
 describe("classifyFinalityGap (#1049)", () => {
@@ -11915,38 +14543,80 @@ describe("getBestBlockNumber (#1051)", () => {
 // ---------------------------------------------------------------------------
 // reconcileTimedOutChunk (#1051) — pure reconcile-before-resubmit decision.
 // ---------------------------------------------------------------------------
-describe("reconcileTimedOutChunk (#1051)", () => {
+describe("reconcileTimedOutChunk (#1051, #1641)", () => {
+  // #1641 item 2: "nonce advanced" used to mean "included". The nonce is read
+  // from system_accountNextIndex, which counts pool txs, so it now only routes
+  // the chunk to the post-batch verify loop ("verify"); inclusion needs the CID.
   test("CID present at best-block alone is sufficient, even if nonce heuristic is invalid", () => {
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: 100, currentNonce: 100, nonceHeuristicValid: false, cidPresentAtBest: true,
-    }), true, ">> FAIL: reconcileTimedOutChunk: CID-present must short-circuit to included regardless of nonce state");
+    }), "included", ">> FAIL: reconcileTimedOutChunk: CID-present must short-circuit to included regardless of nonce state");
   });
 
-  test("nonce advance alone is sufficient when the heuristic is valid", () => {
+  test("nonce advance alone is NOT inclusion: it routes the chunk to verification (#1641)", () => {
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: 100, currentNonce: 101, nonceHeuristicValid: true, cidPresentAtBest: null,
-    }), true);
+    }), "verify", ">> FAIL: reconcileTimedOutChunk: a consumed nonce must route to verification, never report included (#1641 item 2)");
   });
 
   test("nonce advance is ignored when the heuristic is invalid (#951 account rotation)", () => {
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: 100, currentNonce: 101, nonceHeuristicValid: false, cidPresentAtBest: null,
-    }), false, ">> FAIL: reconcileTimedOutChunk: nonce heuristic must be ignored after an account rotation, else #951 false-positive returns");
+    }), "resubmit", ">> FAIL: reconcileTimedOutChunk: nonce heuristic must be ignored after an account rotation, else #951 false-positive returns");
   });
 
-  test("neither signal present -> not included, resubmit is warranted", () => {
+  test("neither signal present -> resubmit", () => {
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: 100, currentNonce: 100, nonceHeuristicValid: true, cidPresentAtBest: false,
-    }), false);
+    }), "resubmit");
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: 100, currentNonce: 100, nonceHeuristicValid: true, cidPresentAtBest: null,
-    }), false);
+    }), "resubmit");
   });
 
-  test("undefined originalNonce never falsely reports inclusion via the nonce path", () => {
+  test("undefined originalNonce never routes via the nonce path", () => {
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: undefined, currentNonce: 5, nonceHeuristicValid: true, cidPresentAtBest: null,
-    }), false);
+    }), "resubmit");
+  });
+});
+
+describe("readBoundedChunkNonce (#1641)", () => {
+  const quiet = { log: () => {} };
+  const seq = (...xs) => { let i = 0; return async () => { const x = xs[Math.min(i++, xs.length - 1)]; if (x instanceof Error) throw x; return x; }; };
+
+  test("an in-bound nextIndex is used as-is (a shared signer stacks above pending txs)", async () => {
+    assert.strictEqual(await readBoundedChunkNonce({ readOnchainNonce: async () => 100, readNextIndex: seq(105), ...quiet }), 105);
+  });
+
+  test("exactly the bound above the on-chain nonce is accepted", async () => {
+    assert.strictEqual(await readBoundedChunkNonce({ readOnchainNonce: async () => 100, readNextIndex: seq(108), bound: 8, ...quiet }), 108);
+  });
+
+  test("a lagging backend (nextIndex below the on-chain nonce) yields the on-chain nonce", async () => {
+    assert.strictEqual(await readBoundedChunkNonce({ readOnchainNonce: async () => 100, readNextIndex: seq(97), ...quiet }), 100);
+  });
+
+  test("a stuck backend's read is rejected and re-read; the in-bound re-read wins", async () => {
+    const logs = [];
+    const n = await readBoundedChunkNonce({ readOnchainNonce: async () => 13063, readNextIndex: seq(13114, 13063), bound: 8, log: (m) => logs.push(m) });
+    assert.strictEqual(n, 13063, ">> FAIL: readBoundedChunkNonce: the out-of-bound (stuck backend) read must not be used");
+    assert.ok(logs.some((l) => l.includes("stuck backend") && l.includes("13114")), ">> FAIL: readBoundedChunkNonce: the rejected read must be logged");
+  });
+
+  test("every read out of bound: falls back to the on-chain nonce after `reads` attempts", async () => {
+    let calls = 0;
+    const n = await readBoundedChunkNonce({ readOnchainNonce: async () => 50, readNextIndex: async () => { calls++; return 200; }, reads: 3, ...quiet });
+    assert.strictEqual(n, 50);
+    assert.strictEqual(calls, 3, ">> FAIL: readBoundedChunkNonce: exactly `reads` nextIndex reads, then the on-chain fallback");
+  });
+
+  test("nextIndex reads all fail: the on-chain nonce is used", async () => {
+    assert.strictEqual(await readBoundedChunkNonce({ readOnchainNonce: async () => 7, readNextIndex: seq(new Error("ws down")), ...quiet }), 7);
+  });
+
+  test("on-chain read fails: degrades to the unbounded nextIndex (pre-#1641 behaviour; inclusion is still probe-gated)", async () => {
+    assert.strictEqual(await readBoundedChunkNonce({ readOnchainNonce: async () => { throw new Error("no System.Account"); }, readNextIndex: seq(321), ...quiet }), 321);
   });
 });
 
@@ -12465,28 +15135,166 @@ describe("buildFilesMap with fileCids (incremental-upload-v2)", () => {
     assert.ok("index.html" in map);
     fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  // #1528 Phase 1 wiring: buildFilesMap must thread a framework value into
+  // classifyFile so the per-framework rule table actually reaches the
+  // manifest's `files` map (previously the framework value reached nothing).
+  test("threads the framework param into classifyFile", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-bfm-fw-"));
+    fs.mkdirSync(path.join(dir, "_next", "static", "chunks"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "_next", "static", "chunks", "x.js"), "x");
+    const fileCids = new Map([["_next/static/chunks/x.js", "bafabc"]]);
+    const withoutFramework = buildFilesMap(dir, fileCids);
+    const withFramework = buildFilesMap(dir, fileCids, "next");
+    assert.equal(withoutFramework["_next/static/chunks/x.js"].type, "volatile",
+      ">> FAIL: without a framework hint, an unhashed _next/static/ path stays volatile (global fallback unchanged)");
+    assert.equal(withFramework["_next/static/chunks/x.js"].type, "stable",
+      ">> FAIL: buildFilesMap must thread its framework param into classifyFile so the next stablePrefix rule applies");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
 });
 
+// Detection hardening (#1527/#1528/#1529 Phase 1): markers evaluated against
+// the deployed directory only (C1), returning null on ambiguity rather than
+// guessing (C3).
 describe("detectFramework", () => {
-  test("returns 'next' when _next/ exists", () => {
+  test("returns 'polkavm-app' when root manifest.json has runtime.kind:'polkavm' alongside app.polkavm", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
-    fs.mkdirSync(path.join(dir, "_next"));
+    fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ runtime: { kind: "polkavm" }, version: "1.0.0" }));
+    fs.writeFileSync(path.join(dir, "app.polkavm"), Buffer.alloc(16, 0x00));
+    assert.equal(detectFramework(dir), "polkavm-app");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("does NOT return 'polkavm-app' when app.polkavm is missing (manifest.json alone is not evidence)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ runtime: { kind: "polkavm" } }));
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("does NOT return 'polkavm-app' when manifest.json's runtime.kind is not 'polkavm'", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ runtime: { kind: "web" } }));
+    fs.writeFileSync(path.join(dir, "app.polkavm"), Buffer.alloc(4));
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("does NOT return 'polkavm-app' when manifest.json is malformed JSON (fails closed, not a crash)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.writeFileSync(path.join(dir, "manifest.json"), "{not valid json");
+    fs.writeFileSync(path.join(dir, "app.polkavm"), Buffer.alloc(4));
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("returns 'next' when _next/static/ exists", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.mkdirSync(path.join(dir, "_next", "static"), { recursive: true });
     assert.equal(detectFramework(dir), "next");
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  test("returns 'vite' when assets/ exists", () => {
+  test("does NOT return 'next' for a bare _next/ with no static/ subdir", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.mkdirSync(path.join(dir, "_next"));
+    fs.writeFileSync(path.join(dir, "_next", "server-manifest.json"), "{}");
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("returns 'nuxt' when _nuxt/ exists", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.mkdirSync(path.join(dir, "_nuxt"));
+    assert.equal(detectFramework(dir), "nuxt");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("returns 'vite' when assets/ contains at least one hash-shaped entry", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
     fs.mkdirSync(path.join(dir, "assets"));
+    fs.writeFileSync(path.join(dir, "assets", "main-Abc12345.js"), "x");
     assert.equal(detectFramework(dir), "vite");
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  test("returns null when neither _next nor assets exists", () => {
+  // C3: an assets/ dir with no hashed entry must return null, not "vite" — a
+  // bare directory-name guess is what let detection flip between UNKNOWN and
+  // vite for vite-plugin-singlefile's inlined-HTML output.
+  test("returns null (not 'vite') when assets/ exists but no entry is hash-shaped", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.mkdirSync(path.join(dir, "assets"));
+    fs.writeFileSync(path.join(dir, "assets", "data.json"), "{}");
+    fs.writeFileSync(path.join(dir, "assets", "logo.png"), "x"); // stable-extension, but not hash-shaped
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("returns null when no marker exists", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
     fs.writeFileSync(path.join(dir, "index.html"), "<html/>");
     assert.equal(detectFramework(dir), null);
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // C3: more than one marker present -> null, never a guess.
+  test("returns null when more than one marker is present (ambiguous — never guesses)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.mkdirSync(path.join(dir, "_next", "static"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "_nuxt"));
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // C1: detection is a pure function of the deployed directory only — no
+  // second parameter through which a prevManifest could ever be threaded in.
+  test("detectFramework takes only a directory path", () => {
+    assert.equal(detectFramework.length, 1,
+      ">> FAIL: detectFramework must stay a pure function of the deployed directory only (C1) — a second parameter would invite reading prevManifest here, which C1 forbids");
+  });
+});
+
+// Bulletin #1550/#1566: a mainnet deploy should upload full content and
+// stop — no incremental (chunk-dedup) upload, no embedded
+// .bulletin-deploy/manifest.json cache manifest. Retention makes the cache
+// stale on arrival at mainnet's low deploy cadence, and a production name
+// should not carry build-cache artifacts. Exact `=== "mainnet"` check on
+// purpose: an env-less deploy or one whose resolved env declares no network
+// keeps the historical incremental behaviour.
+//
+// Ported as a standalone pure predicate only — not yet wired into
+// storeDirectoryV2 or deploy() — the twin has no mainnet env configured
+// today, so there is nothing to gate on yet.
+describe("usesIncrementalCache", () => {
+  test("mainnet network disables incremental cache", () => {
+    assert.equal(usesIncrementalCache({ network: "mainnet" }), false,
+      ">> FAIL: usesIncrementalCache: mainnet must disable the incremental cache");
+  });
+
+  test("testnet network keeps incremental cache", () => {
+    assert.equal(usesIncrementalCache({ network: "testnet" }), true,
+      ">> FAIL: usesIncrementalCache: testnet must keep the incremental cache");
+  });
+
+  test("undefined network keeps incremental cache (bare --rpc deploy)", () => {
+    assert.equal(usesIncrementalCache({}), true,
+      ">> FAIL: usesIncrementalCache: an env-less deploy must keep the incremental cache");
+  });
+
+  test("unknown network (env resolved, no declared network) keeps incremental cache", () => {
+    assert.equal(usesIncrementalCache({ network: "unknown" }), true,
+      ">> FAIL: usesIncrementalCache: an 'unknown' sentinel is not mainnet and must keep the cache");
+  });
+
+  test("password disables incremental cache regardless of network", () => {
+    assert.equal(usesIncrementalCache({ network: "testnet", password: "secret" }), false,
+      ">> FAIL: usesIncrementalCache: an encrypted deploy must disable the incremental cache even off mainnet");
+  });
+
+  test("mainnet + password together still disables incremental cache", () => {
+    assert.equal(usesIncrementalCache({ network: "mainnet", password: "secret" }), false,
+      ">> FAIL: usesIncrementalCache: mainnet+password combined must not re-enable the cache");
   });
 });
 
@@ -12662,10 +15470,13 @@ describe("incremental-stats v3 summary", () => {
 
   test("storeChunkedContent emits monotonic upload indices [K/U] (#511 regression guard)", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf8");
-    // Upload batch line uses uploadEmitted/uploadTotal (not i+1/chunks.length)
-    // so progress is monotonic when trusted/skipped chunks live interleaved
-    // with uploaded ones in CAR position order.
-    assert.match(src, /\[\$\{uploadEmitted\}\/\$\{uploadTotal\}\] chunk \$\{i\}/);
+    // Upload batch line uses uploadEmitted/uploadTotal (not chunks.length) for
+    // the [K/U] progress counter, so progress is monotonic when trusted/skipped
+    // chunks live interleaved with uploaded ones in CAR position order. The
+    // per-chunk index shown alongside it is 1-based (#1011) — see the
+    // "ONE 1-based convention" test below for why.
+    assert.match(src, /\[\$\{uploadEmitted\}\/\$\{uploadTotal\}\] chunk \$\{i \+ 1\}/,
+      ">> FAIL: #511 guard: the batch line's [K/U] counter (uploadEmitted/uploadTotal) must stay monotonic and distinct from the 1-based chunk index shown alongside it");
     // Trusted summary collapses per-chunk lines into one row listing indices.
     assert.match(src, /Trusted: \$\{trustedCount\} chunks skipped without re-probe \(chunks /);
   });
@@ -12681,22 +15492,53 @@ describe("incremental-stats v3 summary", () => {
       ">> FAIL: #932 guard: must check uploadEmittedIndices.has(i) before incrementing uploadEmitted");
   });
 
-  test("storeChunkedContent chunk-index display is 0-based everywhere (no batch/retry off-by-one)", () => {
+  // #1011: this test used to protect "0-based everywhere" — a single shared
+  // convention across every chunk-index display site. That convention flipped
+  // to 1-based (issue #1011's own triage: "label chunks 1-based everywhere a
+  // user sees them"), because the missing-positions error (a few lines below
+  // this whole block) and the structured captureWarning({chunkIndex: ...})
+  // payloads were ALREADY 1-based — "0-based everywhere" was never actually
+  // true of the whole function, which is exactly the "chunk numbers are all
+  // over the place" bug #1011 reports. This test now protects the SAME
+  // property (one shared convention, so the same chunk never shows under two
+  // different numbers across batch/retry/nonce-collision/verify-mismatch
+  // lines) in its corrected 1-based form.
+  test("storeChunkedContent chunk-index display is ONE 1-based convention everywhere (#1011 — no mixed bases)", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf8");
-    // The batch upload line shows `chunk ${i}` (0-based). The retry / consumed /
-    // nonce-collision re-upload / verify-mismatch lines must use the SAME 0-based
-    // index — NOT `${fail.index + 1}` / `${idx + 1}` / `${i + 1}`. Otherwise the
-    // same chunk shows under two numbers (a retrying chunk N looked like a phantom
-    // "chunk N+1" colliding with the trusted chunk N+1). The [K/U] progress
-    // counter is a count and legitimately stays 1-based.
-    assert.match(src, /chunk \$\{i\}/,
-      ">> FAIL: chunk-numbering: the batch upload line must display the 0-based chunk index `chunk ${i}`");
-    assert.doesNotMatch(src, /chunk \$\{fail\.index \+ 1\}/,
-      ">> FAIL: chunk-numbering: retry/consumed lines must use 0-based `${fail.index}`, not `${fail.index + 1}` (off-by-one vs the batch line)");
-    assert.doesNotMatch(src, /chunk \$\{idx \+ 1\}/,
-      ">> FAIL: chunk-numbering: nonce-collision re-upload lines must use 0-based `${idx}`, not `${idx + 1}`");
-    assert.doesNotMatch(src, /chunk \$\{i \+ 1\} CID mismatch/,
-      ">> FAIL: chunk-numbering: the verify-mismatch error must use 0-based `${i}`, not `${i + 1}`");
+    assert.match(src, /chunk \$\{i \+ 1\} —/,
+      ">> FAIL: chunk-numbering: the batch upload line must display the 1-based chunk index `chunk ${i + 1}`");
+    assert.match(src, /Chunk \$\{idx \+ 1\}: nonce/,
+      ">> FAIL: chunk-numbering: the nonce-consumed heuristic line must use 1-based `${idx + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: isValid:false but CID was probe-failed/,
+      ">> FAIL: chunk-numbering: the isValid:false backstop line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: tx rejected/,
+      ">> FAIL: chunk-numbering: the mortal-expiry note must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Retrying chunk \$\{fail\.index \+ 1\} \(attempt/,
+      ">> FAIL: chunk-numbering: the retry-progress line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: reconcile found its CID at the best block/,
+      ">> FAIL: chunk-numbering: the reconcile-found line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: chain still frozen/,
+      ">> FAIL: chunk-numbering: the frozen-chain-wait line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: retry isValid:false/,
+      ">> FAIL: chunk-numbering: the retry isValid:false backstop line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\} failed after \$\{MAX_CHUNK_RETRIES\} retries/,
+      ">> FAIL: chunk-numbering: the final chunk-failure throw must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Nonce-collision re-upload: chunk \$\{idx \+ 1\} \(attempt/,
+      ">> FAIL: chunk-numbering: the nonce-collision re-upload progress line must use 1-based `${idx + 1}`");
+    assert.match(src, /Nonce-collision re-upload of chunk \$\{idx \+ 1\} failed/,
+      ">> FAIL: chunk-numbering: the nonce-collision re-upload failure throw must use 1-based `${idx + 1}`");
+    assert.match(src, /chunk \$\{i \+ 1\} CID mismatch/,
+      ">> FAIL: chunk-numbering: the verify-mismatch error must use 1-based `${i + 1}`, matching the missing-positions error which was already 1-based");
+    assert.match(src, /trustedIndices\.push\(i \+ 1\)/,
+      ">> FAIL: chunk-numbering: trustedIndices must push 1-based (i + 1), matching every other display site");
+  });
+
+  test("storeDirectoryV2 prints 'Phase A (stable section):' / 'Phase B (full CAR):' headers (#1011)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    assert.match(src, /Phase A \(stable section\):/,
+      ">> FAIL: chunk-numbering: storeDirectoryV2 must print a 'Phase A (stable section):' header before the Phase A upload block");
+    assert.match(src, /Phase B \(full CAR\):/,
+      ">> FAIL: chunk-numbering: storeDirectoryV2 must print a 'Phase B (full CAR):' header before the Phase B upload block");
   });
 
   test("owned-name update preflight announces the owner phone signature; header drops the transfer claim (#60 regression guard)", () => {
@@ -12733,6 +15575,39 @@ describe("incremental-stats v3 summary", () => {
     };
     const out = renderSummary(stats);
     assert.match(out, /Upload:.*3 chunks/);
+  });
+
+  test("renderSummary labels Probed as Phase-A-only and Upload as A+B combined (#1011)", () => {
+    // #1011: Probed: (probedTotal/probePresent/probeAbsent) is populated ONLY from
+    // Phase A's section-1 probe (probeResultsForStats in deploy.ts omits sections
+    // 0/2, which Phase A never probes) while Upload: (chunksUploaded/bytesUploaded)
+    // combines BOTH phases — the exact "9 / 10 / 13 contradict each other" report.
+    // Labeling them removes the ambiguity without changing either figure.
+    const stats = {
+      manifestSource: "embedded", manifestFetchAttempts: 1, manifestBytes: 27_000,
+      framework: null,
+      filesTotal: 76, filesStable: 75, filesVolatile: 1,
+      probedTotal: 13, probePresent: 10, probeAbsent: 0, probeFailed: 3,
+      probeFailedRpc: 3, probeFailedDecode: 0, probeFailedMetadata: 0,
+      recycledCids: 0, retentionPeriodBlocks: 100800,
+      bytesProbePresent: 9_300_000, bytesProbeAbsent: 0,
+      bytesSkipped: 9_300_000, bytesUploaded: 1_500_000,
+      chunksTotal: 13, chunksUploaded: 3, chunksSkipped: 10,
+      carBytes: 10_300_000,
+      section0Bytes: 27_000, section1Bytes: 9_312_991, section2Bytes: 1_458_630,
+      estimatedSecondsSaved: 35,
+      tier2VerifiedCount: 0, tier2FallbackCount: 0, tier2InconclusiveCount: 0,
+    };
+    const out = renderSummary(stats);
+    // test/e2e.test.js parses live stdout with /Probed:\s+(\d+)\s+chunks/ and
+    // /Upload:\s+([\d.]+)\s+MB\s+across\s+(\d+)\s+chunks/ (no end anchor) — the
+    // phase label must come AFTER the number, never between "Probed"/"Upload"
+    // and the colon or between the colon and the number, or it silently breaks
+    // the live E2E harness's parsing.
+    assert.match(out, /Probed:\s+13 chunks.*\(Phase A only\)/,
+      ">> FAIL: renderSummary: Probed line must be suffixed '(Phase A only)' after the existing count/absent text");
+    assert.match(out, /Upload:\s+[\d.]+ MB across 3 chunks \(A\+B combined\)/,
+      ">> FAIL: renderSummary: Upload line must be suffixed '(A+B combined)' right after the chunk count");
   });
 
   test("probeResultsForStats omits non-probed Phase A chunks (#513 — no fabricated rpc_error)", () => {
@@ -13105,6 +15980,375 @@ describe("incremental-v2 scenarios (mocked storage)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// #1383 regression guard: CAR-section classification must be a pure function
+// of the current directory's content — never of a previous deploy's
+// manifest. An earlier attempt at fixing #1355 threaded a prevManifest-aware
+// classifyFn (CID-match only, ignoring the recorded `type`) into
+// buildOrderedCar. Because index.html is deliberately heuristic-volatile (no
+// content hash in its name) but is often byte-identical between two
+// consecutive deploys, that CID-match flipped it to "stable" on the second
+// deploy, migrating it into section 1's tail and forcing a
+// never-before-uploaded chunk — confirmed on real chain via S-INC-PORTABILITY
+// ("Probed 10 → 9 on chain, 1 absent"). This test exercises buildOrderedCar
+// exactly as deploy.ts calls it: no classifyFn override, so the bare default
+// `(p) => classifyFile(p)` applies — which never even receives a
+// prevManifest — across two back-to-back, byte-identical deploys of the same
+// directory.
+// ---------------------------------------------------------------------------
+describe("portability: CAR-section classification independent of deploy history (#1383 regression guard)", () => {
+  test("section-1 membership is identical across two byte-identical deploys; index.html never migrates in", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-port-"));
+    try {
+      fs.writeFileSync(path.join(dir, "vendor-9f8e7d6c.js"), Buffer.alloc(80_000, 0x42));
+      fs.writeFileSync(path.join(dir, "index.html"), "<html>unchanged</html>");
+
+      // Deploy 1: no prevStableOrder, no classifyFn override.
+      const out1 = await merkleizeJSBackend(dir);
+      const car1 = await buildOrderedCar({ output: out1 });
+
+      // Deploy 2: identical directory content (index.html byte-for-byte the
+      // same), fed deploy 1's own stableOrder as prevStableOrder — matching
+      // what deploy.ts actually passes to merkleizeWithStableOrder.
+      const out2 = await merkleizeJSBackend(dir);
+      const car2 = await buildOrderedCar({ output: out2, prevStableOrder: car1.stableOrder });
+
+      // Sanity: confirm this genuinely is the byte-identical scenario.
+      assert.equal(out1.fileCids.get("index.html"), out2.fileCids.get("index.html"));
+      assert.ok(car1.stableOrder.length > 0, "vendor bundle must land in section 1 for this test to be meaningful");
+
+      // Portability property: exact set equality, not mere overlap — a
+      // migrated file would inflate car2.stableOrder beyond car1.stableOrder
+      // while every original member still "overlaps".
+      assert.deepEqual([...car2.stableOrder].sort(), [...car1.stableOrder].sort());
+
+      const htmlCid = out2.fileCids.get("index.html");
+      assert.ok(!car2.stableOrder.includes(htmlCid),
+        "index.html must never enter the stable section — it has no content hash in its name");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1527/#1528 Phase 1: the framework-aware classifyFn threaded through
+// buildOrderedCar must preserve the same C1 invariant the describe block
+// above guards. The naive version of this test — build once with a
+// prevManifest and once without — passes even under a reverted classifier,
+// so it proves nothing. This mirrors the actual shape instead: classify tree
+// T with the new framework-aware classifyFn, capture its stableBlockOrder,
+// then run the CAR build again for the SAME T with that order fed back as
+// prevStableOrder, and assert section membership AND chunk boundaries (the
+// full ordered chunkCids array, not just the stable-order set) are
+// identical. That is what would have caught #1383: any classifyFn that lets
+// a file's classification depend on something other than (path, framework)
+// shifts chunk boundaries here.
+// ---------------------------------------------------------------------------
+describe("portability: per-framework classifyFn preserves the C1 invariant (#1527/#1528 Phase 1)", () => {
+  test("next-shaped tree: section membership and full chunk-boundary array identical across two identical builds", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-port-"));
+    try {
+      fs.mkdirSync(path.join(dir, "_next", "static", "chunks", "abc123"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "_next", "static", "chunks", "abc123", "main.js"), Buffer.alloc(40_000, 0x41));
+      fs.mkdirSync(path.join(dir, "_next", "static", "abc123"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "_next", "static", "abc123", "_buildManifest.js"), "self.__BUILD_MANIFEST=1;");
+      fs.writeFileSync(path.join(dir, "index.html"), "<html>unchanged</html>");
+
+      const framework = detectFramework(dir);
+      assert.equal(framework, "next", ">> FAIL: fixture setup: expected this tree to detect as 'next' for the test to be meaningful");
+      const classifyFn = (p) => classifyFile(p, { framework });
+
+      const out1 = await merkleizeJSBackend(dir);
+      const car1 = await buildOrderedCar({ output: out1, classifyFn });
+
+      const out2 = await merkleizeJSBackend(dir);
+      const car2 = await buildOrderedCar({ output: out2, classifyFn, prevStableOrder: car1.stableOrder });
+
+      // Section membership: exact set equality.
+      assert.deepEqual([...car2.stableOrder].sort(), [...car1.stableOrder].sort(),
+        ">> FAIL: next-shaped tree: section-1 (stable) file membership changed between two identical builds");
+
+      // Chunk boundaries: the FULL ordered chunk-CID array, not just the
+      // stable-order set — this is the #1389 assertion target ("chunk index
+      // 9 disappeared").
+      assert.deepEqual(car2.chunkCids, car1.chunkCids,
+        ">> FAIL: next-shaped tree: ordered chunk-CID array changed between two identical builds — chunk boundaries are not a pure function of (path, framework)");
+      assert.deepEqual(car2.sectionChunkCounts, car1.sectionChunkCounts,
+        ">> FAIL: next-shaped tree: section chunk counts changed between two identical builds");
+
+      // The excluded file must never migrate into section 1, on either pass.
+      const buildManifestCid = out2.fileCids.get("_next/static/abc123/_buildManifest.js");
+      assert.ok(!car1.stableOrder.includes(buildManifestCid) && !car2.stableOrder.includes(buildManifestCid),
+        ">> FAIL: _buildManifest.js (stable path, mutable content) must never enter section 1");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase A / Phase B chunk-subset invariant — permanent regression guard.
+// ---------------------------------------------------------------------------
+// A prior design proposal considered removing the two-merkleization Phase
+// A/B split because Phase A can, in theory, upload a chunk the final CAR
+// (Phase B) never references — paid for and orphaned. #1459 fixed one
+// concrete cause of exactly that (a duplicate-CID file double-counted in
+// section 1's packing between phases).
+//
+// This is NOT a bug fix. This is a discriminating experiment: a failing case
+// here would justify redesigning the two-phase split; a clean pass across
+// the shapes that historically diverged is evidence the divergence class is
+// closed post-#1459, and this guard is what keeps it closed.
+//
+// Mirrors real deploy.ts sequencing:
+//   1. writeEmbeddedManifestPlaceholder — a small placeholder manifest,
+//      written BEFORE Phase A's merkleize.
+//   2. Phase A merkleize + buildOrderedCar, anchored on the PRIOR deploy's
+//      stableOrder (or unanchored, for a first deploy). Phase A uploads its
+//      section-1 chunk set — `phaseA.section1ChunkCids`.
+//   3. finaliseEmbeddedManifest — the real, much larger manifest — written
+//      BEFORE Phase B's re-merkleize. This is the size delta that
+//      historically moved chunk boundaries.
+//   4. Phase B merkleize + buildOrderedCar, anchored on Phase A's OWN
+//      stableOrder. Phase B's `chunkCids` is what the deploy actually
+//      uploads/references for sections 0+1+2.
+//
+// buildOrderedCar `continue`s past MANIFEST_PATH before file classification,
+// so the manifest is always confined to section 0 — this harness DOES reach
+// the placeholder→finalised transition at unit level. The `finalisedBytes >
+// placeholderBytes` checks below are fixture sanity (confirming the
+// transition actually happened), not a standalone proof that section 1 is
+// independent of it — that independence falls out of buildOrderedCar's
+// structure (section 0 is packed separately and never merged into section
+// 1's byte stream), which the subset assertion exercises indirectly.
+//
+// Structural note, so a future reader doesn't mistake this for 4 independent
+// discriminators: Phase B always anchors on Phase A's OWN stableOrder, over
+// the same tree (deploy.ts's real sequencing, mirrored here). Given that,
+// buildOrderedCar's anchored-placement loop forces Phase B's section-1 order
+// to replay Phase A's exactly, so packSection (deterministic) must reproduce
+// Phase A's chunks byte-for-byte UNLESS the two phases' dedup-by-fileCid
+// disagrees — exactly the #1459 mechanism. That makes "duplicate-CID files"
+// the one case that can structurally fail; "unhashed index.html", "asset
+// rotation", and "control" regression-guard their own named issues (a file
+// never migrating into section 1, membership tracking a rotated anchor
+// correctly, exact byte-identity on a no-op redeploy) and validate the
+// subset property holds under those specific mutations too, rather than
+// stress the packing algorithm itself. The first test below is a synthetic
+// mutation case that proves `assertPhaseASubset` actually fires — the other
+// four passing green is otherwise ambiguous between "divergence class closed"
+// and "guard doesn't discriminate".
+describe("portability: Phase A upload set is a subset of Phase B's final CAR (#1517 discriminating experiment)", { concurrency: true }, () => {
+  // Fixture helpers shared by every case below.
+  function writeAsset(dir, relPath, sizeBytes, fillByte) {
+    fs.mkdirSync(path.join(dir, path.dirname(relPath)), { recursive: true });
+    fs.writeFileSync(path.join(dir, relPath), Buffer.alloc(sizeBytes, fillByte));
+  }
+
+  async function withTmpDir(prefix, fn) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    try {
+      return await fn(dir);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  // The "anchoring deploy" (deploy N-1): a plain, unanchored buildOrderedCar
+  // pass whose stableOrder feeds Phase A's prevStableOrder — the same role
+  // fetchPreviousManifest's stableBlockOrder plays in deploy.ts.
+  async function buildAnchoringDeploy(dir) {
+    const classifyFn = (p) => classifyFile(p, { framework: null });
+    const out = await merkleizeJSBackend(dir);
+    const build = await buildOrderedCar({ output: out, classifyFn });
+    return { out, build };
+  }
+
+  async function runPhaseAThenPhaseB(dir, { framework = null, phaseAPrevStableOrder = [] } = {}) {
+    const classifyFn = (p) => classifyFile(p, { framework });
+
+    writeEmbeddedManifestPlaceholder(dir, {
+      version: MANIFEST_VERSION,
+      previousContenthash: null,
+      deployedAt: "2026-01-01T00:00:00.000Z",
+      framework: null,
+    });
+    const placeholderBytes = fs.statSync(path.join(dir, MANIFEST_PATH)).size;
+    const outA = await merkleizeJSBackend(dir);
+    const phaseA = await buildOrderedCar({ output: outA, classifyFn, prevStableOrder: phaseAPrevStableOrder, phase: "Phase A" });
+
+    // The real finalised manifest: full file list + chunk map, materially
+    // larger than the placeholder — this is the byte-size transition that
+    // historically moved chunk boundaries. buildFilesMap is the exact
+    // function deploy.ts calls at this point, so this mirrors production
+    // classification instead of re-deriving it.
+    const files = buildFilesMap(dir, outA.fileCids, framework);
+    const chunks = {};
+    for (const cid of phaseA.chunkCids) chunks[cid] = { size: 1000, deployed_at: "2026-01-01T00:00:00.000Z" };
+    finaliseEmbeddedManifest(dir, {
+      version: MANIFEST_VERSION,
+      previousContenthash: null,
+      deployedAt: "2026-01-01T00:00:01.000Z",
+      framework,
+      files,
+      stableBlockOrder: phaseA.stableOrder,
+      blocks: phaseA.blockOrder,
+      chunks,
+    });
+    const finalisedBytes = fs.statSync(path.join(dir, MANIFEST_PATH)).size;
+    const outB = await merkleizeJSBackend(dir);
+    const phaseB = await buildOrderedCar({ output: outB, classifyFn, prevStableOrder: phaseA.stableOrder, phase: "Phase B" });
+
+    return { phaseA, phaseB, outA, outB, placeholderBytes, finalisedBytes };
+  }
+
+  function assertPhaseASubset(phaseA, phaseB, label) {
+    const phaseBSet = new Set(phaseB.chunkCids);
+    const orphaned = phaseA.section1ChunkCids.filter((c) => !phaseBSet.has(c));
+    assert.deepEqual(
+      orphaned,
+      [],
+      `>> FAIL: ${label}: Phase A uploaded ${orphaned.length} section-1 chunk(s) that Phase B's final CAR does not reference — ` +
+      `orphaned CIDs: [${orphaned.join(", ")}] ` +
+      `(phaseA s1=${phaseA.sectionSizes.section1}B/${phaseA.sectionChunkCounts.section1}chunks, ` +
+      `phaseB s0=${phaseB.sectionSizes.section0}B s1=${phaseB.sectionSizes.section1}B/${phaseB.sectionChunkCounts.section1}chunks s2=${phaseB.sectionSizes.section2}B)`
+    );
+  }
+
+  // Multi-chunk fixture sanity, shared by every case: enough stable bytes to
+  // force >=N section-1 chunks, so the subset check exercises a real chunk
+  // boundary rather than trivially holding for a single chunk.
+  function assertMultiChunkFixture(phaseA, minChunks = 2) {
+    assert.ok(phaseA.sectionChunkCounts.section1 >= minChunks,
+      `>> FAIL: fixture setup: expected >=${minChunks} section-1 chunks, got ${phaseA.sectionChunkCounts.section1} — fixture too small to exercise a chunk boundary`);
+  }
+
+  // Meta-test: prove assertPhaseASubset actually fires, on a synthetic
+  // divergence, before trusting the four real-fixture cases below to be
+  // meaningful rather than vacuous. Without this, five greens are ambiguous
+  // between "the divergence class is closed" and "this guard never catches
+  // anything."
+  test("assertPhaseASubset fires when Phase A's section-1 CIDs are not a subset of Phase B's chunkCids (synthetic)", () => {
+    const phaseA = {
+      section1ChunkCids: ["bafkOrphan1", "bafkShared1"],
+      sectionSizes: { section1: 2_000_000 },
+      sectionChunkCounts: { section1: 2 },
+    };
+    const phaseB = {
+      chunkCids: ["bafkHeader", "bafkShared1", "bafkRootDir"], // missing bafkOrphan1
+      sectionSizes: { section0: 100, section1: 1_000_000, section2: 200 },
+      sectionChunkCounts: { section1: 1 },
+    };
+    assert.throws(
+      () => assertPhaseASubset(phaseA, phaseB, "synthetic divergence"),
+      (err) => {
+        assert.match(err.message, /synthetic divergence/, "error must name the case");
+        // Exactly the orphaned CID, not the shared one that IS in phaseB.chunkCids.
+        assert.match(err.message, /orphaned CIDs: \[bafkOrphan1\]/, "error must list exactly the one orphaned CID, excluding the shared one");
+        return true;
+      },
+      ">> FAIL: assertPhaseASubset meta-test: helper did not throw on a genuine Phase-A/Phase-B divergence"
+    );
+  });
+
+  test("duplicate-CID files (#1459): byte-identical stable files at two paths stay deduped across Phase A and Phase B", async () => {
+    await withTmpDir("bd-phaseab-dup-", async (dir) => {
+      writeAsset(dir, "assets/logo-a.png", 600_000, 0x41);
+      writeAsset(dir, "assets/logo-b.png", 600_000, 0x41); // same bytes -> same CID, different path
+      writeAsset(dir, "assets/banner.png", 600_000, 0x42);
+      fs.writeFileSync(path.join(dir, "index.html"), "<html>unchanged</html>");
+
+      const { phaseA, phaseB, outA, finalisedBytes, placeholderBytes } = await runPhaseAThenPhaseB(dir);
+
+      // Fixture sanity: confirm the duplicate really collapsed to ONE section-1
+      // entry (fileCid-keyed), not two — otherwise this case tests nothing.
+      const logoACid = outA.fileCids.get("assets/logo-a.png");
+      const logoBCid = outA.fileCids.get("assets/logo-b.png");
+      assert.equal(logoACid, logoBCid, ">> FAIL: fixture setup: logo-a.png and logo-b.png must produce the same CID for this to be a duplicate-CID case");
+      const occurrences = phaseA.stableOrder.filter((cid) => cid === logoACid).length;
+      assert.equal(occurrences, 1, `>> FAIL: duplicate-CID files: the duplicate CID appears ${occurrences} times in Phase A's stableOrder, expected exactly 1 (dedup should collapse it)`);
+      assert.ok(finalisedBytes > placeholderBytes, ">> FAIL: fixture setup: finalised manifest must be larger than the placeholder to exercise the size transition");
+      assertMultiChunkFixture(phaseA);
+
+      assertPhaseASubset(phaseA, phaseB, "duplicate-CID files (#1459)");
+    });
+  });
+
+  test("unhashed index.html, byte-identical across builds (#1383/#1389): stays volatile in both phases, never enters section 1", async () => {
+    await withTmpDir("bd-phaseab-idx-", async (dir) => {
+      writeAsset(dir, "assets/app.png", 700_000, 0x41);
+      writeAsset(dir, "assets/vendor.png", 700_000, 0x42);
+      // No content hash in the filename, and content is identical across
+      // Phase A and Phase B by construction (nothing rewrites it) — this is
+      // the exact "heuristically volatile but unchanged" shape #1383/#1389
+      // describe. classifyFn here never threads prevManifest (matches
+      // deploy.ts's actual classifyFn wrapper), so this stays a heuristic
+      // classification, not a CID-match one.
+      fs.writeFileSync(path.join(dir, "index.html"), "<html><body>same every deploy</body></html>");
+
+      const { phaseA, phaseB, outA, outB } = await runPhaseAThenPhaseB(dir);
+
+      const indexCidA = outA.fileCids.get("index.html");
+      const indexCidB = outB.fileCids.get("index.html");
+      assert.equal(indexCidA, indexCidB, ">> FAIL: fixture setup: index.html must be byte-identical (same CID) across Phase A and Phase B for this to be the #1383/#1389 shape");
+      assert.ok(!phaseA.stableOrder.includes(indexCidA), ">> FAIL: unhashed index.html: must not enter Phase A's section 1 (stable) despite being byte-identical");
+      assert.ok(!phaseB.stableOrder.includes(indexCidB), ">> FAIL: unhashed index.html: must not enter Phase B's section 1 (stable) despite being byte-identical");
+      assertMultiChunkFixture(phaseA);
+
+      assertPhaseASubset(phaseA, phaseB, "unhashed index.html, byte-identical (#1383/#1389)");
+    });
+  });
+
+  test("asset rotation (S-INC-ASSET-ROTATION): section-1 membership changes between the anchoring deploy and this one", async () => {
+    await withTmpDir("bd-phaseab-rot-old-", async (dirOld) => {
+      await withTmpDir("bd-phaseab-rot-new-", async (dirNew) => {
+        // Deploy N-1: assetA + assetB stable, unanchored (its own first build).
+        writeAsset(dirOld, "assets/assetA.png", 650_000, 0x41);
+        writeAsset(dirOld, "assets/assetB.png", 650_000, 0x42);
+        fs.writeFileSync(path.join(dirOld, "index.html"), "<html>old</html>");
+        const { out: outOld, build: buildOld } = await buildAnchoringDeploy(dirOld);
+
+        // Deploy N: assetA removed, assetB unchanged (byte-identical), assetC
+        // newly added — section-1 membership genuinely changes.
+        writeAsset(dirNew, "assets/assetB.png", 650_000, 0x42);
+        writeAsset(dirNew, "assets/assetC.png", 650_000, 0x43);
+        fs.writeFileSync(path.join(dirNew, "index.html"), "<html>new</html>");
+
+        const { phaseA, phaseB, outA } = await runPhaseAThenPhaseB(dirNew, { phaseAPrevStableOrder: buildOld.stableOrder });
+
+        // Fixture sanity: membership actually rotated.
+        const assetACid = outOld.fileCids.get("assets/assetA.png");
+        const assetCCid = outA.fileCids.get("assets/assetC.png");
+        assert.ok(!phaseA.stableOrder.includes(assetACid), ">> FAIL: fixture setup: removed assetA must not appear in Phase A's stableOrder");
+        assert.ok(phaseA.stableOrder.includes(assetCCid), ">> FAIL: fixture setup: newly-added assetC must appear in Phase A's stableOrder");
+        assert.ok(phaseA.sectionChunkCounts.section1 >= 1, ">> FAIL: fixture setup: expected at least 1 section-1 chunk");
+
+        assertPhaseASubset(phaseA, phaseB, "asset rotation (S-INC-ASSET-ROTATION)");
+      });
+    });
+  });
+
+  test("control: plain unchanged redeploy — identical tree across the anchoring build, Phase A, and Phase B", async () => {
+    await withTmpDir("bd-phaseab-ctl-", async (dir) => {
+      writeAsset(dir, "assets/asset1.png", 650_000, 0x41);
+      writeAsset(dir, "assets/asset2.png", 650_000, 0x42);
+      fs.writeFileSync(path.join(dir, "index.html"), "<html>unchanged</html>");
+
+      const { build: buildOld } = await buildAnchoringDeploy(dir); // deploy N-1, unanchored
+      const { phaseA, phaseB } = await runPhaseAThenPhaseB(dir, { phaseAPrevStableOrder: buildOld.stableOrder });
+
+      assertMultiChunkFixture(phaseA);
+      // Stronger than subset: nothing changed, so section-1 membership must be
+      // byte-identical between Phase A and Phase B, not merely a subset.
+      assert.deepEqual([...phaseB.stableOrder].sort(), [...phaseA.stableOrder].sort(),
+        ">> FAIL: control unchanged redeploy: section-1 membership differs between Phase A and Phase B despite no content change");
+
+      assertPhaseASubset(phaseA, phaseB, "control: plain unchanged redeploy");
+    });
+  });
+});
+
 describe("storeChunkedContent isValid:false backstop", () => {
   test("ExistingProvider accepts probeFailedCids without TypeError", async () => {
     // Smoke-test: verify that storeChunkedContent destructures probeFailedCids
@@ -13214,22 +16458,28 @@ describe("storeChunkedContent post-upload chunk verification", () => {
     });
   });
 
-  test("probe-failed chain response (present:null) does not throw", async () => {
+  // #1657: an unanswered probe used to skip the upload, keeping the chunk on
+  // no evidence. Now the chunk is uploaded like an absent one (a duplicate
+  // store is harmless; a missing chunk is not), and the deploy still succeeds.
+  test("probe-failed chain response (present:null) is not treated as stored: the chunk is uploaded, no throw", async () => {
     _resetProbeSession(); _bypassMetadataCheckForTest();
     const chunk = new Uint8Array([0x45]);
     const chunkCid = createCID(chunk).toString();
+    let txCalls = 0;
+    const api = makeStubApi(() => { txCalls++; return normalSubscribable(); });
 
     await storeChunkedContent([chunk], {
       client: {
         destroy() {},
         _request: async () => { throw new Error("RPC timeout"); },
       },
-      unsafeApi: makeStubApi(normalSubscribable),
+      unsafeApi: api,
       signer: stubSigner,
       ss58: STUB_SS58,
       fetchNonce: async () => 100,
       skipCids: new Set([chunkCid]),
     });
+    assert.ok(txCalls >= 1, ">> FAIL: #1657: a chunk whose skip probe never answered must be uploaded, not kept as stored");
   });
 
   test("skipCids chunk absent is uploaded and deploy succeeds", async () => {
@@ -14244,7 +17494,7 @@ describe("paseo-next-v2 E2E harness wiring", () => {
 
   function assertNoStatusLabel(label) {
     assert.strictEqual(
-      classifyDotnsLabel(label).status,
+      classifyDotnsLabel(label, DEFAULT_TLD, "poprules-startingPrice").status,
       ProofOfPersonhoodStatus.NoStatus,
       `${label}.dot must classify as NoStatus on DotNS`,
     );
@@ -14285,7 +17535,6 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       DOTNS_REGISTRAR_CONTROLLER: "0x35f8594c8e68a0ad079bca5f72bf6c9560ac22b0",
       DOTNS_REGISTRY: "0x64e619ea4d8a593c68533c0feaf3e36d3666495b",
       DOTNS_POP_CONTROLLER: "0xb0dd60b3da4a563cdc8aa78ec9d5b169f81046f1",
-      ROOT_GATEWAY_DISPATCHER: "0x2cedd39924d216b4a49f4c532e03fe79d006e89e",
       DOTNS_RESOLVER: "0x5296344ed752c19cdee2bb3e5e5b015ba69982c7",
       DOTNS_CONTENT_RESOLVER: "0xa27c323a30c7ee1f0a7a35f48983d98d18c53445",
       DOTNS_REVERSE_RESOLVER: "0x099b539bf034c741404d393ab95946e4923bc7ab",
@@ -14312,16 +17561,18 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       DOTNS_REGISTRAR_CONTROLLER: "0xBdaA01bD1bA67d709F2b1fF286Da0d854977EA30",
       DOTNS_REGISTRY: "0xf34054fd76BbF85f216cf9908226D5f0A72E50CA",
       DOTNS_POP_CONTROLLER: "0xCC932348606cc1f3318cADeC5A5Cd2CA447f8a4b",
-      ROOT_GATEWAY_DISPATCHER: "0xa889CCA3Fb4B07b98a11cc54C10f13dDA20bc3db",
       DOTNS_RESOLVER: "0xbd1165E549DF96F083c0A16f61590927bC187009",
       DOTNS_CONTENT_RESOLVER: "0x7F74D7CD50f5a834270E2ad395a01b01891AB37d",
       DOTNS_REVERSE_RESOLVER: "0xee3883d7eB60Ee9BCD7F3bcD8f2f05302A9Cc035",
       DOTNS_POP_RESOLVER: "0xDaC984884EcA8Fc44011f1D6C49B27828390A72B",
       DOTNS_NAME_ESCROW: "0x4881Afb78e7C908cAe818168B926229D93376520",
       POP_RULES: "0x747B456bE03aec0b42bd85C51513730FBD45DA31",
-      STORE_FACTORY: "0x709A027F446a9e2a4BB9cb9a9c754435b19e32B7",
-      LABEL_STORE_BEACON: "0xb57Ebc2e7085616d4906D1fE49af1cE13f7dffeF",
-      USER_STORE_BEACON: "0xb7C995601679840d36F37E86DB2d7dF30797eC5C",
+      // bulletin-deploy #1514: paseo-assethub's store set moved onto the v0.8.0
+      // proxy upstream; both old and new trios still have code on paseo-next-v2
+      // (verified on-chain), so this just follows the record.
+      STORE_FACTORY: "0x99605a926FcB40aB520F659c6505E5ff862771f6",
+      LABEL_STORE_BEACON: "0x2227d9807F5A71332Aaa0640643030f2A3bf84cD",
+      USER_STORE_BEACON: "0x3d1Ca165f7A5e387C2df02DB2FadD3149c1C72ad",
       MULTICALL3: "0xB4468000abD87D3c56cbFBd153161223D7b109e5",
     }, ">> FAIL: paseo-next-v2-contracts: assets/environments.json contract addresses drifted from the canonical DotNS deployment. Re-check paritytech/dotns DEPLOYMENTS.md — a stale address surfaces as \"No contract deployed at 0x… \" in preflight, not as a build error.");
     assert.strictEqual(env.tld, "paseo",
@@ -14393,16 +17644,21 @@ describe("paseo-next-v2 E2E harness wiring", () => {
   test("custom-env verification helper forwards nativeToEthRatio", () => {
     const verifyHelper = fs.readFileSync("test/helpers/e2e-verify.js", "utf-8");
     assert.ok(
-      /nativeToEthRatio:\s*resolved\.nativeToEthRatio/.test(verifyHelper),
-      "test/helpers/e2e-verify.js must pass nativeToEthRatio through when env-specific DotNS reads are requested",
+      /dotnsConnectOptions/.test(verifyHelper),
+      "test/helpers/e2e-verify.js must take its DotNS connect options from the shared env helper, which forwards nativeToEthRatio",
     );
   });
 
   test("custom-env E2E writer paths forward env-specific DotNS options in both connect sites", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
+    const envHelper = fs.readFileSync("test/helpers/e2e-env.js", "utf-8");
     assert.ok(
-      /async function resolveDotnsEnvConnectOptions\(\)[\s\S]{0,500}nativeToEthRatio:\s*resolved\.nativeToEthRatio/.test(e2e),
-      "test/e2e.test.js must define a shared env-connect helper that forwards nativeToEthRatio",
+      /dotnsConnectOptions:\s*\{[\s\S]{0,500}nativeToEthRatio:\s*resolved\.nativeToEthRatio/.test(envHelper),
+      "test/helpers/e2e-env.js must build the DotNS connect options and forward nativeToEthRatio",
+    );
+    assert.ok(
+      /async function resolveE2eTld\(\)\s*\{\s*return \(await resolveE2eEnv\(/.test(e2e),
+      "test/e2e.test.js must resolve the TLD through the shared env helper, not a literal fallback",
     );
     const helperCalls = e2e.match(/resolveDotnsEnvConnectOptions\(\)/g) ?? [];
     assert.ok(
@@ -14425,9 +17681,10 @@ describe("paseo-next-v2 E2E harness wiring", () => {
 
   test("custom-env roundtrip tests derive the gateway from environments.json", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
+    const envHelper = fs.readFileSync("test/helpers/e2e-env.js", "utf-8");
     assert.ok(
-      /async function resolveE2eGateway\(\)[\s\S]{0,400}env\?\.ipfs/.test(e2e),
-      "test/e2e.test.js must derive the gateway from the selected PAD_ENV ipfs endpoint",
+      /gateway:\s*resolved\.ipfs/.test(envHelper),
+      "test/helpers/e2e-env.js must derive the gateway from the resolved environment's ipfs endpoint",
     );
     assert.ok(
       /const gateway = await resolveE2eGateway\(\)/.test(e2e),
@@ -14437,9 +17694,10 @@ describe("paseo-next-v2 E2E harness wiring", () => {
 
   test("S8 fault proxy follows the selected env and preserves env-aware CLI args", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
+    const envHelper = fs.readFileSync("test/helpers/e2e-env.js", "utf-8");
     assert.ok(
-      /async function resolveE2eBulletinRpc\(\)[\s\S]{0,220}resolveEndpoints\(doc, PAD_ENV\)\.bulletin\[0\]/.test(e2e),
-      "S8 must resolve the fault-proxy upstream from environments.json when PAD_ENV is set",
+      /bulletin:\s*resolved\.bulletin\[0\]/.test(envHelper),
+      "S8 must resolve the fault-proxy upstream from environments.json, not a hardcoded endpoint",
     );
     assert.ok(
       /startFaultProxy\(\{[\s\S]{0,220}mode: "once"[\s\S]{0,220}upstream: await resolveE2eBulletinRpc\(\)/.test(e2e),
@@ -14449,11 +17707,11 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       /startFaultProxy\(\{[\s\S]{0,260}mode: "rapid"[\s\S]{0,260}upstream: await resolveE2eBulletinRpc\(\)/.test(e2e),
       "S8 rapid proxy must target the selected environment's Bulletin RPC",
     );
-    // S8 uses a fresh per-run label picked once at describe scope, so both
-    // deploys reference the same `label` binding rather than re-calling
-    // pickDirectLabel(). Verify: one fresh-label pick + two buildArgs calls.
-    assert.match(e2e, /describe\("S8[\s\S]{0,300}const label = pickFreshRunLabel\("s8smoke"\)/,
-      "S8 must pick a fresh per-run label once at describe scope");
+    // S8 picks its label once at describe scope (the tier's fixed label since
+    // bulletin #1623), so both deploys reference the same `label` binding rather than
+    // re-calling pickDirectLabel(). Verify: one label pick + two buildArgs calls.
+    assert.match(e2e, /describe\("S8[\s\S]{0,300}const label = tieredLabel\("s8"\)/,
+      "S8 must pick its tier label once at describe scope");
     // #paseo-tld: the suffix is now the env's resolved tld (bare "dot" was
     // hardcoded pre-#1240; the CLI's wrong-TLD guard would reject that on a
     // .paseo env), so this regex accepts any `.${tld}`-shaped interpolation
@@ -14469,7 +17727,9 @@ describe("paseo-next-v2 E2E harness wiring", () => {
   test("PR/source E2E harness uses NoStatus labels when the signer has no PoP status", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
 
-    for (const label of ["e2epoolns01", "e2edirect01", "e2eincpool01", "e2erotpool01", "e2escarpool01"]) {
+    // S-CAR's old e2escarpool01 fallback is gone (bulletin #1623): it deploys to a
+    // per-tier label, each pinned NoStatus on every profile in test/e2e-fixtures.test.js.
+    for (const label of ["e2epoolns01", "e2edirect01", "e2eincpool01", "e2erotpool01"]) {
       assertNoStatusLabel(label);
       assert.match(e2e, new RegExp(label), `source E2E harness must include NoStatus fallback label ${label}.dot`);
     }
@@ -14482,6 +17742,17 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     for (const label of ["e2e-fresh25829471478abcdef0x00", "e2e-s525829471478abcdef0x00"]) {
       assertNoStatusLabel(sanitizeDomainLabel(label));
     }
+  });
+
+  test("#274: S-INC-CROSSLABEL folds MERKLE into both fresh-label prefixes (call-site regression guard)", () => {
+    const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
+    assert.match(
+      e2e,
+      // bulletin #1623: label A is the per-merkle tier label; label B is a subname of A,
+      // so it inherits the merkle discriminator.
+      /describe\("S-INC-CROSSLABEL[\s\S]{0,2000}const labelA = tieredLabel\(`s-inc-crosslabel-a-\$\{MERKLE\}`\);[\s\S]{0,200}const labelB = `[^`]*\.\$\{labelA\}`;/,
+      ">> FAIL: crosslabel-leg-collision: S-INC-CROSSLABEL must fold MERKLE into label A (and derive label B from A) so the js and kubo matrix legs (which share RUN_TAG) can't pick the same labels.",
+    );
   });
 
   test("select-env defaults to paseo-next-v2 as the primary environment", () => {
@@ -14556,7 +17827,6 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     for (const label of [
       "e2es525829471478a1x00",
       "e2epoolns01",
-      "e2escar25829471478a1x00",
     ]) {
       assertNoStatusLabel(label);
     }
@@ -14564,7 +17834,12 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     assert.match(workflowJobBlock(workflow, "nightly-s5"), /LABEL:\s*"e2es5\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00"/, "nightly S5 must use a dynamic NoStatus label");
     assert.match(workflowJobBlock(workflow, "nightly-s6"), /build e2epoolns01\b(?!\.)/, "nightly S6 must deploy the NoStatus pool label as a BARE label — a \".dot\" suffix is rejected on a .paseo environment");
     assert.match(workflowJobBlock(workflow, "nightly-s7"), /LABEL:\s*e2epoolns01/, "nightly S7 must use the v2 NoStatus pool label");
-    assert.match(workflowJobBlock(workflow, "nightly-s-car"), /LABEL:\s*e2escar\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00$/m, "nightly S-CAR must use a dynamic NoStatus label");
+    // bulletin #1623: S-CAR deploys to the tier's fixed label from tools/lib/e2e-fixtures.mjs
+    // on both paths; a per-run LABEL here would register a fresh name every run.
+    const sCar = workflowJobBlock(workflow, "nightly-s-car");
+    assert.doesNotMatch(sCar, /^\s*LABEL:/m, ">> FAIL: S-CAR: the job must not set LABEL; it would override the provisioned per-tier label");
+    assert.match(sCar, /tieredFixtureLabel\("s-car", process\.env\.DEPLOY_TAG\)/, ">> FAIL: S-CAR: the npm-path script must take its label from tools/lib/e2e-fixtures.mjs");
+    assert.match(sCar, /DEPLOY_TAG: \$\{\{ needs\.build-nightly\.outputs\.deploy-tag \}\}/, ">> FAIL: S-CAR: the label tier comes from DEPLOY_TAG, so the job must set it");
 
     const sExt = workflowJobBlock(workflow, "nightly-s-ext-signer");
     assert.match(sExt, /setContenthash\("e2epoolns01", expected\)/, "nightly S-ext-signer must write the v2 NoStatus pool label");
@@ -14575,8 +17850,8 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     assert.doesNotMatch(sExt, /require\.resolve\("bulletin-deploy"\)/, "S-ext must not use CJS require.resolve on the ESM/export-mapped package");
 
     const s7Script = fs.readFileSync("scripts/e2e-sigint-scenario.mjs", "utf-8");
-    assert.match(s7Script, /const envFlag = PAD_ENV \? \["--env", PAD_ENV\] : \[\]/, "S7 harness must forward PAD_ENV to both deploy invocations");
-    assert.match(s7Script, /const LABEL = process\.env\.LABEL \?\? \(PAD_ENV === "paseo-next-v2" \? "e2epoolns01" : "e2epool"\)/, "S7 harness must default to the v2 NoStatus pool label");
+    assert.match(s7Script, /const envFlag = \["--env", ENV_ID\]/, "S7 harness must forward the resolved env to both deploy invocations");
+    assert.match(s7Script, /const LABEL = process\.env\.LABEL \?\? \(ENV_ID === "paseo-next-v2" \? "e2epoolns01" : "e2epool"\)/, "S7 harness must default to the v2 NoStatus pool label");
     // e2eownedns03, not e2eownedns02: the Asset Hub re-genesis emptied the
     // .paseo namespace and a third party squatted e2eownedns02.paseo before
     // this fixture was re-provisioned (verified live via checkOwnership).
@@ -14642,11 +17917,12 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     // single-env because mixing a free env dim with include produces additive (not cartesian)
     // expansion in GitHub Actions — include entries without the env key are appended as new
     // combinations rather than merged, silently dropping scenario coverage.
-    for (const jobName of ["nightly-s1-pool", "nightly-s1-direct", "nightly-s2-fresh",
+    // nightly-s1-direct is the readiness canary (#1624) and fans out over canary_envs; see the test below.
+    for (const jobName of ["nightly-s1-pool", "nightly-s2-fresh",
                            "nightly-s3", "nightly-s5", "nightly-s6", "nightly-s7",
                            "nightly-s8", "nightly-s9", "nightly-s-grandpa-reupload",
                            "nightly-s-mortality", "nightly-s-reprove", "nightly-s-car",
-                           "nightly-s-ext-signer"]) {
+                           "nightly-s-ext-signer", "nightly-s-reserved-invariant"]) {
       const block = workflowJobBlock(wf, jobName);
       assert.match(
         block,
@@ -14663,6 +17939,73 @@ describe("paseo-next-v2 E2E harness wiring", () => {
         `${jobName} must NOT fan out via healthy_envs (include-matrix incompatibility)`,
       );
     }
+  });
+
+  describe("env readiness wiring (#1624)", () => {
+    const wf = () => fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+
+    test("select-env exposes ready_envs, not_ready and canary_envs and writes them", () => {
+      const w = wf();
+      for (const out of ["ready_envs", "not_ready", "canary_envs"]) {
+        assert.match(w, new RegExp(`${out}:\\s*\\$\\{\\{\\s*steps\\.select\\.outputs\\.${out}\\s*\\}\\}`),
+          `>> FAIL: env-readiness: select-env must surface ${out} as a job output`);
+        assert.match(workflowJobBlock(w, "select-env"), new RegExp(`echo "${out}=`),
+          `>> FAIL: env-readiness: select-env must write ${out} to GITHUB_OUTPUT`);
+      }
+    });
+
+    test("select-env builds, runs tools/check-env-readiness.mjs per live env, and only on nightly-class events", () => {
+      const block = workflowJobBlock(wf(), "select-env");
+      assert.match(block, /npm run build/, ">> FAIL: env-readiness: the readiness tool imports dist/, so select-env must build");
+      assert.match(block, /node tools\/check-env-readiness\.mjs --env "\$env"/, ">> FAIL: env-readiness: select-env must call the readiness tool per env");
+      assert.match(block, /RUN_READINESS:.*schedule.*release.*workflow_dispatch/s, ">> FAIL: env-readiness: readiness must be gated to schedule/release/nightly dispatch");
+    });
+
+    test("an unknown/crashed readiness probe never excludes an env (only an explicit ready:false does)", () => {
+      const block = workflowJobBlock(wf(), "select-env");
+      assert.match(block, /jq -e '\.ready == false'/, ">> FAIL: env-readiness: only .ready == false may exclude an env");
+      assert.match(block, /no summary line; treating as unknown/, ">> FAIL: env-readiness: a missing summary line must be treated as unknown");
+    });
+
+    test("a release whose selected env is not ready fails select-env instead of falling back", () => {
+      const block = workflowJobBlock(wf(), "select-env");
+      assert.match(block, /EVENT_NAME" == "release"\s*\]\];\s*then[\s\S]*?exit 1/, ">> FAIL: env-readiness: release + not-ready selected env must exit 1");
+      assert.doesNotMatch(block, /EVENT_NAME" == "release" && .*READY\[0\]/, ">> FAIL: env-readiness: release must not move SELECTED to another env");
+    });
+
+    test("nightly-s1-direct is the canary: it fans out over canary_envs, every other fan-out stays on healthy_envs", () => {
+      const w = wf();
+      assert.match(workflowJobBlock(w, "nightly-s1-direct"), /fromJSON\(\s*needs\.select-env\.outputs\.canary_envs\s*\)/,
+        ">> FAIL: env-readiness: nightly-s1-direct must fan out over canary_envs");
+      assert.doesNotMatch(workflowJobBlock(w, "nightly-s1-pool"), /canary_envs/, ">> FAIL: env-readiness: only nightly-s1-direct may use canary_envs");
+      const users = [...w.matchAll(/canary_envs\) \}\}/g)].length;
+      assert.equal(users, 1, ">> FAIL: env-readiness: exactly one matrix may fan out over canary_envs");
+    });
+
+    test("build-nightly is skipped when no env is ready (empty matrix guard)", () => {
+      assert.match(workflowJobBlock(wf(), "build-nightly"), /needs\.select-env\.outputs\.healthy_envs != '\[\]'/,
+        ">> FAIL: env-readiness: build-nightly must skip when healthy_envs is [], an empty matrix errors every scenario job");
+    });
+
+    test("nightly-report renders an Environment readiness section from not_ready", () => {
+      const block = workflowJobBlock(wf(), "nightly-report");
+      assert.match(block, /NOT_READY:\s*\$\{\{\s*needs\.select-env\.outputs\.not_ready\s*\}\}/, ">> FAIL: env-readiness: report must read not_ready");
+      assert.match(block, /## Environment readiness/, ">> FAIL: env-readiness: report must carry an Environment readiness section");
+      assert.match(block, /cat \/tmp\/readiness-section\.md/, ">> FAIL: env-readiness: the section must be included in the report body");
+    });
+
+    test("nightly-report files ONE env-not-ready issue, deduped on the label", () => {
+      const block = workflowJobBlock(wf(), "nightly-report");
+      assert.match(block, /name: Open or update the env-not-ready issue/, ">> FAIL: env-readiness: missing the env-not-ready issue step");
+      assert.match(block, /LABEL=env-not-ready/, ">> FAIL: env-readiness: the issue must carry the env-not-ready label");
+      assert.match(block, /--data-urlencode "labels=\$LABEL"[\s\S]*?issues\/\$EXISTING\/comments/, ">> FAIL: env-readiness: an open labelled issue must get a comment, not a duplicate");
+    });
+
+    test("canary-only red does not file the normal failure issue", () => {
+      const block = workflowJobBlock(wf(), "nightly-report");
+      assert.match(block, /id: canary/, ">> FAIL: env-readiness: missing the canary-only classifier step");
+      assert.match(block, /steps\.canary\.outputs\.canary_only != 'true'/, ">> FAIL: env-readiness: the failure issue must be skipped when every red leg is a canary");
+    });
   });
 
   test("test-pr reads PAD_ENV from select-env, not hardcoded paseo-next-v2", () => {
@@ -14772,6 +18115,7 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       "nightly-s-car",
       "nightly-s-inc",
       "nightly-s-ext-signer",
+      "nightly-s-reserved-invariant",
     ];
     for (const jobName of nightlyJobs) {
       const block = workflowJobBlock(wf, jobName);
@@ -14813,6 +18157,7 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       "nightly-s-car",
       "nightly-s-inc",
       "nightly-s-ext-signer",
+      "nightly-s-reserved-invariant",
     ];
     for (const jobName of nightlyJobs) {
       const block = workflowJobBlock(wf, jobName);
@@ -14823,6 +18168,26 @@ describe("paseo-next-v2 E2E harness wiring", () => {
         `>> FAIL: nightly-always-gate: ${jobName} must have always() in its if: to override transitive auto-skip from detect-noop-push (see retro: e2e run 26648057966 / v0.7.30-rc.0 gating)`,
       );
     }
+  });
+
+  test("dispatch-s-v060-unblock only runs on workflow_dispatch test-suite='v060', never on PR/push/schedule/release (bulletin #1423/#1410)", () => {
+    // This repo has no preview env to fall back to while paseo-next-v2 lags
+    // the v0.6.0 redeploy — S-V060-UNBLOCK must NOT run automatically. It is
+    // dispatch-only, gated specifically on inputs.test-suite == 'v060'
+    // (distinct from every 'nightly'-gated job above).
+    const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const block = workflowJobBlock(wf, "dispatch-s-v060-unblock");
+    assert.ok(block, "dispatch-s-v060-unblock job not found");
+    assert.match(
+      block,
+      /if:\s*[\s\S]*?github\.event_name == 'workflow_dispatch' && inputs\.test-suite == 'v060'/,
+      ">> FAIL: dispatch-s-v060-unblock must gate on workflow_dispatch + inputs.test-suite == 'v060'",
+    );
+    assert.doesNotMatch(
+      block,
+      /github\.event_name == 'pull_request'|github\.event_name == 'push'|github\.event_name == 'schedule'|github\.event_name == 'release'/,
+      ">> FAIL: dispatch-s-v060-unblock must not be reachable from pull_request/push/schedule/release — it is dispatch-only",
+    );
   });
 
   test("no nightly job hardcodes BULLETIN_DEPLOY_ENV or env: to paseo-next-v2", () => {
@@ -16672,6 +20037,64 @@ describe("telemetry coverage source scans — deploy.ts (issue #419)", () => {
       "deploy.ts preflight branch must call assertSubdomainOwnerMatchesSigner to guard orphan-owned subnames"
     );
   });
+
+  // bulletin-deploy #1449 (folded into #1443): depth is observed, not
+  // gated — parseDomainName never refuses, so this attribute plus the
+  // console NOTE right below are the entire replacement signal.
+  test("deploy.ts: deploy.dotns.subname_levels is set after deploy.subdomain, for every subname deploy", () => {
+    const subIdx = deploySrc.indexOf(`setDeployAttribute("deploy.subdomain",`);
+    const levelsIdx = deploySrc.indexOf(`setDeployAttribute("deploy.dotns.subname_levels",`);
+    assert.ok(subIdx !== -1, "deploy.subdomain attribute call must exist");
+    assert.ok(levelsIdx !== -1, "deploy.dotns.subname_levels attribute call must exist");
+    assert.ok(levelsIdx > subIdx, "deploy.dotns.subname_levels must appear after deploy.subdomain in source");
+  });
+
+  test("deploy.ts: deploy.dotns.subname_levels is passed as a raw number, not String()-wrapped", () => {
+    const levelsIdx = deploySrc.indexOf(`setDeployAttribute("deploy.dotns.subname_levels",`);
+    assert.ok(levelsIdx !== -1, "deploy.dotns.subname_levels attribute call must exist");
+    const callSite = deploySrc.slice(levelsIdx, levelsIdx + 200);
+    assert.doesNotMatch(callSite, /String\(/,
+      ">> FAIL: deploy.dotns.subname_levels: numeric span attributes must be raw numbers, not String()-wrapped, or sum()/avg() break in Sentry");
+  });
+
+  test("deploy.ts: the subname-nesting NOTE fires right after the parseDomainName call, only when the parent path itself has a dot", () => {
+    const parseIdx = deploySrc.indexOf("parseDomainName(domainName, envTld)");
+    const noteIdx = deploySrc.indexOf("NOTE:", parseIdx);
+    assert.ok(parseIdx !== -1, "the pre-connect parseDomainName(domainName, envTld) call must exist");
+    assert.ok(noteIdx !== -1, "a NOTE: console line must follow the parse call");
+    const conditionSlice = deploySrc.slice(parseIdx, noteIdx);
+    assert.match(conditionSlice, /parsed\?\.isSubdomain && parsed\.parentLabel!\.includes\("\."\)/,
+      ">> FAIL: subname-nesting NOTE: must gate on isSubdomain + parentLabel containing a dot (more than 2 labels before the tld), not fire for an ordinary single-level subname");
+  });
+});
+
+describe("deploy.ts: subname-nesting NOTE/telemetry logic (bulletin #1449) is correct for nested vs. plain vs. top-level", () => {
+  // Exercises the EXACT expressions deploy.ts uses (parsed.isSubdomain,
+  // parsed.parentLabel.includes("."), subnameNestingLevels(1 + parentLabel
+  // split length)) against parseDomainName's real output, so this is a
+  // faithful proxy for "the NOTE fires for a nested name and not a plain
+  // one" without needing a live chain to actually run deploy().
+  test("an ordinary depth-1 subname (single-label parent) does NOT trip the NOTE condition", () => {
+    const parsed = parseDomainName("worker.app.dot");
+    assert.equal(parsed.isSubdomain, true);
+    assert.equal(parsed.parentLabel.includes("."), false,
+      ">> FAIL: subname-nesting NOTE: a single-label parent ('app') must not look nested");
+  });
+
+  test("a depth-2 nested subname (dotted parent) DOES trip the NOTE condition, with the right level count", () => {
+    const parsed = parseDomainName("worker.app.supafaust.dot");
+    assert.equal(parsed.isSubdomain, true);
+    assert.equal(parsed.parentLabel.includes("."), true,
+      ">> FAIL: subname-nesting NOTE: a dotted parent ('app.supafaust') must look nested");
+    const levels = subnameNestingLevels(1 + parsed.parentLabel.split(".").length);
+    assert.equal(levels, 2, ">> FAIL: subname-nesting NOTE: worker.app.supafaust.dot is 3 labels before the tld, i.e. 2 levels of nesting");
+  });
+
+  test("a top-level (non-subdomain) name never trips the NOTE condition", () => {
+    const parsed = parseDomainName("demoapp.dot");
+    assert.equal(parsed.isSubdomain, false);
+    assert.equal(parsed.parentLabel, null);
+  });
 });
 
 describe("telemetry coverage source scans — dotns.ts (issue #419)", () => {
@@ -16816,7 +20239,9 @@ describe("readPreviousContenthashSafe (subdomain contenthash read — double-TLD
 });
 
 // ---------------------------------------------------------------------------
-// computeStorageDepositLimit — storage_deposit_limit buffer helper.
+// storageDepositLimitFor — storage_deposit_limit buffer helper (bulletin-deploy
+// #1491/#1518: renamed from computeStorageDepositLimit to match bulletin's
+// helper of the same purpose, so the two codebases stay aligned at sync).
 //
 // ReviveClientWrapper.dryRunReviveCall computes this buffer (20% headroom
 // over the dry-run estimate, floored at a minimum) and is documented as
@@ -16826,70 +20251,277 @@ describe("readPreviousContenthashSafe (subdomain contenthash read — double-TLD
 // ReviveClientWrapper — so it had grown its own inline copy of the identical
 // formula instead. Extracted into this standalone function so both paths
 // share one implementation.
+//
+// bulletin-deploy #1491/#1518 found a real bug in the shape this helper used
+// to have: the per-env `registerStorageDeposit` override (environments.json)
+// only ever moved the preflight balance gate (feeFloorFor/topUpTargetFor),
+// never the floor actually threaded into this function at either call site —
+// so an operator's configured floor never reached the DECLARED
+// storage_deposit_limit on a submitted Revive.call. Fixed by giving
+// ReviveClientWrapper a settable `_storageDepositFloor` (defaulted to the
+// module constant, overridden via setStorageDepositFloor from
+// DotNS.recreateReviveClient with this._registerStorageDeposit) and by
+// threading this._registerStorageDeposit directly at the
+// submitBatchedContractCalls call site, which builds its own Revive.call
+// extrinsics rather than going through the wrapper.
 // ---------------------------------------------------------------------------
 
-describe("computeStorageDepositLimit (storage_deposit_limit buffer helper)", () => {
+describe("storageDepositLimitFor (storage_deposit_limit buffer helper)", () => {
   const DEFAULT_MINIMUM = 2_000_000_000_000n; // REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT
 
   test("zero estimate returns the minimum", async () => {
-    const { computeStorageDepositLimit } = await import("../dist/dotns.js");
-    assert.equal(computeStorageDepositLimit(0n), DEFAULT_MINIMUM,
-      ">> FAIL: computeStorageDepositLimit zero estimate: expected the minimum floor, dry-runs with no storage effect must still get a workable limit");
+    const { storageDepositLimitFor } = await import("../dist/dotns.js");
+    assert.equal(storageDepositLimitFor(0n), DEFAULT_MINIMUM,
+      ">> FAIL: storageDepositLimitFor zero estimate: expected the minimum floor, dry-runs with no storage effect must still get a workable limit");
   });
 
   test("a buffered estimate below the minimum is clamped up to the minimum", async () => {
-    const { computeStorageDepositLimit } = await import("../dist/dotns.js");
+    const { storageDepositLimitFor } = await import("../dist/dotns.js");
     // 1_000_000_000_000n * 1.2 = 1_200_000_000_000n, still below the 2e12 floor.
-    assert.equal(computeStorageDepositLimit(1_000_000_000_000n), DEFAULT_MINIMUM,
-      ">> FAIL: computeStorageDepositLimit clamp: a thin estimate's 20%-buffered value must not undercut the minimum floor");
+    assert.equal(storageDepositLimitFor(1_000_000_000_000n), DEFAULT_MINIMUM,
+      ">> FAIL: storageDepositLimitFor clamp: a thin estimate's 20%-buffered value must not undercut the minimum floor");
   });
 
   test("a buffered estimate above the minimum passes through buffered, not clamped", async () => {
-    const { computeStorageDepositLimit } = await import("../dist/dotns.js");
+    const { storageDepositLimitFor } = await import("../dist/dotns.js");
     // 10_000_000_000_000n * 120 / 100 = 12_000_000_000_000n, above the 2e12 floor.
-    assert.equal(computeStorageDepositLimit(10_000_000_000_000n), 12_000_000_000_000n,
-      ">> FAIL: computeStorageDepositLimit above-floor case: expected the 20%-buffered estimate, not the floor");
+    assert.equal(storageDepositLimitFor(10_000_000_000_000n), 12_000_000_000_000n,
+      ">> FAIL: storageDepositLimitFor above-floor case: expected the 20%-buffered estimate, not the floor");
   });
 
   test("boundary — buffered value exactly equal to the minimum", async () => {
-    const { computeStorageDepositLimit } = await import("../dist/dotns.js");
+    const { storageDepositLimitFor } = await import("../dist/dotns.js");
     // estimate * 120 / 100 lands exactly on 2_000_000_000_000n for this input.
     const estimate = 1_666_666_666_667n;
     const buffered = (estimate * 120n) / 100n;
     assert.equal(buffered, DEFAULT_MINIMUM, "test setup sanity: buffered must land exactly on the minimum for this boundary case");
-    assert.equal(computeStorageDepositLimit(estimate), DEFAULT_MINIMUM,
-      ">> FAIL: computeStorageDepositLimit boundary: a buffered value exactly at the minimum must return the minimum (not clamp-related off-by-one)");
+    assert.equal(storageDepositLimitFor(estimate), DEFAULT_MINIMUM,
+      ">> FAIL: storageDepositLimitFor boundary: a buffered value exactly at the minimum must return the minimum (not clamp-related off-by-one)");
   });
 
-  test("a custom minimum overrides the default floor", async () => {
-    const { computeStorageDepositLimit } = await import("../dist/dotns.js");
-    assert.equal(computeStorageDepositLimit(0n, 5_000_000_000n), 5_000_000_000n,
-      ">> FAIL: computeStorageDepositLimit custom minimum: zero estimate must return the caller-supplied minimum, not the hardcoded default");
-    assert.equal(computeStorageDepositLimit(1n, 5_000_000_000n), 5_000_000_000n,
-      ">> FAIL: computeStorageDepositLimit custom minimum clamp: a negligible estimate must clamp to the caller-supplied minimum");
+  test("a custom floor overrides the default minimum", async () => {
+    const { storageDepositLimitFor } = await import("../dist/dotns.js");
+    assert.equal(storageDepositLimitFor(0n, 5_000_000_000n), 5_000_000_000n,
+      ">> FAIL: storageDepositLimitFor custom floor: zero estimate must return the caller-supplied floor, not the hardcoded default");
+    assert.equal(storageDepositLimitFor(1n, 5_000_000_000n), 5_000_000_000n,
+      ">> FAIL: storageDepositLimitFor custom floor clamp: a negligible estimate must clamp to the caller-supplied floor");
   });
 
-  // Drift guard: the bug this fixes was the SAME 20%-buffer-floored-at-minimum
+  // #1518: this is the per-env floor itself — environments.json's
+  // registerStorageDeposit is what makes this reachable in production; both
+  // call sites used to hardcode the generic 200 PAS default and ignore it.
+  test("the floor is per environment, not the built-in default", async () => {
+    const { storageDepositLimitFor } = await import("../dist/dotns.js");
+    assert.equal(storageDepositLimitFor(0n, 5_000_000_000n), 5_000_000_000n,
+      ">> FAIL: storageDepositLimitFor per-env floor: a custom (lower) env floor must win over the generic default, not be ignored");
+  });
+
+  // Drift guard: the bug this fixes was the SAME 20%-buffer-floored-at-floor
   // formula recomputed inline at a second call site (submitBatchedContractCalls)
   // instead of going through dryRunReviveCall's helper. A return-value test on
-  // computeStorageDepositLimit alone can't catch a future call site
-  // reintroducing its own inline copy — source-scan for the telltale
-  // "* 120n) / 100n" buffer expression and require it appear exactly once.
-  test("dotns.ts: the 20% buffer formula appears in exactly one place (computeStorageDepositLimit)", () => {
+  // storageDepositLimitFor alone can't catch a future call site reintroducing
+  // its own inline copy — source-scan for the telltale "* 120n) / 100n" buffer
+  // expression. storageDepositLimitFor contributes 1 occurrence; weightLimitFor
+  // (bulletin #1522, same 20% factor applied to ref_time and proof_size
+  // separately) legitimately contributes 2 more — both inside the one
+  // canonical function, so this is still a single source of truth per helper.
+  test("dotns.ts: the 20% buffer formula appears only inside storageDepositLimitFor and weightLimitFor", () => {
     const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
     const matches = dotnsSrc.match(/\*\s*120n\)\s*\/\s*100n/g) || [];
-    assert.equal(matches.length, 1,
-      `>> FAIL: storage_deposit_limit buffer drift-guard: found the "* 120n) / 100n" formula ${matches.length} time(s) in dotns.ts, ` +
-      `expected exactly 1 (inside computeStorageDepositLimit) — a second inline copy means the two call sites can drift again`);
+    assert.equal(matches.length, 3,
+      `>> FAIL: 20%-buffer drift-guard: found the "* 120n) / 100n" formula ${matches.length} time(s) in dotns.ts, ` +
+      `expected exactly 3 (1 inside storageDepositLimitFor + 2 inside weightLimitFor for ref_time/proof_size) — ` +
+      `any other count means a call site grew its own inline copy again`);
   });
 
-  test("dotns.ts: both dryRunReviveCall and submitBatchedContractCalls call computeStorageDepositLimit", () => {
+  test("dotns.ts: both dryRunReviveCall and submitBatchedContractCalls call storageDepositLimitFor", () => {
     const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
-    const callSites = (dotnsSrc.match(/computeStorageDepositLimit\(/g) || []).length;
+    const callSites = (dotnsSrc.match(/storageDepositLimitFor\(/g) || []).length;
     // 1 definition + 2 call sites = 3 occurrences of the identifier followed by "(".
     assert.ok(callSites >= 3,
-      `>> FAIL: storage_deposit_limit helper routing: expected computeStorageDepositLimit referenced at least 3 times ` +
+      `>> FAIL: storage_deposit_limit helper routing: expected storageDepositLimitFor referenced at least 3 times ` +
       `(1 definition + dryRunReviveCall + submitBatchedContractCalls), found ${callSites}`);
+  });
+
+  test("dotns.ts: submitBatchedContractCalls threads this._registerStorageDeposit, not a bare default call", () => {
+    const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
+    // #1164: the estimate submitBatchedContractCalls buffers is the component-wise
+    // max across every dry-run'd inner call (maxStorageDeposit), not just the head
+    // call's own estimate (headEstimate.storageDeposit, the pre-#1164 shape) — see
+    // the independentCalls/multi-dry-run block above this call site. The floor
+    // argument itself is unaffected by that change.
+    assert.match(dotnsSrc, /storageDepositLimitFor\(maxStorageDeposit,\s*this\._registerStorageDeposit\)/,
+      ">> FAIL: submitBatchedContractCalls must pass this._registerStorageDeposit as the floor — the per-env config, " +
+      "otherwise it silently falls back to the generic 200 PAS default regardless of environments.json");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// weightLimitFor — weight_limit buffer helper (bulletin-deploy #1522).
+//
+// weight_limit used to be declared at exactly the dry-run estimate, with no
+// margin — unlike storage_deposit_limit (storageDepositLimitFor, buffered
+// since #1518). A dry run measures the chain as it was; a write elsewhere
+// between the estimate and inclusion can push the real requirement above the
+// declared limit and trap the call. Same 20% factor as storageDepositLimitFor,
+// applied to both ref_time and proof_size, deliberately with NO floor.
+// ---------------------------------------------------------------------------
+
+describe("weightLimitFor (weight_limit buffer helper, #1522)", () => {
+  test("buffers both ref_time and proof_size by 20%", async () => {
+    const { weightLimitFor } = await import("../dist/dotns.js");
+    const result = weightLimitFor({ referenceTime: 1_000_000_000n, proofSize: 100_000n });
+    assert.deepStrictEqual(result, { ref_time: 1_200_000_000n, proof_size: 120_000n },
+      ">> FAIL: weightLimitFor buffer factor: both components must scale by exactly 120/100, matching storageDepositLimitFor's proven-safe margin");
+  });
+
+  test("no floor: a tiny estimate stays tiny (proportional-only, unlike storageDepositLimitFor)", async () => {
+    const { weightLimitFor } = await import("../dist/dotns.js");
+    const result = weightLimitFor({ referenceTime: 10n, proofSize: 1n });
+    assert.deepStrictEqual(result, { ref_time: 12n, proof_size: 1n },
+      ">> FAIL: weightLimitFor no-floor: unlike storage, weight is dry-run against the exact call being submitted, so a small estimate must buffer proportionally, not jump to an arbitrary minimum");
+  });
+
+  test("dotns.ts: both dryRunReviveCall and submitBatchedContractCalls call weightLimitFor", () => {
+    const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
+    const callSites = (dotnsSrc.match(/weightLimitFor\(/g) || []).length;
+    assert.ok(callSites >= 3,
+      `>> FAIL: weight_limit helper routing: expected weightLimitFor referenced at least 3 times ` +
+      `(1 definition + dryRunReviveCall + submitBatchedContractCalls), found ${callSites}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ReviveClientWrapper.setStorageDepositFloor — verifies the per-env floor
+// actually reaches the SUBMITTED extrinsic's storage_deposit_limit (and that
+// the buffered weight_limit rides along), not just dryRunReviveCall's return
+// value. Drives submitTransaction end to end with a fake client capturing the
+// literal args client.tx.Revive.call receives.
+// ---------------------------------------------------------------------------
+
+describe("ReviveClientWrapper: per-env storage-deposit floor reaches the submitted extrinsic (#1491/#1518)", () => {
+  test("submitTransaction's built Revive.call uses the configured floor, not the generic default", async () => {
+    const { ReviveClientWrapper } = await import("../dist/dotns.js");
+    const w = new ReviveClientWrapper({});
+    w.ensureAccountMapped = async () => {};
+    w.checkIfAccountMapped = async () => true;
+    w.getEvmAddress = async () => "0xSigner";
+    w.estimateGasForCall = async () => ({
+      success: true,
+      gasRequired: { referenceTime: 1_000_000_000n, proofSize: 100_000n },
+      storageDeposit: 0n, // a call that overwrites storage rather than adding it
+    });
+    let captured;
+    w.client = { tx: { Revive: { call: (args) => { captured = args; return { marker: "extrinsic" }; } } } };
+    w.signAndSubmitWithRetry = async (buildExtrinsic) => {
+      buildExtrinsic();
+      return { kind: "hash", hash: "0xtx" };
+    };
+
+    // Env floor: 5 PAS (bulletin's measured paseo-next-v2 value), well below
+    // the 200 PAS generic default this wrapper would otherwise fall back to.
+    w.setStorageDepositFloor(50_000_000_000n);
+    await w.submitTransaction("0xContract", 0n, "0x", "5Signer", {}, () => {}, { rpcs: [] });
+
+    assert.ok(captured, ">> FAIL: submitTransaction setup: fake signAndSubmitWithRetry must trigger buildExtrinsic — check the fake client wiring above");
+    assert.strictEqual(captured.storage_deposit_limit, 50_000_000_000n,
+      ">> FAIL: submitTransaction storage_deposit_limit: the SUBMITTED extrinsic must declare the wrapper's configured per-env floor, not the generic 200 PAS default");
+    assert.deepStrictEqual(captured.weight_limit, { ref_time: 1_200_000_000n, proof_size: 120_000n },
+      ">> FAIL: submitTransaction weight_limit: must be buffered 20% via weightLimitFor even when storage_deposit_limit comes from a custom floor");
+  });
+
+  test("with no floor configured, falls back to the generic REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT default", async () => {
+    const { ReviveClientWrapper } = await import("../dist/dotns.js");
+    const w = new ReviveClientWrapper({});
+    w.ensureAccountMapped = async () => {};
+    w.checkIfAccountMapped = async () => true;
+    w.getEvmAddress = async () => "0xSigner";
+    w.estimateGasForCall = async () => ({
+      success: true,
+      gasRequired: { referenceTime: 1_000_000_000n, proofSize: 100_000n },
+      storageDeposit: 0n,
+    });
+    let captured;
+    w.client = { tx: { Revive: { call: (args) => { captured = args; return { marker: "extrinsic" }; } } } };
+    w.signAndSubmitWithRetry = async (buildExtrinsic) => {
+      buildExtrinsic();
+      return { kind: "hash", hash: "0xtx" };
+    };
+
+    await w.submitTransaction("0xContract", 0n, "0x", "5Signer", {}, () => {}, { rpcs: [] });
+
+    assert.strictEqual(captured.storage_deposit_limit, 2_000_000_000_000n,
+      ">> FAIL: submitTransaction default floor: an unconfigured wrapper (e.g. a bare `new ReviveClientWrapper(...)`) must still declare a safe, known floor rather than 0");
+  });
+});
+
+describe("DotNS: recreateReviveClient wires the connected instance's registerStorageDeposit into the wrapper (#1518)", () => {
+  test("dotns.ts: recreateReviveClient calls setStorageDepositFloor(this._registerStorageDeposit) right after construction", () => {
+    const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
+    const recreateFnMatch = dotnsSrc.match(/private recreateReviveClient\(endpoint: string\): void \{[\s\S]*?\n  \}/);
+    assert.ok(recreateFnMatch, ">> FAIL: recreateReviveClient not found — did the method get renamed/restructured?");
+    assert.match(recreateFnMatch[0], /this\.clientWrapper\.setStorageDepositFloor\(this\._registerStorageDeposit\)/,
+      ">> FAIL: recreateReviveClient must call setStorageDepositFloor(this._registerStorageDeposit) — this is the ONLY place a " +
+      "ReviveClientWrapper is constructed, so missing this call here means the per-env floor never reaches a fresh wrapper");
+  });
+});
+
+// submitBatchedContractCalls builds Revive.call extrinsics directly (it does
+// not go through ReviveClientWrapper.dryRunReviveCall), so it needs the
+// per-env floor and the weight buffer threaded explicitly at this call site
+// too (see the drift-guard tests above). Drives the real private method with
+// a fake clientWrapper and captures the literal args reaching
+// client.tx.Revive.call for both inner calls in the batch.
+describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and the per-env storage floor on every inner call (#1491/#1518/#1522)", () => {
+  test("both inner Revive.call entries in the batch get the buffered weight_limit and the configured registerStorageDeposit floor", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    d["_registerStorageDeposit"] = 50_000_000_000n; // 5 PAS — the measured paseo-next-v2 floor
+    const capturedCalls = [];
+    d.clientWrapper = {
+      ensureAccountMapped: async () => {},
+      estimateGasForCall: async () => ({
+        success: true,
+        gasRequired: { referenceTime: 2_000_000_000n, proofSize: 200_000n },
+        storageDeposit: 0n, // overwrite-shaped call — zero estimate must still floor at the env value, not 200 PAS
+      }),
+      client: {
+        tx: {
+          Revive: {
+            call: (args) => { capturedCalls.push(args); return { decodedCall: { marker: capturedCalls.length } }; },
+          },
+          Utility: {
+            batch_all: (args) => ({ signSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }),
+          },
+        },
+      },
+      signAndSubmitWithRetry: async (buildBatch) => {
+        buildBatch();
+        return { kind: "hash", hash: "0xbatch" };
+      },
+    };
+
+    const abiOne = [{ type: "function", name: "setSubnodeOwner", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    const abiTwo = [{ type: "function", name: "setResolver", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    const result = await d["submitBatchedContractCalls"](
+      [
+        { contractAddress: "0xAAAA000000000000000000000000000000AAAA", abi: abiOne, functionName: "setSubnodeOwner", args: [] },
+        { contractAddress: "0xBBBB000000000000000000000000000000BBBB", abi: abiTwo, functionName: "setResolver", args: [] },
+      ],
+      () => {},
+      "test batch",
+    );
+
+    assert.strictEqual(result.kind, "hash", ">> FAIL: submitBatchedContractCalls setup: fake signAndSubmitWithRetry must resolve — check the fake clientWrapper wiring above");
+    assert.strictEqual(capturedCalls.length, 2, ">> FAIL: submitBatchedContractCalls call count: both inner calls must reach client.tx.Revive.call");
+    for (const call of capturedCalls) {
+      assert.deepStrictEqual(call.weight_limit, { ref_time: 2_400_000_000n, proof_size: 240_000n },
+        ">> FAIL: submitBatchedContractCalls weight_limit: must be buffered 20% via weightLimitFor on every inner call, from the head dry-run estimate");
+      assert.strictEqual(call.storage_deposit_limit, 50_000_000_000n,
+        ">> FAIL: submitBatchedContractCalls storage_deposit_limit: must floor at this._registerStorageDeposit (the connected instance's per-env config), not the generic 200 PAS default");
+    }
   });
 });
 
@@ -17644,6 +21276,75 @@ describe("dotns.ts: finalisation poll prints only when chain time advances", () 
   });
 });
 
+test("publishManifest prints a 60-char '=' banner titled 'Manifest publish — <domain>' (#1011)", () => {
+  const src = fs.readFileSync("src/manifest/publish.ts", "utf8");
+  assert.match(src, /const banner = "=".repeat\(60\);\s*\n\s*console\.log\("\\n" \+ banner\);\s*\n\s*console\.log\(`Manifest publish — \$\{config\.domain\}`\);\s*\n\s*console\.log\(banner\);/,
+    ">> FAIL: publish.ts: manifest phase must print the same 60-char '=' banner style as Storage/DotNS/Preflight, titled 'Manifest publish — <domain>'");
+});
+
+describe("computePhaseACounts (#1011)", () => {
+  test("first deploy (no trusted CIDs) reports everything as toCheck, zero trusted", () => {
+    const counts = computePhaseACounts(["cidA", "cidB", "cidC"], new Set());
+    assert.deepEqual(counts, { toCheck: 3, trusted: 0, duplicates: 0 },
+      ">> FAIL: computePhaseACounts: first deploy: trusted must be 0 when trustedCids is empty");
+  });
+
+  test("all trusted: toCheck is 0, trusted equals the unique count", () => {
+    const counts = computePhaseACounts(["cidA", "cidB"], new Set(["cidA", "cidB"]));
+    assert.deepEqual(counts, { toCheck: 0, trusted: 2, duplicates: 0 },
+      ">> FAIL: computePhaseACounts: all-trusted: toCheck must be 0 and trusted must equal the unique CID count");
+  });
+
+  test("duplicate untrusted CID is not miscounted as trusted (the #1011 bug shape)", () => {
+    // Old buggy formula: trustedCount = uploadCids.length - new Set(uploadCids).size
+    // = 4 - 3 = 1, reporting 1 "trusted from prev manifest" chunk that was never in
+    // any previous manifest — it was just a duplicate CID within this section.
+    const counts = computePhaseACounts(["cidA", "cidA", "cidB", "cidC"], new Set());
+    assert.deepEqual(counts, { toCheck: 3, trusted: 0, duplicates: 1 },
+      ">> FAIL: computePhaseACounts: a duplicate of an UNTRUSTED CID must count as a duplicate, never as trusted");
+  });
+
+  test("duplicate TRUSTED CID is counted once in trusted, once in duplicates (not double-counted as trusted)", () => {
+    const counts = computePhaseACounts(["cidA", "cidA", "cidB"], new Set(["cidA"]));
+    assert.deepEqual(counts, { toCheck: 1, trusted: 1, duplicates: 1 },
+      ">> FAIL: computePhaseACounts: a trusted CID appearing twice must count as ONE trusted chunk plus one duplicate, not two trusted (this is the edge case where toCheck = uniqueSize - occurrences would go negative)");
+  });
+
+  test("first deploy with duplicate CIDs never reports a nonzero trusted count (contradiction guard)", () => {
+    // This is the literal #1011 report: a FIRST deploy printed "1 trusted from prev
+    // manifest" purely because of a duplicate CID, with no previous manifest at all.
+    const counts = computePhaseACounts(["cidX", "cidX", "cidY"], new Set());
+    assert.equal(counts.trusted, 0,
+      ">> FAIL: computePhaseACounts: a first deploy (empty trustedCids set) must never report trusted > 0, regardless of duplicate CIDs in section 1");
+  });
+});
+
+describe("formatUploadInclusionLine (#1011)", () => {
+  test("nothing submitted: uploadTotal 0", () => {
+    assert.equal(
+      formatUploadInclusionLine(13, 0),
+      "All 13 chunks already on chain — nothing submitted",
+      ">> FAIL: formatUploadInclusionLine: uploadTotal=0 must print the existing 'nothing submitted' wording"
+    );
+  });
+
+  test("partial: some submitted, some already on chain", () => {
+    assert.equal(
+      formatUploadInclusionLine(13, 3),
+      "3 submitted and included, 10 already on chain",
+      ">> FAIL: formatUploadInclusionLine: must report uploadTotal as submitted and (total - uploadTotal) as already on chain"
+    );
+  });
+
+  test("everything submitted: no chunks were already known present", () => {
+    assert.equal(
+      formatUploadInclusionLine(5, 5),
+      "5 submitted and included, 0 already on chain",
+      ">> FAIL: formatUploadInclusionLine: uploadTotal == totalChunks must report 0 already-on-chain, not skip the line"
+    );
+  });
+});
+
 describe("storeDirectoryV2 Phase A: phaseAKnownPresent scoped to section 1", () => {
   test("phaseAKnownPresent built from phaseAUploadCids (section 1), not carChunkCidsA", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf8");
@@ -17987,6 +21688,21 @@ describe("INVARIANT: env-specific URLs never leak into src/ as hardcoded literal
   // DEFAULT_GATEWAY pointing at the WRONG environment's gateway, and
   // resolveEndpoints dropped the env.ipfs field so deploys silently fell back
   // to the hardcoded default.
+  // DotNS v0.6.0 deleted ROOT_GATEWAY_DISPATCHER upstream and nothing on our
+  // side ever read it. Belt-and-suspenders beyond the per-env
+  // deepStrictEqual snapshots elsewhere in this file (which don't cover every
+  // environment): scan every environment's `contracts` for the removed keys.
+  test("no environment declares ROOT_GATEWAY_DISPATCHER, a role-manager, a popGateway, or PUBLISHER (#1410, #1310)", () => {
+    const envDoc = JSON.parse(fs.readFileSync("assets/environments.json", "utf-8"));
+    for (const env of envDoc.environments) {
+      const keys = Object.keys(env.contracts ?? {});
+      for (const removed of ["ROOT_GATEWAY_DISPATCHER", "DOTNS_ROLE_MANAGER", "DotnsRoleManager", "popGateway", "POP_GATEWAY", "PUBLISHER"]) {
+        assert.ok(!keys.includes(removed),
+          `>> FAIL: v060-config-cleanup: environment "${env.id}" still declares "${removed}", which upstream deleted — remove it from assets/environments.json.`);
+      }
+    }
+  });
+
   test("no environments.json URL appears as a hardcoded string literal in src/ outside environments.ts", () => {
     const envDoc = JSON.parse(fs.readFileSync("assets/environments.json", "utf8"));
 
@@ -20572,6 +24288,89 @@ describe("regression guard: claim-pgas.ts must not contain hardcoded extension e
 });
 
 // ---------------------------------------------------------------------------
+// bulletin #1360: makeOneShotBuildRingProof pins the one_shot(ringExponent,
+// memberEntropy, members, context, msg) argument order in one place, so the
+// two call sites (src/dotns.ts, src/personhood/bootstrap.ts) cannot drift
+// independently. bulletin-deploy's own #1229 was exactly this class of drift
+// in a third (tools/) call site that polkadot-app-deploy doesn't have.
+// ---------------------------------------------------------------------------
+describe("makeOneShotBuildRingProof (bulletin #1360)", () => {
+  test("calls one_shot with (ringExponent, memberEntropy, members, context, msg) in that exact order", async () => {
+    const { makeOneShotBuildRingProof } = await import("../dist/personhood/ring-proof.js");
+    const memberEntropy = new Uint8Array([0xaa, 0xaa, 0xaa, 0xaa]);
+    const members = new Uint8Array([0xbb, 0xbb, 0xbb]);
+    const context = new Uint8Array([0xcc, 0xcc]);
+    const msg = new Uint8Array([0xdd]);
+    const ringExponent = 9;
+
+    let capturedArgs = null;
+    const fakeOneShot = (...args) => {
+      capturedArgs = args;
+      return { proof: new Uint8Array([1]), alias: new Uint8Array([2]), decoy: "should not leak through" };
+    };
+
+    const buildRingProof = makeOneShotBuildRingProof(fakeOneShot, memberEntropy);
+    const result = await buildRingProof({ ringExponent, members, context, msg });
+
+    assert.equal(capturedArgs.length, 5,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): one_shot must be called with exactly 5 positional args");
+    assert.equal(capturedArgs[0], ringExponent,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): arg 0 must be ringExponent — this is the class of drift bulletin's #1229 hit (ringExponent dropped, everything shifted left)");
+    assert.equal(capturedArgs[1], memberEntropy,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): arg 1 must be memberEntropy");
+    assert.equal(capturedArgs[2], members,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): arg 2 must be members");
+    assert.equal(capturedArgs[3], context,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): arg 3 must be context");
+    assert.equal(capturedArgs[4], msg,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): arg 4 must be msg");
+
+    assert.deepEqual(Object.keys(result).sort(), ["alias", "proof"],
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): return value must be exactly {proof, alias} — no extra fields from one_shot's result should leak through");
+    assert.deepEqual(result.proof, new Uint8Array([1]));
+    assert.deepEqual(result.alias, new Uint8Array([2]));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bulletin #1360 regression guard: verifiablejs's one_shot must only ever be
+// called from src/personhood/ring-proof.ts. If a new call site hand-rolls its
+// own `one_shot(...)` call instead of going through makeOneShotBuildRingProof,
+// the argument-order drift class becomes possible again. Scoped to src/ only
+// — polkadot-app-deploy has no tools/reprove-alias.mjs equivalent.
+// ---------------------------------------------------------------------------
+describe("regression guard: verifiable.one_shot must only be called from ring-proof.ts (bulletin #1360)", () => {
+  test("no src/ file other than src/personhood/ring-proof.ts calls one_shot(", () => {
+    const offenders = [];
+
+    function walk(dir) {
+      for (const name of fs.readdirSync(dir)) {
+        const p = path.join(dir, name);
+        const st = fs.statSync(p);
+        if (st.isDirectory()) {
+          walk(p);
+          continue;
+        }
+        if (!/\.ts$/.test(name)) continue;
+        if (p.endsWith(path.join("src", "personhood", "ring-proof.ts"))) continue;
+        // Strip backtick-quoted spans first so doc-comment mentions like
+        // `` `verifiablejs.one_shot(...)` `` (src/personhood/encoding.ts) don't
+        // count as a call — only look for an actual `one_shot(` call expression.
+        const text = fs.readFileSync(p, "utf8").replace(/`[^`]*`/g, "");
+        if (/\bone_shot\s*\(/.test(text)) offenders.push(p);
+      }
+    }
+
+    walk("src");
+
+    assert.deepEqual(offenders, [],
+      `>> FAIL: regression-guard bulletin #1360: found a direct one_shot(...) call outside src/personhood/ring-proof.ts in: ${offenders.join(", ")}. ` +
+      "Route ring-proof construction through makeOneShotBuildRingProof so the argument order (ringExponent, memberEntropy, members, context, msg) " +
+      "cannot drift independently between call sites.");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // PR 3: verifiablejs 1.3.0-beta.4 upgrade + people-collection identifier rename
 // (handover §1 + §2)
 // ---------------------------------------------------------------------------
@@ -20721,52 +24520,162 @@ describe("verifiablejs beta.4 upgrade + people-collection identifier (handover �
 });
 
 // ---------------------------------------------------------------------------
-// Test-suite wiring guard: a *.test.js file that no command runs is dead —
-// it gives false "covered" confidence while never executing in CI. (This is
+// Test-suite wiring guard: a test file that no command runs is dead — it
+// gives false "covered" confidence while never executing in CI. (This is
 // exactly how the chain-call encode bug shipped: a test asserted the wrong
-// contract AND other suites were never wired in.) Assert every test file is
-// referenced by package.json, a workflow, or a script.
+// contract AND other suites were never wired in.)
+//
+// Deny-by-default (#210): the old guard only ever walked files matching
+// known test-file naming conventions (*.test.js, test.js, test-*.js), so a
+// file under any OTHER name — wrapper_test.js, a .spec.js, a nested file
+// matching neither convention — was invisible to the guard, not just
+// unexempted from it. This asserts the actual property we want ("every
+// .js/.mjs file under test/ executes somewhere, or is legitimately non-test
+// data"), not a whitelist of shapes seen breaking so far.
+//
+// Every .js/.mjs file under test/ must be one of:
+//   (a) selected by scripts/run-unit-tests.mjs's collectUnitTestFiles
+//       (imported above, not reimplemented here, so the guard and the
+//       runner cannot silently drift apart);
+//   (b) referenced by name in package.json, a .github/workflows/*.y*ml
+//       step, or a scripts/*.sh|.mjs file — how the E2E pair
+//       (test/e2e.test.js, test/e2e-reprove.test.js) and
+//       test/helpers/e2e-ci-prep.js stay wired despite being excluded from,
+//       or absent from, the unit-test selection; or
+//   (c) referenced by a literal path from another file under test/ — a
+//       static import/require, a dynamic import with a literal path, or a
+//       literal fixture-directory path (e.g. path.resolve("test/fixtures/…"))
+//       that is an ancestor of the file. That covers helper modules
+//       (test/helpers/e2e-failure.js) and bulk data fixtures walked by
+//       directory rather than imported file-by-file
+//       (test/fixtures/realistic-vite/**).
 // ---------------------------------------------------------------------------
 
 describe("test-suite wiring — no orphaned test files", () => {
-  test("every test/**/*.test.js AND test-*.js is referenced by package.json, a workflow, or a script", () => {
-    const repoRoot = new URL("..", import.meta.url).pathname;
+  // repoRoot must come from fileURLToPath, not a bare URL.pathname — the
+  // latter is percent-encoded and would break path.join/path.relative
+  // comparisons against fs paths on any repo path containing characters
+  // that get percent-escaped in a URL.
+  const repoRoot = path.dirname(fileURLToPath(new URL(".", import.meta.url)));
+  const testDirRoot = path.join(repoRoot, "test");
 
-    const readIfExists = (p) => {
-      try { return fs.readFileSync(p, "utf8"); } catch { return ""; }
-    };
+  const readIfExists = (p) => {
+    try { return fs.readFileSync(p, "utf8"); } catch { return ""; }
+  };
+
+  const buildNameCorpus = () => {
     const corpusParts = [readIfExists(path.join(repoRoot, "package.json"))];
-    const addDir = (dir, exts) => {
+    const addDir = (dir, exts, exclude = new Set()) => {
       let entries;
       try { entries = fs.readdirSync(dir); } catch { return; }
       for (const e of entries) {
+        if (exclude.has(e)) continue;
         if (exts.some((x) => e.endsWith(x))) corpusParts.push(readIfExists(path.join(dir, e)));
       }
     };
     addDir(path.join(repoRoot, ".github", "workflows"), [".yml", ".yaml"]);
-    addDir(path.join(repoRoot, "scripts"), [".sh", ".mjs"]);
-    const corpus = corpusParts.join("\n");
+    // Exclude run-unit-tests.mjs itself: it's the selection logic under
+    // test here (via collectUnitTestFiles), not an independent "this file is
+    // wired in" reference. Its own EXCLUDED_FILENAMES literal happens to
+    // contain the E2E pair's names, which would otherwise let this corpus
+    // scan rubber-stamp them regardless of whether anything else actually
+    // runs them.
+    addDir(path.join(repoRoot, "scripts"), [".sh", ".mjs"], new Set(["run-unit-tests.mjs"]));
+    return corpusParts.join("\n");
+  };
 
-    const testFiles = [];
+  // Deny-by-default: every .js/.mjs under test/, no naming filter. (The old
+  // walk only ever matched *.test.js / test.js / test-*.js, so a file under
+  // any other name was never even looked at.)
+  const walkAllJsFiles = () => {
+    const files = [];
     const walk = (dir) => {
       let entries;
       try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
       for (const e of entries) {
         const full = path.join(dir, e.name);
-        if (e.isDirectory()) walk(full);
-        // Both naming conventions in use here. Matching only "*.test.js" is how
-        // test/test-release-retry-wrapper.js sat unrun with 11 assertions — it is a
-        // "test-*.js", so this walk never saw it.
-        else if (e.name.endsWith(".test.js") || /^test-[a-z0-9-]+\.js$/.test(e.name)) testFiles.push(e.name);
+        if (e.isDirectory()) { walk(full); continue; }
+        if (e.name.endsWith(".js") || e.name.endsWith(".mjs")) files.push(full);
       }
     };
-    walk(path.join(repoRoot, "test"));
-    if (testFiles.length === 0) return; // test/ absent (dist-only context)
+    walk(testDirRoot);
+    return files;
+  };
 
-    const orphans = testFiles.filter((f) => !corpus.includes(f)).sort();
+  // Every ancestor directory of a posix-style repo-relative path, down to
+  // (but not including) the top-level bucket directory directly under test/
+  // — e.g. "test/fixtures/x/y/f.js" yields ["test/fixtures/x/y",
+  // "test/fixtures/x"], NOT "test/fixtures". Lets a literal directory
+  // reference (a fixture tree walked with fs.readdirSync rather than
+  // imported file-by-file) satisfy condition (c) for every file under it.
+  // Stopping short of the 2-segment "test/fixtures" / "test/helpers" level
+  // is deliberate: those bucket names are near-universal substrings (any
+  // reference to a file anywhere under them contains that prefix), so
+  // allowing them as candidates would let ONE reference into a bucket
+  // directory silently exempt every unrelated file elsewhere in it.
+  const ancestorDirs = (relRepo) => {
+    const parts = relRepo.split("/");
+    const out = [];
+    for (let i = parts.length - 1; i > 2; i--) out.push(parts.slice(0, i).join("/"));
+    return out;
+  };
+
+  test("every .js/.mjs file under test/ is selected by the unit-test runner, referenced by name, or referenced by path from another test/ file", () => {
+    const allFiles = walkAllJsFiles();
+    if (allFiles.length === 0) return; // test/ absent (dist-only context)
+
+    const nameCorpus = buildNameCorpus();
+    const selected = new Set(collectUnitTestFiles());
+    // Condition (c)'s corpus: the concatenated content of every file under
+    // test/, so a literal import/require path or a literal fixture-directory
+    // path written in ANY test/ file counts as a reference to that file.
+    const moduleCorpus = allFiles.map((f) => readIfExists(f)).join("\n");
+    // Sibling files (e.g. a fixture directory's many files) generate
+    // overlapping candidate strings — memoize so each distinct candidate is
+    // scanned against the corpus once, not once per file that produces it.
+    const corpusHitCache = new Map();
+    const corpusHas = (s) => {
+      if (corpusHitCache.has(s)) return corpusHitCache.get(s);
+      const hit = moduleCorpus.includes(s);
+      corpusHitCache.set(s, hit);
+      return hit;
+    };
+
+    const isReferencedByPath = (f) => {
+      const relRepo = path.relative(repoRoot, f).split(path.sep).join("/");
+      const relTest = path.relative(testDirRoot, f).split(path.sep).join("/");
+      const candidates = [relRepo, relTest, `./${relTest}`, ...ancestorDirs(relRepo)];
+      for (const c of candidates) {
+        if (c && corpusHas(c)) return true;
+      }
+      return false;
+    };
+
+    const orphans = allFiles
+      .filter((f) => !selected.has(f))
+      .filter((f) => !nameCorpus.includes(path.basename(f)))
+      .filter((f) => !isReferencedByPath(f))
+      .map((f) => path.relative(repoRoot, f))
+      .sort();
+
     assert.deepEqual(orphans, [],
       `>> FAIL: test-wiring: orphaned test file(s) that no command runs: ${orphans.join(", ")}. ` +
-      `Add each to package.json "test"/"test:e2e" or a .github/workflows step — an unreferenced *.test.js never executes in CI.`);
+      `Each file under test/ must be (a) selected by scripts/run-unit-tests.mjs's collectUnitTestFiles, ` +
+      `(b) referenced by name in package.json, a .github/workflows step, or a scripts/*.sh|.mjs file, or ` +
+      `(c) imported (or, for a bulk fixture directory, path-referenced) by another file under test/ — ` +
+      `an unreferenced file never executes in CI.`);
+  });
+
+  test("the unit-test selection excludes the E2E pair but includes test/test.js and test/test-release-retry-wrapper.js", () => {
+    const selectedNames = new Set(collectUnitTestFiles().map((f) => path.relative(repoRoot, f)));
+    assert.ok(!selectedNames.has("test/e2e.test.js"),
+      ">> FAIL: test-wiring: test/e2e.test.js must stay OUT of the default unit-test selection (self-skips unless E2E=1, but its top-level imports still execute at collection time)");
+    assert.ok(!selectedNames.has("test/e2e-reprove.test.js"),
+      ">> FAIL: test-wiring: test/e2e-reprove.test.js must stay OUT of the default unit-test selection (same reason as e2e.test.js)");
+    assert.ok(selectedNames.has("test/test.js"),
+      ">> FAIL: test-wiring: test/test.js (this file) must be INCLUDED in the unit-test selection");
+    assert.ok(selectedNames.has("test/test-release-retry-wrapper.js"),
+      ">> FAIL: test-wiring: test/test-release-retry-wrapper.js must be INCLUDED in the unit-test selection (test-*.js at test/ root)");
   });
 });
 
@@ -21089,6 +24998,172 @@ describe("browserUrlFor", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// DeployResult.browserUrl + its plumbing (#1157)
+// browserUrlFor() already resolved the env's real webGateway (and the
+// previewnet suffix) for the CLI's "Check it out here" console line — this
+// section pins that the SAME resolution reaches DeployResult, bin/polkadot-
+// app-deploy's GITHUB_OUTPUT, and the reusable workflow's PR-comment/summary
+// URL, instead of a second, out-of-sync mechanism recomputing a gateway URL
+// from a hardcoded default.
+// ---------------------------------------------------------------------------
+
+describe("DeployResult.browserUrl (#1157)", () => {
+  test("DeployResult interface declares browserUrl: string", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf-8");
+    const ifaceMatch = src.match(/export interface DeployResult \{[\s\S]*?\n\}/);
+    assert.ok(ifaceMatch, ">> FAIL: DeployResult.browserUrl: could not locate the DeployResult interface in src/deploy.ts");
+    assert.match(
+      ifaceMatch[0],
+      /browserUrl:\s*string;/,
+      ">> FAIL: DeployResult.browserUrl: DeployResult must declare `browserUrl: string` so library callers (and the CLI's GITHUB_OUTPUT write) can reuse the env-resolved URL instead of recomputing one"
+    );
+  });
+
+  test("deploy()'s return site reuses ONE browserUrlFor(...) call — no second URL mechanism", () => {
+    // #1164: the "Check it out here" console lines moved out of this call
+    // site and into printDeploymentCompleteBanner (deferred until after a
+    // pending manifest publish succeeds, so a manifest failure never leaves
+    // a false completion banner on screen) — they no longer appear
+    // immediately after this assignment. The invariant this test protects
+    // (one resolution, reused everywhere) still holds and is asserted
+    // directly: browserUrlFor is called exactly once in this file, and the
+    // banner call passes the SAME `browserUrl` variable rather than
+    // resolving a second time.
+    const src = fs.readFileSync("src/deploy.ts", "utf-8");
+    const returnStatement = "domainName: name,\n        fullDomain: `${name}.${envTld}`,\n        cid: cid as string,\n        ipfsCid,\n        browserUrl,";
+    assert.ok(src.includes(returnStatement), ">> FAIL: browserUrl-single-resolution: deploy()'s DeployResult return must include a `browserUrl` field");
+    assert.ok(
+      !returnStatement.includes("browserUrlFor("),
+      ">> FAIL: browserUrl-single-resolution: the return statement must reuse the `browserUrl` variable, not call browserUrlFor(...) again"
+    );
+    assert.match(
+      src,
+      /const browserUrl = browserUrlFor\(name, envId, envWebGateway\);/,
+      ">> FAIL: browserUrl-single-resolution: expected `const browserUrl = browserUrlFor(name, envId, envWebGateway)` assigned once in deploy()"
+    );
+    // Matches only the CALL shape (name, envId, envWebGateway args) — not the
+    // `export function browserUrlFor(...)` definition or its doc-comment
+    // mention, either of which would false-positive a naive `browserUrlFor(`
+    // occurrence count.
+    const browserUrlForCallCount = (src.match(/browserUrlFor\(name, envId, envWebGateway\)/g) || []).length;
+    assert.equal(
+      browserUrlForCallCount,
+      1,
+      ">> FAIL: browserUrl-single-resolution: browserUrlFor(name, envId, envWebGateway) must be called exactly once in src/deploy.ts — a second call site would be the exact drift this test guards against"
+    );
+    assert.match(
+      src,
+      /printDeploymentCompleteBanner\(`\$\{name\}\.\$\{envTld\}`, browserUrl\)/,
+      ">> FAIL: browserUrl-single-resolution: the completion banner must reuse the SAME browserUrl variable via printDeploymentCompleteBanner(..., browserUrl), not a second resolution"
+    );
+  });
+
+  test("bin/polkadot-app-deploy writes browserUrl to GITHUB_OUTPUT", () => {
+    const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf-8");
+    assert.match(
+      bin,
+      /appendFileSync\(output, `browserUrl=\$\{result\.browserUrl\}\\n`\)/,
+      ">> FAIL: bin-browserUrl-output: bin/polkadot-app-deploy must append `browserUrl=${result.browserUrl}` to GITHUB_OUTPUT alongside cid/domain, so a consumer's reusable-workflow step can read the env-resolved URL"
+    );
+  });
+
+  test(".github/workflows/deploy.yml: browser-URL step prefers the CLI-resolved URL over the gateway fallback", () => {
+    const wf = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+    const stepMatch = wf.match(/- name: Compute browser URL[\s\S]*?(?=\n {6}- name:|\Z)/);
+    assert.ok(stepMatch, ">> FAIL: workflow-browser-url: could not locate the 'Compute browser URL' step");
+    const step = stepMatch[0];
+    assert.match(
+      step,
+      /RESOLVED_URL:\s*\$\{\{\s*steps\.final\.outputs\.browserUrl\s*\}\}/,
+      ">> FAIL: workflow-browser-url: step must read steps.final.outputs.browserUrl (the CLI's env-resolved URL)"
+    );
+    assert.match(
+      step,
+      /if \[ -n "\$RESOLVED_URL" \]; then\s*\n\s*URL="\$RESOLVED_URL"/,
+      ">> FAIL: workflow-browser-url: a non-empty RESOLVED_URL must win over the inputs.gateway-based fallback construction"
+    );
+  });
+
+  test(".github/workflows/deploy.yml: 'Set deployment outputs' propagates browserUrl on both the cache-hit and fresh-deploy branches", () => {
+    const wf = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+    const stepMatch = wf.match(/- name: Set deployment outputs[\s\S]*?(?=\n {6}- name:|\Z)/);
+    assert.ok(stepMatch, ">> FAIL: workflow-final-outputs: could not locate the 'Set deployment outputs' step");
+    const step = stepMatch[0];
+    assert.match(
+      step,
+      /echo "browserUrl=\$\{\{ steps\.deploy\.outputs\.browserUrl \}\}" >> "\$GITHUB_OUTPUT"/,
+      ">> FAIL: workflow-final-outputs: fresh-deploy branch must propagate steps.deploy.outputs.browserUrl"
+    );
+    assert.match(
+      step,
+      /echo "browserUrl=" >> "\$GITHUB_OUTPUT"/,
+      ">> FAIL: workflow-final-outputs: cache-hit branch must emit an explicit empty browserUrl (deploy step never ran, so no env-resolved URL exists) rather than omitting the key"
+    );
+  });
+
+  test(".github/workflows/deploy.yml: gateway input is documented as a fallback, not the primary mechanism", () => {
+    const wf = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+    const gatewayInput = wf.match(/gateway:\s*\n\s*description: '([^']*)'/);
+    assert.ok(gatewayInput, ">> FAIL: workflow-gateway-doc: could not locate the `gateway` input description");
+    assert.match(
+      gatewayInput[1],
+      /FALLBACK ONLY/,
+      ">> FAIL: workflow-gateway-doc: `gateway` input description must flag itself as fallback-only now that polkadot-app-deploy's own env-resolved URL is preferred"
+    );
+  });
+});
+
+// The config is only discoverable if the caller's repo is on disk at the
+// workspace root, and the artifact must land where the config points (#1418).
+describe(".github/workflows/deploy.yml: checks out the caller repo so its product manifest is found (#1418)", () => {
+  test("checks out the caller repo at the root before the artifact download", () => {
+    const wf = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+    const checkoutStep = wf.split(/\n(?= {6}- )/).find((step) => /- name: Checkout caller repository$/m.test(step));
+    assert.ok(checkoutStep, ">> FAIL: deploy.yml: the caller checkout step must exist");
+    // No repository:/path: — either one moves the config outside the walk-up.
+    assert.doesNotMatch(checkoutStep, /^ {10}(repository|path):/m,
+      ">> FAIL: deploy.yml: the caller checkout must not set repository: or path:, or the config leaves the walk-up path");
+    const checkout = wf.indexOf("- name: Checkout caller repository");
+    const download = wf.indexOf("- name: Download build artifact");
+    assert.ok(checkout > -1 && download > checkout,
+      ">> FAIL: deploy.yml: the caller checkout must precede the artifact download, or checkout's git clean removes it");
+    assert.match(wf, /^ {6}build-dir:\n {8}description:/m, ">> FAIL: deploy.yml: build-dir input must exist");
+    assert.match(wf, /path: \$\{\{ inputs\.build-dir \}\}/,
+      ">> FAIL: deploy.yml: the artifact must download into inputs.build-dir");
+    // The cache key must track the directory actually deployed.
+    const hashStep = wf.split(/\n(?= {6}- )/).find((step) => /- name: Compute build hash$/m.test(step));
+    assert.match(hashStep, /BUILD_DIR: \$\{\{ inputs\.build-dir \}\}/,
+      ">> FAIL: deploy.yml: the build hash must be computed over inputs.build-dir, not a literal directory");
+    // The manifest is republished only when the deploy step runs, and that step is
+    // skipped on a cache hit. A config-only edit must therefore change the key.
+    assert.match(hashStep, /polkadot-app-deploy\.config\.ts/,
+      ">> FAIL: deploy.yml: the build hash must cover polkadot-app-deploy.config.*, or editing only the config hits the cache and the manifest is never republished");
+    // A caller-controlled input in script text is a shell injection in the job
+    // that exports the deploy mnemonic. Scan the script bodies themselves: the
+    // deploy step is a `command:` block on nick-fields/retry, not a `run:`, so a
+    // line-scoped `run:` check cannot see where injection would happen.
+    const lines = wf.split("\n");
+    const scripts = [];
+    for (let i = 0; i < lines.length; i++) {
+      const open = lines[i].match(/^( +)(?:run|command): \|-?\s*$/);
+      if (!open) continue;
+      const indent = open[1].length;
+      const body = [];
+      while (++i < lines.length) {
+        const line = lines[i];
+        if (line.trim() !== "" && (line.length - line.trimStart().length) <= indent) { i--; break; }
+        body.push(line);
+      }
+      scripts.push(body.join("\n"));
+    }
+    assert.ok(scripts.length >= 2, `>> FAIL: deploy.yml: expected to find the run/command script bodies, found ${scripts.length}`);
+    const injected = scripts.filter((body) => body.includes("${{ inputs.build-dir }}"));
+    assert.deepStrictEqual(injected.map((b) => b.trim().split("\n")[0]), [],
+      ">> FAIL: deploy.yml: build-dir must reach scripts through env:, never interpolated into a run:/command: body");
+  });
+});
+
 // import { shouldEmit } from "../tools/cache-savings-totals.mjs";
 
 describe.skip("shouldEmit (cache-savings-totals DSN gate)", () => { // skipped in public snapshot: tool not shipped
@@ -21229,42 +25304,22 @@ describe("computePhoneSigningSteps", () => {
   }
 
   test("new domain: 3 taps (commitment · register · link)", () => {
-    const steps = computePhoneSigningSteps(pf("register"), false);
+    const steps = computePhoneSigningSteps(pf("register"));
     assert.deepStrictEqual(steps, ["Commitment", "Register", "Link content"]);
   });
 
   test("already owned: 1 tap (link only)", () => {
-    const steps = computePhoneSigningSteps(pf("already-owned-by-us"), false);
-    assert.deepStrictEqual(steps, ["Link content"]);
-  });
-
-  test("new domain + publish needed: 4 taps", () => {
-    const steps = computePhoneSigningSteps(pf("register"), true);
-    assert.deepStrictEqual(steps, ["Commitment", "Register", "Link content", "Publish to registry"]);
-  });
-
-  test("already owned + publish needed: 2 taps", () => {
-    const steps = computePhoneSigningSteps(pf("already-owned-by-us"), true);
-    assert.deepStrictEqual(steps, ["Link content", "Publish to registry"]);
-  });
-
-  test("new domain + publish not needed: 3 taps (same as base register)", () => {
-    const steps = computePhoneSigningSteps(pf("register"), false);
-    assert.deepStrictEqual(steps, ["Commitment", "Register", "Link content"]);
-  });
-
-  test("already owned + publish not needed: 1 tap", () => {
-    const steps = computePhoneSigningSteps(pf("already-owned-by-us"), false);
+    const steps = computePhoneSigningSteps(pf("already-owned-by-us"));
     assert.deepStrictEqual(steps, ["Link content"]);
   });
 
   test("abort action: 0 taps", () => {
-    const steps = computePhoneSigningSteps(pf("abort"), false);
+    const steps = computePhoneSigningSteps(pf("abort"));
     assert.deepStrictEqual(steps, []);
   });
 
   test("null preflight: 0 taps", () => {
-    const steps = computePhoneSigningSteps(null, false);
+    const steps = computePhoneSigningSteps(null);
     assert.deepStrictEqual(steps, []);
   });
 });
@@ -21445,8 +25500,7 @@ describe("human-first phone signing", () => {
     const handler = (steps) => plans.push(steps.slice());
     // Simulate what deploy() does at preflight.
     const dotnsPreflight = { plannedAction: "register", needsPopUpgrade: false };
-    const preflightPublishNeeded = false;
-    const steps = computePhoneSigningSteps(dotnsPreflight, preflightPublishNeeded);
+    const steps = computePhoneSigningSteps(dotnsPreflight);
     handler(steps);
     assert.deepStrictEqual(plans[0], ["Commitment", "Register", "Link content"],
       "new-name plan must be [Commitment, Register, Link content] >> FAIL: human-first phone signing: wrong step plan for new-name");
@@ -21455,16 +25509,10 @@ describe("human-first phone signing", () => {
   test("onPhoneSignaturePlan fires before storage with correct step counts: owned-name (link)", () => {
     const plans = [];
     const dotnsPreflight = { plannedAction: "already-owned-by-us", needsPopUpgrade: false };
-    const steps = computePhoneSigningSteps(dotnsPreflight, false);
+    const steps = computePhoneSigningSteps(dotnsPreflight);
     plans.push(steps.slice());
     assert.deepStrictEqual(plans[0], ["Link content"],
       "owned-name plan must be [Link content] >> FAIL: human-first phone signing: wrong step plan for owned-name");
-  });
-
-  test("onPhoneSignaturePlan fires before storage with correct step counts: new-name + publish (commit·register·link·publish)", () => {
-    const steps = computePhoneSigningSteps({ plannedAction: "register", needsPopUpgrade: false }, true);
-    assert.deepStrictEqual(steps, ["Commitment", "Register", "Link content", "Publish to registry"],
-      "new-name+publish plan must include Publish to registry >> FAIL: human-first phone signing: publish step missing from plan");
   });
 
   test("core src/dotns.ts and src/deploy.ts contain no readline or process.stdin reference", () => {
@@ -22173,7 +26221,8 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, validateNoManifestFlags } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, mnemonicConflictNotice, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, pickPostDeployBannerText, resolveProductSigner, isPoolFallbackAllowed, assertPoolFallbackAllowed, setBulletinNetworkContext, __getBulletinNetworkContextForTest } from "../dist/deploy.js";
+import { deriveProductSigner } from "../dist/product-account.js";
 import { BulletinSlotAuthError as BulletinSlotAuthErrorForReasonTest } from "../dist/storage-signer.js";
 
 // #1058: describeSlotFallbackReason is the extracted, unit-testable reason
@@ -22211,11 +26260,13 @@ describe("resolveStorageSigner (user-first storage signer, #19)", () => {
   const fakeSigner = { publicKey: new Uint8Array(32), signTx: async () => new Uint8Array(64), signBytes: async () => new Uint8Array(64) };
   const SLOT_ADDR = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
   const SESSION_ID = "test-session-id";
+  const PRODUCT_ID = "polkadot-app-deploy.paseo";
 
   // Helper: build a minimal session mock
   function makeSession() {
     return {
       userSession: { id: SESSION_ID },
+      productId: PRODUCT_ID,
       adapter: {
         allowance: {
           getBulletinSigner: async () => ({ isOk: () => true, isErr: () => false, value: fakeSigner }),
@@ -22252,6 +26303,7 @@ describe("resolveStorageSigner (user-first storage signer, #19)", () => {
     const result = await resolveStorageSigner(session, {
       getBulletinSigner: async (sessionId, productId) => {
         assert.strictEqual(sessionId, SESSION_ID, ">> FAIL: resolveStorageSigner cache-hit: must call getBulletinSigner with correct sessionId");
+        assert.strictEqual(productId, PRODUCT_ID, ">> FAIL: resolveStorageSigner cache-hit: must read the slot under the session's product id");
         return ok(fakeSigner);
       },
       requestResourceAllocation: async () => { throw new Error("should not be called on cache-hit"); },
@@ -22274,13 +26326,19 @@ describe("resolveStorageSigner (user-first storage signer, #19)", () => {
     const session = makeSession();
     const result = await resolveStorageSigner(session, {
       getBulletinSigner: async () => err("NotAvailable"),
-      requestResourceAllocation: async (userSession, adapter, resources) => {
+      requestResourceAllocation: async (userSession, adapter, productId, resources) => {
+        assert.strictEqual(productId, PRODUCT_ID,
+          ">> FAIL: resolveStorageSigner miss+approve: allocation must be scoped to the session's product id");
         assert.ok(resources.some(r => r.tag === "BulletInAllowance"),
           ">> FAIL: resolveStorageSigner miss+approve: requestResourceAllocation must request BulletInAllowance");
         return [{ tag: "Allocated", value: { slotAccountKey: new Uint8Array(64) } }];
       },
       ss58Encode: () => SLOT_ADDR,
-      createSlotAccountSigner: async () => fakeSigner,
+      createSlotAccountSigner: async (adapter, resource, productId) => {
+        assert.strictEqual(productId, PRODUCT_ID,
+          ">> FAIL: resolveStorageSigner miss+approve: slot cache read must use the session's product id");
+        return fakeSigner;
+      },
       promptBeforeAllocation: () => { promptCalled = true; },
     });
     assert.ok(promptCalled,
@@ -22475,6 +26533,231 @@ describe("resolveEffectiveMnemonic env/flag precedence (#1107)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// nonInteractivePhoneConfirmationError (#1363) — non-interactive callers must
+// not hit "aborted by user"
+//
+// Pre-fix: bin/polkadot-app-deploy's confirmPhoneReady hook unconditionally
+// built a readline interface and awaited a keypress. In CI (no TTY),
+// readline's "close" event fires immediately (nothing will ever answer), and
+// the gate rejected with `new Error("aborted by user")` — indistinguishable
+// from a deliberate Ctrl-C. This is the pure, readline-free piece of the fix:
+// the message + error type the CLI now throws BEFORE creating readline once
+// it detects a non-interactive environment (via the existing isInteractive()
+// helper, not a new mechanism).
+// ---------------------------------------------------------------------------
+describe("nonInteractivePhoneConfirmationError (#1363)", () => {
+  test("returns a NonRetryableError — retrying an unattended CI run fails identically every time", () => {
+    const err = nonInteractivePhoneConfirmationError("Link content");
+    assert.ok(err instanceof NonRetryableError,
+      `>> FAIL: nonInteractivePhoneConfirmationError: must be a NonRetryableError so bin/polkadot-app-deploy exits EXIT_CODE_NO_RETRY instead of a retryable-looking generic failure; got ${err.constructor.name}`);
+  });
+
+  test("message names the label, states the run is non-interactive, and never says 'aborted by user'", () => {
+    const err = nonInteractivePhoneConfirmationError("Link content");
+    assert.match(err.message, /Link content/,
+      ">> FAIL: nonInteractivePhoneConfirmationError: message must name which signature step was blocked");
+    assert.match(err.message, /non-interactive/i,
+      ">> FAIL: nonInteractivePhoneConfirmationError: message must say the run is non-interactive, not disguise the cause");
+    assert.doesNotMatch(err.message, /aborted by user/i,
+      ">> FAIL: nonInteractivePhoneConfirmationError: must never reuse the 'aborted by user' phrasing — that's the issue this fixes (misattributing a CI failure to an operator who was never there)");
+  });
+
+  test("message names the actionable fix: --mnemonic, MNEMONIC, and DOTNS_MNEMONIC", () => {
+    // There is no safe default for a phone signature (unlike a yes/no prompt,
+    // silently proceeding would submit an unapproved transaction), so the
+    // message must point the caller at a signer that never needs phone
+    // confirmation instead of guessing on their behalf.
+    const err = nonInteractivePhoneConfirmationError("Commitment");
+    assert.match(err.message, /--mnemonic/,
+      ">> FAIL: nonInteractivePhoneConfirmationError: message must name the --mnemonic flag as the fix");
+    assert.match(err.message, /\bMNEMONIC\b/,
+      ">> FAIL: nonInteractivePhoneConfirmationError: message must name the MNEMONIC env var as an alternative fix");
+    assert.match(err.message, /DOTNS_MNEMONIC/,
+      ">> FAIL: nonInteractivePhoneConfirmationError: message must name the DOTNS_MNEMONIC env var as an alternative fix");
+  });
+
+  test("error_category classifies as 'user' — the fix is in the caller's hands (pass --mnemonic), not the tool's", () => {
+    const err = nonInteractivePhoneConfirmationError("Register");
+    const category = classifyDeployError(err.message);
+    assert.strictEqual(category, "user",
+      `>> FAIL: nonInteractivePhoneConfirmationError category: got ${category} — this is an actionable caller-side fix, same family as insufficient-balance/invalid-label, not an environment/internal fault`);
+  });
+});
+
+describe("bin/polkadot-app-deploy confirmPhoneReady non-interactive gate (#1363, source wiring)", () => {
+  // bin/polkadot-app-deploy is a plain executable script (not compiled, no
+  // top-level exports), and driving it far enough to hit the live
+  // confirmPhoneReady closure requires a real chain connection — that's E2E
+  // territory. These assertions pin the wiring the interactive-vs-CI split
+  // depends on, the same way this file's other bin/polkadot-app-deploy tests
+  // check source shape directly rather than executing the script end-to-end.
+  const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf-8");
+
+  test("imports isInteractive from version-check.js and nonInteractivePhoneConfirmationError from deploy.js", () => {
+    assert.match(bin, /isInteractive/,
+      ">> FAIL: bin/polkadot-app-deploy must import isInteractive from ../dist/version-check.js — reuse the existing TTY/CI detection, not a second mechanism");
+    assert.match(bin, /nonInteractivePhoneConfirmationError/,
+      ">> FAIL: bin/polkadot-app-deploy must import and use nonInteractivePhoneConfirmationError from ../dist/deploy.js");
+  });
+
+  test("confirmPhoneReady checks isInteractive() BEFORE readline.createInterface is reached", () => {
+    const confirmBlock = bin.slice(bin.indexOf("confirmPhoneReady: ("), bin.indexOf("readline.createInterface"));
+    assert.ok(confirmBlock.length > 0 && confirmBlock.includes("isInteractive"),
+      ">> FAIL: bin/polkadot-app-deploy: the isInteractive() check must run before readline.createInterface — otherwise a non-TTY run still builds a readline interface it can never satisfy");
+    assert.match(confirmBlock, /!isInteractive\(\)/,
+      ">> FAIL: bin/polkadot-app-deploy: confirmPhoneReady must gate on !isInteractive(), rejecting before creating readline");
+  });
+
+  test("the interactive branch (readline prompt, Y/yes handling, genuine Ctrl-C abort) is still present, unmodified in behavior", () => {
+    // The fix must ONLY add a guard in front of the existing prompt — a real
+    // interactive deploy must still see "Check your phone", accept y/yes, and
+    // a genuine Ctrl-C during the prompt must still reject as "aborted by
+    // user" (that classification stays correct for an actual interactive
+    // cancellation; #1363 only stops CI from reaching it).
+    assert.match(bin, /Check your phone/,
+      ">> FAIL: bin/polkadot-app-deploy: interactive phone-check prompt text must still be present");
+    assert.match(bin, /readline\.createInterface/,
+      ">> FAIL: bin/polkadot-app-deploy: interactive readline wiring must still be present for a real TTY session");
+    assert.match(bin, /new Error\("aborted by user"\)/,
+      ">> FAIL: bin/polkadot-app-deploy: a genuine interactive Ctrl-C must still reject with 'aborted by user' — only the non-interactive path gets the new distinct error");
+    assert.match(bin, /answer === "y" \|\| answer === "yes"/,
+      ">> FAIL: bin/polkadot-app-deploy: the explicit y/yes confirmation requirement (#194) must be unchanged");
+  });
+});
+
+// bulletin #1553/#1461: MNEMONIC and DOTNS_MNEMONIC used to be ranked in
+// opposite order by resolveEffectiveMnemonic (MNEMONIC-first, above) and
+// DotNS.connect's own fallback (DOTNS_MNEMONIC-first) — invisible via the CLI
+// because bin/polkadot-app-deploy always pre-resolves options.mnemonic before
+// DotNS.connect ever looks at its own env fallback. src/mnemonic.ts is now
+// the single shared implementation.
+const MN1553_A = "bottom drive obey lake curtain smoke basket hold race lonely fit walk"; // well-known dev phrase
+const MN1553_B = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+describe("resolveEffectiveMnemonic env-vs-env precedence (bulletin #1553/#1461)", () => {
+  test("both env vars set, no flag → MNEMONIC wins (the exact case #1461 found untested)", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: undefined, envMnemonic: MN1553_A, envDotnsMnemonic: MN1553_B });
+    assert.strictEqual(resolved, MN1553_A,
+      ">> FAIL: mnemonic-precedence: with both MNEMONIC and DOTNS_MNEMONIC set and no --mnemonic flag, MNEMONIC must win — pre-fix, DotNS.connect's own fallback disagreed and picked DOTNS_MNEMONIC on this exact input");
+  });
+
+  test("empty-string MNEMONIC is treated as unset, not a winning blank value (GH Actions unset-secret shape)", () => {
+    // `MNEMONIC: ${{ secrets.X }}` on an unset secret resolves to "" — must
+    // fall through to DOTNS_MNEMONIC, not win as a blank mnemonic.
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: undefined, envMnemonic: "", envDotnsMnemonic: MN1553_B });
+    assert.strictEqual(resolved, MN1553_B, ">> FAIL: mnemonic-precedence: an empty-string MNEMONIC must fall through to DOTNS_MNEMONIC rather than winning as a blank value");
+  });
+
+  test("whitespace-only --mnemonic flag falls through to MNEMONIC", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: "   ", envMnemonic: MN1553_A, envDotnsMnemonic: undefined });
+    assert.strictEqual(resolved, MN1553_A, ">> FAIL: mnemonic-precedence: a whitespace-only --mnemonic flag must fall through to the MNEMONIC env var rather than winning as a blank value");
+  });
+});
+
+describe("mnemonicConflictNotice (bulletin #1553/#1461)", () => {
+  test("both set and differ → a notice naming both env vars, never their values", () => {
+    const notice = mnemonicConflictNotice({ envMnemonic: MN1553_A, envDotnsMnemonic: MN1553_B });
+    assert.ok(notice, ">> FAIL: mnemonic-notice: both set and differing must produce a non-null notice");
+    assert.match(notice, /MNEMONIC/, ">> FAIL: mnemonic-notice: notice must name MNEMONIC");
+    assert.match(notice, /DOTNS_MNEMONIC/, ">> FAIL: mnemonic-notice: notice must name DOTNS_MNEMONIC");
+    assert.ok(!notice.includes(MN1553_A) && !notice.includes(MN1553_B),
+      ">> FAIL: mnemonic-notice: notice must never include a raw mnemonic value (trust-boundary: no key material in logs)");
+  });
+
+  test("both set to the SAME value → no notice", () => {
+    const notice = mnemonicConflictNotice({ envMnemonic: MN1553_A, envDotnsMnemonic: MN1553_A });
+    assert.strictEqual(notice, null, ">> FAIL: mnemonic-notice: identical values must not be flagged as a conflict");
+  });
+
+  test("only one set → no notice", () => {
+    assert.strictEqual(mnemonicConflictNotice({ envMnemonic: MN1553_A, envDotnsMnemonic: undefined }), null, ">> FAIL: mnemonic-notice: MNEMONIC alone must not be flagged");
+    assert.strictEqual(mnemonicConflictNotice({ envMnemonic: undefined, envDotnsMnemonic: MN1553_B }), null, ">> FAIL: mnemonic-notice: DOTNS_MNEMONIC alone must not be flagged");
+  });
+
+  test("neither set → no notice", () => {
+    assert.strictEqual(mnemonicConflictNotice({ envMnemonic: undefined, envDotnsMnemonic: undefined }), null, ">> FAIL: mnemonic-notice: nothing set must not be flagged");
+  });
+});
+
+describe("DotNS.connect() shares resolveEffectiveMnemonic's precedence (bulletin #1553/#1461)", () => {
+  const repoRoot = path.resolve(BIN_PATH, "../..");
+  const dotnsUrl = pathToFileURL(path.join(repoRoot, "dist/dotns.js")).href;
+
+  async function addressFor(mnemonic) {
+    await ensureAuthCryptoWaitReady();
+    const keyring = new EnsureAuthKeyring({ type: "sr25519" });
+    return keyring.addFromMnemonic(mnemonic).address;
+  }
+
+  test("options.mnemonic absent, both env vars set and differ → derives the signer from MNEMONIC, not DOTNS_MNEMONIC", async () => {
+    const addressA = await addressFor(MN1553_A);
+    // Run in a CHILD process rather than in-process: connect()'s network
+    // step against an unreachable RPC can take much longer than the
+    // signer-derivation step this test cares about, and an in-process await
+    // left the pending connection an open handle with no way to force it
+    // closed. A child process can be killed outright via spawnSync's timeout
+    // once the value we need (substrateAddress, set synchronously before any
+    // network call) has been captured and printed.
+    const script = [
+      `import { DotNS } from ${JSON.stringify(dotnsUrl)};`,
+      `const dotns = new DotNS();`,
+      `dotns.connect({ rpc: "ws://127.0.0.1:1" }).catch(() => {});`,
+      `setTimeout(() => { process.stdout.write(JSON.stringify({ address: dotns.substrateAddress ?? null })); process.exit(0); }, 1200);`,
+    ].join("\n");
+    const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      encoding: "utf8",
+      timeout: 6000,
+      killSignal: "SIGKILL",
+      env: { ...process.env, MNEMONIC: MN1553_A, DOTNS_MNEMONIC: MN1553_B },
+    });
+    assert.ok(result.stdout, `>> FAIL: dotns-connect-precedence: child process produced no stdout (status ${result.status}, signal ${result.signal}, stderr: ${result.stderr})`);
+    // dotns.ts's own connect() prints "   SS58 Address: ..." to stdout
+    // before our marker JSON does — take only the last line.
+    const lastLine = result.stdout.trim().split("\n").pop();
+    const { address } = JSON.parse(lastLine);
+    assert.strictEqual(address, addressA,
+      ">> FAIL: dotns-connect-precedence: with no options.mnemonic and both env vars set and differing, DotNS.connect must derive its signer from MNEMONIC, not DOTNS_MNEMONIC — this is dotns.ts's own resolution point for a direct connect() caller that bypasses bin's pre-collapse (e.g. deploy() used as a library, or DotNS used directly)");
+  });
+});
+
+describe("CLI end-to-end: bin/polkadot-app-deploy's mnemonic collapse doesn't defeat the fix (bulletin #1553/#1461)", () => {
+  test("MNEMONIC and DOTNS_MNEMONIC both set, no --mnemonic flag → the CLI signs with MNEMONIC and warns about the conflict on stderr", async () => {
+    await ensureAuthCryptoWaitReady();
+    const keyring = new EnsureAuthKeyring({ type: "sr25519" });
+    const addressA = keyring.addFromMnemonic(MN1553_A).address;
+
+    const buildDir = fs.mkdtempSync(path.join(os.tmpdir(), "mn1553test-"));
+    fs.writeFileSync(path.join(buildDir, "index.html"), "<html></html>");
+    let result;
+    try {
+      result = spawnSync(process.execPath, [BIN_PATH, buildDir, "mnemonic1553test", "--no-manifest"], {
+        cwd: path.resolve(BIN_PATH, "../.."),
+        encoding: "utf8",
+        timeout: 8000,
+        killSignal: "SIGKILL",
+        env: {
+          ...process.env,
+          MNEMONIC: MN1553_A,
+          DOTNS_MNEMONIC: MN1553_B,
+          // Unreachable on purpose — this test only needs the signer to be
+          // derived and printed, which happens before any network call; the
+          // deploy is expected (and allowed) to fail after.
+          DOTNS_RPC: "ws://127.0.0.1:1",
+          PAD_UPDATE_CHECK: "0",
+        },
+      });
+    } finally {
+      fs.rmSync(buildDir, { recursive: true, force: true });
+    }
+
+    assert.match(result.stdout, new RegExp(`SS58 Address: ${addressA}`),
+      `>> FAIL: cli-mnemonic-collapse: bin/polkadot-app-deploy must sign with the MNEMONIC-derived address (${addressA}) even though it pre-collapses MNEMONIC/DOTNS_MNEMONIC into a single options.mnemonic before DotNS.connect ever runs — got stdout:\n${result.stdout}`);
+    assert.match(result.stderr, /Both MNEMONIC and DOTNS_MNEMONIC are set/,
+      ">> FAIL: cli-mnemonic-collapse: the CLI must print the conflict notice on stderr when both env vars are set and differ");
+  });
+});
+
 describe("resolveEnvId env/flag precedence (#1165)", () => {
   const FLAG_ENV = "preview";
   const VAR_ENV = "summit";
@@ -22504,7 +26787,7 @@ describe("resolveEnvId env/flag precedence (#1165)", () => {
   });
 });
 
-describe("shouldPublishManifest / validateNoManifestFlags — --no-manifest / --content-only (#1163)", () => {
+describe("shouldPublishManifest — --no-manifest / --content-only (#1163)", () => {
   test("config present + noManifest → false (skip manifest publish even though a config was discovered)", () => {
     const result = shouldPublishManifest({ configFound: true, noManifest: true });
     assert.strictEqual(result, false,
@@ -22523,23 +26806,105 @@ describe("shouldPublishManifest / validateNoManifestFlags — --no-manifest / --
     assert.strictEqual(shouldPublishManifest({ configFound: false, noManifest: true }), false,
       ">> FAIL: shouldPublishManifest: with no config discovered AND --no-manifest set, manifest publishing must stay skipped");
   });
+});
 
-  test("--no-manifest + --publish → rejected as a contradiction", () => {
-    const err = validateNoManifestFlags({ noManifest: true, publish: true });
-    assert.match(err, /--no-manifest.*--publish are mutually exclusive/,
-      ">> FAIL: validateNoManifestFlags: --no-manifest + --publish must be rejected — Publisher listing (--publish) depends on the manifest records --no-manifest skips");
+describe("pickPostDeployBannerText (#1164)", () => {
+  test("manifestPending true → interim banner, not DEPLOYMENT COMPLETE", () => {
+    assert.strictEqual(pickPostDeployBannerText(true), "CONTENT DEPLOYED — publishing product manifest…",
+      ">> FAIL: pickPostDeployBannerText: manifestPending:true must defer the completion banner (#1164)");
   });
 
-  test("--no-manifest without --publish → not rejected", () => {
-    const err = validateNoManifestFlags({ noManifest: true, publish: false });
-    assert.strictEqual(err, null,
-      ">> FAIL: validateNoManifestFlags: --no-manifest alone (no --publish) must be accepted — it's the normal content-only use case");
+  test("manifestPending false → DEPLOYMENT COMPLETE (unchanged default)", () => {
+    assert.strictEqual(pickPostDeployBannerText(false), "DEPLOYMENT COMPLETE!",
+      ">> FAIL: pickPostDeployBannerText: manifestPending:false must keep today's banner");
   });
 
-  test("--publish without --no-manifest → not rejected", () => {
-    const err = validateNoManifestFlags({ noManifest: false, publish: true });
-    assert.strictEqual(err, null,
-      ">> FAIL: validateNoManifestFlags: --publish alone (no --no-manifest) must be accepted — unaffected by #1163");
+  test("manifestPending undefined (every existing library caller) → DEPLOYMENT COMPLETE (default unchanged)", () => {
+    assert.strictEqual(pickPostDeployBannerText(undefined), "DEPLOYMENT COMPLETE!",
+      ">> FAIL: pickPostDeployBannerText: an unset flag (e.g. playground-cli, which never sets manifestPending) must keep today's banner — the change is opt-in, not a behavior change for existing callers");
+  });
+});
+
+describe("bin/polkadot-app-deploy manifestPending + deferred banner wiring (#1164, source wiring)", () => {
+  const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf-8");
+
+  test("passes manifestPending to deploy() derived from shouldPublishManifest", () => {
+    assert.match(bin, /manifestPending:\s*manifestWillPublish/,
+      ">> FAIL: bin/polkadot-app-deploy must pass manifestPending: manifestWillPublish (derived from shouldPublishManifest) into deploy()'s options — the banner defers only when a manifest publish will actually follow");
+  });
+
+  test("prints the real completion banner AFTER publishManifest succeeds, not before", () => {
+    const publishIdx = bin.indexOf("await publishManifest(");
+    const bannerIdx = bin.indexOf("printDeploymentCompleteBanner(");
+    assert.ok(publishIdx > -1 && bannerIdx > -1 && bannerIdx > publishIdx,
+      ">> FAIL: bin/polkadot-app-deploy: printDeploymentCompleteBanner must be called AFTER await publishManifest(...) resolves, inside the same try block, so a manifest publish failure never prints a false completion banner");
+  });
+});
+
+// The reusable workflow downloads only the build artifact, so the caller's
+// config is on disk only if their repo is checked out at the workspace root (#1418).
+describe("product config discovery in the reusable-workflow layout (#1418)", () => {
+  const CONFIG = (domain) => `export default {
+  domain: '${domain}',
+  displayName: 'Demo',
+  description: 'Fixture for #1418.',
+  icon: { path: './icon.png', format: 'png' },
+  executables: [{ kind: 'app', path: './build', appVersion: [0, 1, 0] }],
+};
+`;
+
+  // A fresh dir per case: tryLoadProductConfig import()s the config, and Node
+  // caches ES modules by path, so a reused dir would serve the previous body.
+  let seq = 0;
+  function workspace({ repo = {}, artifact = {}, buildDir = "build" }) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `pad-1418-${seq++}-`));
+    for (const [rel, body] of Object.entries(repo)) {
+      fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+      fs.writeFileSync(path.join(root, rel), body);
+    }
+    const bd = path.join(root, buildDir);
+    fs.mkdirSync(bd, { recursive: true });
+    fs.writeFileSync(path.join(bd, "index.html"), "<h1>site</h1>");
+    for (const [rel, body] of Object.entries(artifact)) {
+      fs.mkdirSync(path.dirname(path.join(bd, rel)), { recursive: true });
+      fs.writeFileSync(path.join(bd, rel), body);
+    }
+    return { root, bd };
+  }
+  const find = async (bd) => {
+    const { tryLoadProductConfig } = await import("../dist/index.js");
+    return tryLoadProductConfig({ cwd: path.resolve(bd), walkUp: true });
+  };
+
+  test("no caller checkout: the config is not on disk, so the manifest is silently skipped", async () => {
+    const { bd } = workspace({});
+    const loaded = await find(bd);
+    assert.strictEqual(shouldPublishManifest({ configFound: !!loaded, noManifest: false }), false,
+      ">> FAIL: #1418 fixture: with no caller checkout there is no config to find; this pins the bug the workflow change fixes");
+  });
+
+  test("caller checked out at the workspace root: the config is found and the manifest publishes", async () => {
+    const { bd } = workspace({ repo: { "polkadot-app-deploy.config.ts": CONFIG("demo.dot"), "icon.png": "x" } });
+    const loaded = await find(bd);
+    assert.ok(loaded, ">> FAIL: #1418: a root config must be found by walking up from the build dir");
+    assert.strictEqual(shouldPublishManifest({ configFound: !!loaded, noManifest: false }), true,
+      ">> FAIL: #1418: a discovered config must trigger the manifest publish");
+  });
+
+  test("a build-dir other than build/ still reaches a root config", async () => {
+    const { bd } = workspace({ repo: { "polkadot-app-deploy.config.ts": CONFIG("demo.dot"), "icon.png": "x" }, buildDir: "out" });
+    assert.ok(await find(bd),
+      ">> FAIL: #1418: build-dir must not break the walk-up, or callers that build to out/ or dist/ stay broken");
+  });
+
+  test("a config inside the artifact wins over one at the repo root", async () => {
+    const { bd } = workspace({
+      repo: { "polkadot-app-deploy.config.ts": CONFIG("stale.dot"), "icon.png": "x" },
+      artifact: { "polkadot-app-deploy.config.ts": CONFIG("generated.dot"), "icon.png": "x" },
+    });
+    const loaded = await find(bd);
+    assert.equal(loaded?.config?.domain, "generated.dot",
+      ">> FAIL: #1418: the walk-up must stop at the build dir, or a caller that generates a per-domain config into its artifact would deploy against a stale root config");
   });
 });
 
@@ -22673,7 +27038,9 @@ describe("e2e-ensure-authorized: DRIFT GUARD — signer list derived from e2e.ym
     const expected = [
       "//e2e-direct", "//e2e-fresh-direct", "//e2e-fresh-pool", "//e2e-s9", "//e2e-sgrandpa",
       "//deploy/0", "//deploy/1", "//deploy/2", "//deploy/3", "//deploy/4", "//deploy/5",
-      "//deploy/6", "//deploy/7", "//deploy/8", "//deploy/9", "//deploy/10", "//deploy/11",
+      // No pinned //deploy/8: s-content-only moved to 13 (bulletin #1637).
+      "//deploy/6", "//deploy/7", "//deploy/9", "//deploy/10", "//deploy/11",
+      "//deploy/12", "//deploy/13",
     ];
     assert.deepStrictEqual(labels, expected,
       `>> FAIL: e2e-signer-drift-guard: the derived signer set no longer matches the pinned expectation (derived: ${JSON.stringify(labels)}). ` +
@@ -22869,7 +27236,7 @@ describe("e2e.yml: prerequisites job wiring (ensure-e2e-authorized)", () => {
     "nightly-pr-coverage", "nightly-s1-pool", "nightly-s1-direct", "nightly-s2-fresh",
     "nightly-s3", "nightly-s5", "nightly-s6", "nightly-s7", "nightly-s8", "nightly-s9",
     "nightly-s-grandpa-reupload", "nightly-s-mortality", "nightly-s-reprove",
-    "nightly-s-car", "nightly-s-inc", "nightly-s-ext-signer",
+    "nightly-s-car", "nightly-s-inc", "nightly-s-ext-signer", "nightly-s-reserved-invariant",
   ];
 
   test("e2e.yml defines the ensure-e2e-authorized prerequisites job", () => {
@@ -22905,10 +27272,168 @@ describe("e2e.yml: prerequisites job wiring (ensure-e2e-authorized)", () => {
     const needsMatch = reportBlock.match(/needs:\s*\[([^\]]*)\]/);
     assert.ok(needsMatch && needsMatch[1].split(",").map((s) => s.trim()).includes("ensure-e2e-authorized"),
       ">> FAIL: e2e-prereq-wiring: nightly-report must needs: ensure-e2e-authorized so a prereq failure is reflected in the nightly report.");
-    assert.match(reportBlock, /needs\.ensure-e2e-authorized\.result == 'failure'/,
-      ">> FAIL: e2e-prereq-wiring: the 'Open failure issue' step must treat a prerequisites failure as a failure condition, not silently omit it.");
-    assert.match(reportBlock, /needs\.ensure-e2e-authorized\.result == 'cancelled'/,
-      ">> FAIL: e2e-prereq-wiring: the 'Open failure issue' step must treat a prerequisites cancellation as a failure condition too.");
+    // The 'Open failure issue' step's condition is now generic —
+    // contains(needs.*.result, 'failure'/'cancelled') — rather than a
+    // hand-listed OR chain (port of bulletin #1512's /simplify pass: the
+    // hand-listed form here was missing nightly-s7, so a solo S7 failure
+    // filed nothing). Being generic over needs.*.result means it
+    // automatically covers ensure-e2e-authorized (and every other needs:
+    // entry) without having to name it, so the invariant this test protects
+    // is "the step reads needs.*.result generically", not "the step names
+    // ensure-e2e-authorized specifically".
+    assert.match(reportBlock, /- name: Open failure issue[\s\S]*?contains\(needs\.\*\.result,\s*'failure'\)/,
+      ">> FAIL: e2e-prereq-wiring: the 'Open failure issue' step must gate on contains(needs.*.result, 'failure'), which covers ensure-e2e-authorized (and every needs: entry) generically.");
+    assert.match(reportBlock, /- name: Open failure issue[\s\S]*?contains\(needs\.\*\.result,\s*'cancelled'\)/,
+      ">> FAIL: e2e-prereq-wiring: the 'Open failure issue' step must gate on contains(needs.*.result, 'cancelled') too.");
+  });
+
+  // Port of bulletin #1516/#1523: the failure-issue title used to be built
+  // from `date -u` evaluated when the "Resolve the failure-issue title" step
+  // RUNS, not when the run started. A re-run's report step can execute on
+  // the far side of 00:00 UTC from attempt 1's — same run, different TODAY —
+  // so attempt 2 computes a title attempt 1's issue doesn't have: "Open
+  // failure issue" then files a duplicate instead of matching, and the
+  // "Note a green re-run" step finds no issue with that title and prints
+  // "nothing to annotate", leaving attempt 1's issue unannotated. The fix
+  // keys TODAY on the run's `created_at`, which GitHub sets once when the
+  // run is first created and does not change across run_attempts.
+  test(".github/workflows/e2e.yml: nightly-report failure-issue title keys off the run's created_at, not report-time wall clock (port of bulletin #1516/#1523)", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const report = jobBlock(e2e, "nightly-report");
+    const resolveStep = report.split(/\n(?= {6}- )/).find((step) => /- name: Resolve the failure-issue title$/m.test(step));
+    assert.ok(resolveStep, ">> FAIL: nightly-report: the Resolve the failure-issue title step must exist");
+
+    // TODAY must be derived from the run's created_at, with wall clock
+    // reachable ONLY through the empty/null guard.
+    assert.match(
+      resolveStep,
+      /if \[ -z "\$RUN_CREATED_AT" \][\s\S]*?TODAY=\$\(date -u \+%Y-%m-%d\)[\s\S]*?else[\s\S]*?TODAY=\$\(date -u -d "\$RUN_CREATED_AT" \+%Y-%m-%d\)/,
+      ">> FAIL: nightly-report: TODAY must come from the run's created_at, which is stable across every run_attempt, and reach bare wall-clock `date -u +%Y-%m-%d` only inside the guard for an unreadable created_at",
+    );
+
+    // The fetch must not be able to kill the step.
+    assert.match(
+      resolveStep,
+      /\|\| true\)/,
+      ">> FAIL: nightly-report: the created_at fetch must tolerate failure (`|| true`) so an API blip degrades to wall clock instead of killing the step and suppressing the failure issue",
+    );
+
+    // RUN_CREATED_AT has to come from a fetch of the RUN object itself (GET
+    // /actions/runs/{run_id}) in THIS step — distinct from the "Fetch
+    // per-leg job results" step's /actions/runs/{run_id}/jobs calls, whose
+    // per-job listing has no run-level created_at field.
+    const runUrls = [...resolveStep.matchAll(/actions\/runs\/[^"\n]*"/g)].map((m) => m[0]);
+    assert.ok(
+      runUrls.some((u) => !u.includes("/jobs")),
+      ">> FAIL: nightly-report: expected a GET to /actions/runs/{run_id} (the run object, for its created_at) in the Resolve step",
+    );
+  });
+
+  // Port of bulletin #1532/#1536: "Open failure issue" and "Note a green
+  // re-run" both used to dedup on the exact rendered TITLE string, so any
+  // cosmetic reword of the title silently broke dedup and filed a
+  // duplicate. The fix: the Resolve step computes a structured dedup label
+  // from (tier, date) — or (tier, version) for the release tier, where a
+  // UTC day can see multiple RC prereleases and date alone would wrongly
+  // collapse distinct release versions onto one issue — and both consumers
+  // filter on that label instead of the title. Adapted from bulletin's
+  // 3-tier (release/stable/head) version to the twin's 2-tier
+  // (release/nightly) model: the twin's schedule trigger always
+  // source-builds main HEAD, so there is no separate @latest-tested tier.
+  test(".github/workflows/e2e.yml: nightly-report failure-issue dedup keys on a structured label, not the title (port of bulletin #1532/#1536)", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const report = jobBlock(e2e, "nightly-report");
+    const steps = report.split(/\n(?= {6}- )/);
+    const resolveStep = steps.find((step) => /- name: Resolve the failure-issue title$/m.test(step));
+    const openStep = steps.find((step) => /- name: Open failure issue$/m.test(step));
+    const noteStep = steps.find((step) => /- name: Note a green re-run/.test(step));
+    assert.ok(resolveStep, ">> FAIL: nightly-report: the Resolve the failure-issue title step must exist");
+    assert.ok(openStep, ">> FAIL: nightly-report: the Open failure issue step must exist");
+    assert.ok(noteStep, ">> FAIL: nightly-report: the Note a green re-run step must exist");
+
+    assert.match(
+      resolveStep,
+      /echo "DEDUP_LABEL=\$DEDUP_LABEL"[\s\S]*?>> "\$GITHUB_ENV"/,
+      ">> FAIL: nightly-report Resolve step: must export DEDUP_LABEL via GITHUB_ENV so both consumers read the same value",
+    );
+
+    const dedupLabelLine = (resolveStep.match(/^\s*DEDUP_LABEL=.*$/m) ?? [""])[0];
+    assert.ok(dedupLabelLine, ">> FAIL: nightly-report Resolve step: expected a DEDUP_LABEL=... assignment");
+    assert.doesNotMatch(
+      dedupLabelLine,
+      /\$(\{)?(ISSUE_)?TITLE/,
+      ">> FAIL: nightly-report Resolve step: DEDUP_LABEL must not be derived from the title — that recouples identity to prose",
+    );
+    assert.doesNotMatch(
+      resolveStep.slice(resolveStep.indexOf("DEDUP_LABEL=")),
+      /GITHUB_RUN_ID/,
+      ">> FAIL: nightly-report Resolve step: DEDUP_LABEL must not key on run_id — a manually re-triggered scheduled run gets a new run_id but must still dedupe onto the same day's issue",
+    );
+
+    // Release tier must key on version, not date. Nightly tier keys on
+    // TODAY (the twin has no separate stable tier — see test header).
+    const dedupBlock = resolveStep.slice(resolveStep.indexOf('if [ "$EVENT" = release ]'), resolveStep.indexOf("DEDUP_LABEL="));
+    assert.match(
+      dedupBlock,
+      /TIER=release[\s\S]*?DEDUP_KEY="\$VERSION_LABEL"/,
+      ">> FAIL: nightly-report Resolve step: the release tier must key its dedup identity on VERSION_LABEL, not TODAY — same-day RC prereleases would otherwise collapse onto one issue",
+    );
+    assert.match(
+      dedupBlock,
+      /TIER=nightly[\s\S]*?DEDUP_KEY="\$TODAY"/,
+      ">> FAIL: nightly-report Resolve step: the nightly tier must key its dedup identity on TODAY",
+    );
+
+    // The label has to be created before the issue that carries it, and in
+    // the step that files that issue — not in Resolve, which also runs on
+    // green nightlies and would mint an unused label every day.
+    assert.match(
+      openStep,
+      /\/repos\/\$REPO\/labels/,
+      ">> FAIL: nightly-report Open failure issue: must create the dedup label before filing the issue that carries it",
+    );
+    assert.doesNotMatch(
+      resolveStep,
+      /\/repos\/\$REPO\/labels/,
+      ">> FAIL: nightly-report Resolve step: must NOT pre-create the dedup label — it runs on green runs too and would mint an unused label per day",
+    );
+
+    // Neither consumer may dedup on the title string any more.
+    for (const [name, step] of [["Open failure issue", openStep], ["Note a green re-run", noteStep]]) {
+      assert.doesNotMatch(
+        step,
+        /\.title == \$t/,
+        `>> FAIL: nightly-report ${name}: must not dedup on .title == $t — a title reword must not affect dedup`,
+      );
+      assert.match(
+        step,
+        /labels=\$\{?DEDUP_LABEL\}?/,
+        `>> FAIL: nightly-report ${name}: must filter the issues query on the DEDUP_LABEL label`,
+      );
+    }
+
+    const openLabelExpr = (openStep.match(/labels=\$\{?DEDUP_LABEL\}?/) ?? [])[0];
+    const noteLabelExpr = (noteStep.match(/labels=\$\{?DEDUP_LABEL\}?/) ?? [])[0];
+    assert.ok(openLabelExpr, ">> FAIL: nightly-report Open failure issue: no labels=$DEDUP_LABEL query found");
+    assert.strictEqual(
+      openLabelExpr, noteLabelExpr,
+      `>> FAIL: nightly-report: Open failure issue (${openLabelExpr}) and Note a green re-run (${noteLabelExpr}) must query the identical label expression, or the two consumers can disagree on identity`,
+    );
+  });
+
+  // Port of bulletin #1512: the report job comments "Re-run also failed" on
+  // a second failing attempt but used to say nothing when one passed.
+  test(".github/workflows/e2e.yml: nightly-report notes a green re-run on the day's failure issue (port of bulletin #1512)", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const report = jobBlock(e2e, "nightly-report");
+    const noteStep = report.split(/\n(?= {6}- )/).find((step) => /- name: Note a green re-run/.test(step));
+    assert.ok(noteStep, ">> FAIL: nightly-report: the Note a green re-run step must exist");
+    assert.match(noteStep, /github\.run_attempt > 1/,
+      ">> FAIL: nightly-report Note step: must only fire on a re-run (run_attempt > 1), not attempt 1 of a green run");
+    assert.match(noteStep, /!contains\(needs\.\*\.result, 'failure'\)/,
+      ">> FAIL: nightly-report Note step: must require no failures among needs.*.result");
+    assert.match(noteStep, /continue-on-error: true/,
+      ">> FAIL: nightly-report Note step: must continue-on-error so a failed lookup can't turn a green run red");
   });
 
   // The dangling-needs walk mandated by the task brief: parse the YAML,
@@ -22935,5 +27460,307 @@ describe("e2e.yml: prerequisites job wiring (ensure-e2e-authorized)", () => {
     }
     assert.deepStrictEqual(dangling, [],
       `>> FAIL: e2e-prereq-wiring: ${dangling.length} dangling needs: reference(s) (job depends on a job that doesn't exist): ${dangling.join(", ")}`);
+  });
+});
+
+describe("resolveProductSigner", () => {
+  const MNEMONIC = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+
+  test("returns null when no product name is given", () => {
+    assert.equal(resolveProductSigner({ mnemonic: MNEMONIC }), null);
+  });
+
+  test("derives the RFC-0022 product account and marks it in-process", () => {
+    const r = resolveProductSigner({ productName: "uid.paseo", mnemonic: MNEMONIC });
+    assert.equal(r.signerAddress, deriveProductSigner(MNEMONIC, "uid.paseo").ss58,
+      ">> FAIL: every DotNS write under --product-name must come from the product account, or the manifest's setResolver reverts NotAuthorised against a name that account owns");
+    assert.equal(r.mnemonic, undefined);
+    assert.equal(r.localSigner, true, ">> FAIL: a derived key signs in-process; without localSigner the deploy waits for a phone approval that never comes");
+  });
+
+  test("refuses a product name combined with a derivation path", () => {
+    assert.throws(() => resolveProductSigner({ productName: "uid.paseo", mnemonic: MNEMONIC, derivationPath: "//x" }), /cannot be combined/);
+  });
+});
+
+// Issue #1496 (1): bulletin-bootstrap authorizes the accounts a deploy will upload from.
+// The two used to read different env vars, so an env could look bootstrapped while every pool
+// deploy still hit unauthorized accounts. resolvePoolMnemonic is now the single resolution both
+// call, and these pin its precedence.
+describe("pool mnemonic resolution is shared by bootstrap and deploy (#1496)", () => {
+  const DEV_PHRASE = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+  const OTHER = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+  let savedPool, savedMnemonic;
+
+  beforeEach(() => {
+    savedPool = process.env.BULLETIN_POOL_MNEMONIC;
+    savedMnemonic = process.env.MNEMONIC;
+    delete process.env.BULLETIN_POOL_MNEMONIC;
+    delete process.env.MNEMONIC;
+  });
+  afterEach(() => {
+    if (savedPool === undefined) delete process.env.BULLETIN_POOL_MNEMONIC; else process.env.BULLETIN_POOL_MNEMONIC = savedPool;
+    if (savedMnemonic === undefined) delete process.env.MNEMONIC; else process.env.MNEMONIC = savedMnemonic;
+  });
+
+  test("defaults to the well-known dev phrase when nothing is set", () => {
+    assert.equal(resolvePoolMnemonic(), DEV_PHRASE);
+  });
+
+  test("BULLETIN_POOL_MNEMONIC drives the pool", () => {
+    process.env.BULLETIN_POOL_MNEMONIC = OTHER;
+    assert.equal(resolvePoolMnemonic(), OTHER);
+  });
+
+  test("an explicit argument (bootstrap's --mnemonic) wins over the env", () => {
+    process.env.BULLETIN_POOL_MNEMONIC = OTHER;
+    assert.equal(resolvePoolMnemonic(DEV_PHRASE), DEV_PHRASE);
+  });
+
+  test("MNEMONIC alone does NOT re-point the pool", () => {
+    process.env.MNEMONIC = OTHER;
+    assert.equal(resolvePoolMnemonic(), DEV_PHRASE,
+      ">> FAIL: MNEMONIC names the DotNS signing account. Deriving the pool from it would send deploys to accounts nobody granted quota to — and it is exactly the var bootstrap used to honour and deploy did not.");
+  });
+
+  test("bootstrap and deploy derive the same //deploy/0 under every env combination", () => {
+    for (const env of [{}, { BULLETIN_POOL_MNEMONIC: OTHER }, { MNEMONIC: OTHER }, { BULLETIN_POOL_MNEMONIC: OTHER, MNEMONIC: DEV_PHRASE }]) {
+      delete process.env.BULLETIN_POOL_MNEMONIC;
+      delete process.env.MNEMONIC;
+      Object.assign(process.env, env);
+      // Both call sites now go through resolvePoolMnemonic() with no argument.
+      const fromBootstrap = derivePoolAccounts(1, resolvePoolMnemonic())[0].address;
+      const fromDeploy = derivePoolAccounts(1, resolvePoolMnemonic())[0].address;
+      assert.equal(fromBootstrap, fromDeploy, `>> FAIL: divergent pool derivation for env ${JSON.stringify(env)}`);
+    }
+  });
+
+  test("warns only when MNEMONIC is set and would plausibly be mistaken for the pool key", () => {
+    assert.equal(describeIgnoredPoolMnemonicEnv({}), null);
+    assert.equal(describeIgnoredPoolMnemonicEnv({ BULLETIN_POOL_MNEMONIC: OTHER, MNEMONIC: OTHER }), null);
+    assert.equal(describeIgnoredPoolMnemonicEnv({ MNEMONIC: OTHER }, "explicit-flag"), null);
+    assert.match(describeIgnoredPoolMnemonicEnv({ MNEMONIC: OTHER }) ?? "", /BULLETIN_POOL_MNEMONIC/);
+  });
+});
+
+// Issue #1496 (2): the slot -> pool fallback is testnet-only. On mainnet the //deploy/N accounts
+// are dev-phrase accounts with no grant, so falling back can only defer the failure past the
+// upload, behind a warning that says the situation is fine.
+describe("slot storage failure falls back to the pool only off mainnet (#1496)", () => {
+  test("testnet keeps the historical fallback", () => {
+    assert.equal(isPoolFallbackAllowed("testnet"), true);
+  });
+  test("mainnet refuses it", () => {
+    assert.equal(isPoolFallbackAllowed("mainnet"), false,
+      ">> FAIL: the shared pool holds no authorization on mainnet — falling back turns a precise slot error into an out-of-quota failure mid-upload.");
+  });
+  test("an env that declares no network keeps the old behaviour rather than newly hard-failing", () => {
+    assert.equal(isPoolFallbackAllowed(undefined), true);
+    assert.equal(isPoolFallbackAllowed("unknown"), true);
+  });
+
+  // The refusal itself, not just the predicate: a mainnet slot failure must surface WHY the slot
+  // was unusable, or the operator is left with "storage unavailable" and no way to tell an
+  // expired allowance from a chain that never granted one.
+  test("testnet falls back, mainnet throws a NonRetryableError that preserves the slot reason", () => {
+    assert.doesNotThrow(() => assertPoolFallbackAllowed("testnet", "expired at block 99"));
+    assert.doesNotThrow(() => assertPoolFallbackAllowed(undefined, "expired at block 99"));
+
+    let thrown = null;
+    try {
+      assertPoolFallbackAllowed("mainnet", "expired at block 99");
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown instanceof NonRetryableError,
+      ">> FAIL: a mainnet slot failure must be NonRetryableError — retrying cannot help when the shared pool holds no quota on that chain.");
+    assert.match(thrown.message, /expired at block 99/,
+      ">> FAIL: the refusal must carry describeSlotFallbackReason's output, or the operator cannot tell an expired allowance from one that was never granted.");
+    assert.match(thrown.message, /logout && polkadot-app-deploy login/,
+      ">> FAIL: the refusal must name the remedy the testnet warning already prints.");
+  });
+});
+
+// #1494-equivalent for the twin (auto-authorize itself excluded per the port brief — the twin
+// never self-authorizes Bulletin storage): publishManifest opens its own Bulletin provider and
+// can run without a preceding in-process deploy() (it is a public export). The mainnet
+// pool-fallback gate above reads module-level state that only deploy() used to write, so a
+// publishManifest() call with no preceding deploy() would resolve bulletinNetwork=undefined —
+// the historical testnet-shaped fallback, not a hard failure on a real mainnet env.
+// publish.ts now sets it from the same env it already resolves; this pins the setter both
+// paths depend on.
+describe("Bulletin network context is settable from outside deploy() (#1496, minus auto-authorize)", () => {
+  test("round-trips the env's declared network", () => {
+    const saved = __getBulletinNetworkContextForTest();
+    try {
+      setBulletinNetworkContext("mainnet");
+      assert.equal(__getBulletinNetworkContextForTest(), "mainnet",
+        ">> FAIL: without this, a publishManifest() call that does not follow deploy() in-process resolves bulletinNetwork=undefined even on a real mainnet env, and a failed slot silently falls back to the pool instead of refusing.");
+      setBulletinNetworkContext(undefined);
+      assert.equal(__getBulletinNetworkContextForTest(), undefined,
+        ">> FAIL: an env that declares no network must CLEAR the previous one, not inherit it from an earlier deploy in the same process.");
+    } finally {
+      setBulletinNetworkContext(saved);
+    }
+  });
+});
+
+// bulletin #1628 (port of bulletin #1636): the daily funding check must stay
+// read-only and minimally privileged.
+describe("e2e-funding-check workflow (bulletin #1628)", () => {
+  const wf = fs.readFileSync(".github/workflows/e2e-funding-check.yml", "utf8");
+  // Strip comments so the explanatory header cannot satisfy or trip an assertion.
+  const code = wf.replace(/^\s*#.*$/gm, "");
+
+  test("runs daily before the 15:00 nightly, can be dispatched, and uses ubuntu-latest", () => {
+    assert.match(code, /schedule:\s*\n\s*- cron: "17 14 \* \* \*"/, ">> FAIL: funding-check: must be scheduled at 14:17 UTC, before the 15:00 nightly");
+    assert.match(code, /^ {2}workflow_dispatch:/m, ">> FAIL: funding-check: must allow workflow_dispatch");
+    assert.match(code, /runs-on: ubuntu-latest/, ">> FAIL: funding-check: this public repo runs on ubuntu-latest");
+    assert.doesNotMatch(code, /parity-default/, ">> FAIL: funding-check: parity-default is upstream's private-repo runner, not this repo's");
+  });
+
+  test("permissions are minimal: read contents, write issues only", () => {
+    const perms = [...code.matchAll(/^\s*permissions:\s*\n((?:\s+[\w-]+: \w+\n)+)/gm)].map((m) => m[1].trim().split(/\s*\n\s*/).sort().join(","));
+    assert.ok(perms.length >= 1, ">> FAIL: funding-check: permissions block missing");
+    for (const p of perms) {
+      assert.ok(["contents: read", "contents: read,issues: write"].includes(p), `>> FAIL: funding-check: unexpected permissions '${p}'`);
+    }
+    assert.ok(perms.includes("contents: read,issues: write"), ">> FAIL: funding-check: the job needs issues: write to file the funding issue");
+  });
+
+  test("never moves money: no transfer calls in the workflow or the tools it runs", () => {
+    const TRANSFER = /transfer_allow_death|transferKeepAlive|transfer_keep_alive|Balances\.transfer|attemptTestnetTopUp|signAndSubmit|\.tx\./;
+    for (const file of [".github/workflows/e2e-funding-check.yml", "tools/funding-check.mjs", "tools/funding-verdict.mjs", "tools/check-balances.mjs"]) {
+      const text = fs.readFileSync(file, "utf8").replace(/^\s*(#|\/\/|\*|\/\*).*$/gm, "");
+      assert.doesNotMatch(text, TRANSFER, `>> FAIL: funding-check: ${file} must stay read-only (no transfer/submit calls)`);
+    }
+  });
+
+  test("files a single issue labelled funding", () => {
+    assert.match(code, /labels: 'funding'/, ">> FAIL: funding-check: dedup must list open issues by the funding label");
+    assert.match(code, /labels: \['funding'\]/, ">> FAIL: funding-check: new issues must carry the funding label");
+  });
+});
+
+describe("e2e.yml: per-leg e2e-result files (#1625)", () => {
+  const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+  const deployWf = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+  const RESULT_PATH = "${{ github.workspace }}/e2e-result/e2e-result.json";
+  const REUSABLE = ["nightly-s1-pool", "nightly-s1-direct", "nightly-s2-fresh"];
+  // Every nightly scenario job: the S-numbered and S- named scenarios plus the HEAD coverage matrix.
+  // The harness-smoke, telemetry, pool-distribution, drift, chain-identity and code-path jobs are META verdicts.
+  const scenarioJobs = [...e2e.matchAll(/^ {2}(nightly-(?:s\d+[\w-]*|s-[\w-]+|pr-coverage)):\s*$/gm)]
+    .map((m) => m[1])
+    .filter((j) => j !== "nightly-s-v060-unblock");
+  const nameOf = (block) => block.match(/^ {4}name: (.*)$/m)[1];
+  const resultStep = (block) => block.split(/\n(?= {6}- )/).find((st) => st.includes("uses: ./.github/actions/e2e-result"));
+
+  test("the scenario-job list is not empty and includes the known legs", () => {
+    for (const j of ["nightly-s3", "nightly-s8", "nightly-s-car", "nightly-s-inc", "nightly-pr-coverage", ...REUSABLE]) {
+      assert.ok(scenarioJobs.includes(j), `>> FAIL: e2e-result: ${j} is not recognised as a scenario job; update the pattern in this test`);
+    }
+  });
+
+  for (const job of scenarioJobs.filter((j) => !REUSABLE.includes(j))) {
+    test(`${job}: ends with an always() e2e-result step whose job-name equals the job's name`, () => {
+      const block = jobBlock(e2e, job);
+      const step = resultStep(block);
+      assert.ok(step, `>> FAIL: e2e-result: ${job} has no e2e-result step, so its failure signature comes only from log grepping`);
+      assert.match(step, /^\s+if: always\(\)$/m, `>> FAIL: e2e-result: ${job}'s step must run on failure (if: always())`);
+      assert.match(step, /^\s+continue-on-error: true$/m, `>> FAIL: e2e-result: ${job}'s step must never fail the job`);
+      assert.match(step, /^\s+status: \$\{\{ job\.status \}\}$/m, `>> FAIL: e2e-result: ${job} must pass job.status`);
+      const jobName = step.match(/^\s+job-name: (.*)$/m)?.[1];
+      assert.equal(jobName, nameOf(block),
+        `>> FAIL: e2e-result: ${job}'s job-name must equal its name: verbatim, because nightly-report joins results to jobs on it`);
+      assert.ok(block.trimEnd().endsWith(step.trimEnd()), `>> FAIL: e2e-result: ${job}'s e2e-result step must be the LAST step so it sees every earlier outcome`);
+    });
+
+    test(`${job}: every harness step points E2E_RESULT_PATH where the composite reads it`, () => {
+      const block = jobBlock(e2e, job);
+      const harness = block.split(/\n(?= {6}- )/).filter((st) => /^\s+E2E: "1"$/m.test(st));
+      for (const st of harness) {
+        assert.ok(st.includes(`E2E_RESULT_PATH: ${RESULT_PATH}`),
+          `>> FAIL: e2e-result: a harness step in ${job} lacks E2E_RESULT_PATH, so its in-process result is never merged`);
+      }
+    });
+  }
+
+  for (const job of REUSABLE) {
+    test(`${job}: passes result-job-name (equal to its name) and result-scenario to the reusable workflow`, () => {
+      const block = jobBlock(e2e, job);
+      assert.equal(block.match(/^\s+result-job-name: (.*)$/m)?.[1], nameOf(block),
+        `>> FAIL: e2e-result: ${job} must pass its own name as result-job-name`);
+      assert.match(block, /^\s+result-scenario: s\d$/m, `>> FAIL: e2e-result: ${job} must pass result-scenario`);
+    });
+  }
+
+  test("deploy.yml: the result step and the log tee are opt-in, so consumer repos never resolve the local action", () => {
+    assert.match(deployWf, /result-job-name:\n(?:.*\n)*?\s+default: ''/m, ">> FAIL: e2e-result: result-job-name must default to empty");
+    const step = deployWf.split(/\n(?= {6}- )/).find((st) => st.includes("uses: ./.github/actions/e2e-result"));
+    assert.ok(step, ">> FAIL: e2e-result: deploy.yml has no e2e-result step");
+    assert.match(step, /if: always\(\) && inputs\.result-job-name != ''/, ">> FAIL: e2e-result: the step must be gated on result-job-name");
+    assert.match(step, /continue-on-error: true/);
+    assert.match(deployWf, /if \[ -n "\$\{\{ inputs\.result-job-name \}\}" \]; then\n\s+exec > >\(tee/,
+      ">> FAIL: e2e-result: the output tee in the Deploying step must be gated on result-job-name");
+  });
+
+  test("the composite action builds the file, then uploads it under the per-leg, per-attempt name the script printed", () => {
+    const action = fs.readFileSync(".github/actions/e2e-result/action.yml", "utf-8");
+    assert.match(action, /e2e-result\.mjs" write/);
+    assert.match(action, /name: \$\{\{ steps\.write\.outputs\.artifact \}\}/, ">> FAIL: e2e-result: the artifact name must come from the script (unique per leg and attempt)");
+    assert.match(action, /E2E_RESULT_PATH: \$\{\{ github\.workspace \}\}\/e2e-result\/e2e-result\.json/);
+    assert.match(action, /if-no-files-found: ignore/);
+    // A `${{ }}` inside a description is evaluated by the runner, and `job` is not a context there:
+    // the first dispatch failed to load the action on exactly this.
+    const descriptions = action.split("\n").filter((l) => /^\s+description:/.test(l));
+    assert.ok(descriptions.every((l) => !l.includes("${{")), ">> FAIL: e2e-result: action.yml descriptions must not contain ${{ }} expressions (the runner evaluates them)");
+  });
+
+  describe("nightly-report", () => {
+    const report = jobBlock(e2e, "nightly-report");
+    const steps = report.split(/\n(?= {6}- )/);
+
+    test("downloads every e2e-result-* artifact with merge-multiple, tolerating none", () => {
+      const dl = steps.find((st) => st.includes("actions/download-artifact"));
+      assert.ok(dl, ">> FAIL: e2e-result: nightly-report does not download the result files");
+      assert.match(dl, /pattern: e2e-result-\*/);
+      assert.match(dl, /merge-multiple: true/);
+      assert.match(dl, /continue-on-error: true/, ">> FAIL: e2e-result: a run with no result files must still report");
+    });
+
+    test("checks out and sets up Node BEFORE the Fetch step that runs the script", () => {
+      const idx = (needle) => steps.findIndex((st) => st.includes(needle));
+      assert.ok(idx("actions/checkout@") !== -1 && idx("actions/checkout@") < idx("name: Fetch per-leg job results"),
+        ">> FAIL: e2e-result: the sparse checkout must precede the Fetch step");
+      assert.ok(idx("actions/setup-node@") < idx("name: Fetch per-leg job results"));
+      assert.ok(idx("actions/download-artifact") < idx("name: Fetch per-leg job results"));
+      const checkout = steps[idx("actions/checkout@")];
+      for (const p of [".github/scripts", "package.json", "test/helpers/e2e-failure.js", "tools/release-retry-wrapper.mjs"]) {
+        assert.ok(checkout.includes(p), `>> FAIL: e2e-result: sparse checkout must include ${p}`);
+      }
+    });
+
+    test("still falls back to the log grep for legs with no usable result file", () => {
+      const fetch = steps.find((st) => st.includes("name: Fetch per-leg job results"));
+      assert.match(fetch, /grep -aE '>> FAIL:\|Deployment failed'/, ">> FAIL: e2e-result: the log-grep fallback is gone");
+      assert.match(fetch, /signatures: \$\{FROM_FILE\} from result files, \$\{FROM_LOG\} from log fallback/);
+      assert.match(fetch, /\[ -n "\$SIG" \]/, ">> FAIL: e2e-result: the fallback must be conditional on a missing signature");
+    });
+
+    test("the per-leg tables, readiness section and runner-loss steps are intact", () => {
+      for (const needle of ["Failing legs by env", "### Failure signatures", "## Environment readiness", "name: Classify runner loss", "name: Classify canary-only red", "all-runner-loss"]) {
+        assert.ok(report.includes(needle), `>> FAIL: e2e-result: nightly-report lost "${needle}"`);
+      }
+    });
+
+    test("the cause label is added at issue creation only and never joins the dedup lookup", () => {
+      const open = steps.find((st) => /- name: Open failure issue$/m.test(st));
+      assert.ok(open.includes('"Dominant cause') || open.includes("CAUSE_LINE"), ">> FAIL: e2e-result: the issue body must carry the dominant-cause line");
+      const lookup = open.slice(open.indexOf("EXISTING=$("), open.indexOf('if [ -n "$EXISTING" ]'));
+      assert.match(lookup, /labels=\$DEDUP_LABEL/);
+      assert.ok(!/CAUSE_LABEL/.test(lookup), ">> FAIL: e2e-result: the cause label must not be part of the dedup query (#1536)");
+      assert.match(open, /labels: \(\[\$label\] \+ \(if \$cause == "" then \[\] else \[\$cause\] end\)\)/);
+      assert.match(open, /"\$API_URL\/repos\/\$REPO\/labels"[\s\S]*?CAUSE_LABEL|CAUSE_LABEL[\s\S]*?"\$API_URL\/repos\/\$REPO\/labels"/, ">> FAIL: e2e-result: the cause label must be created on demand");
+    });
   });
 });

@@ -15,102 +15,69 @@
 // limitations under the License.
 
 /**
- * Session-backed `PolkadotSigner` for a product account.
+ * Session-backed `PolkadotSigner` for a product account, built on
+ * product-sdk-terminal's `createSessionSignerForAccount`.
  *
- * Lifted from playground-cli `src/utils/sessionSigner.ts` (issue #411). The
- * product id + derivation index are injected via `ProductAccountRef` so this
- * module is product-agnostic.
- *
- * **Why `session.createTransaction` instead of `signPayload` or `signRaw`?**
- *
- * `signPayload` (PJS-based) throws "PJS does not support this signed-extension"
- * on chains with unknown extensions like `AsPgas` / `AsRingAlias` on
- * paseo-next-v2, and also sends the full calldata as `method` — Android
- * rejects 2 MB chunks with "message too big".
- *
- * `signRaw({ tag: "Payload" })` signs only the bytes PAPI computes, so PAPI
- * must encode every signed extension correctly (including `AsPgas`). When PAPI
- * can't match the phone's encoding, the chain rejects with `BadProof`.
- *
- * `createTransaction` forwards the raw SCALE bytes for every extension to the
- * phone, which uses its own runtime metadata to decode, complete, and sign the
- * full extrinsic. Unknown extensions survive end-to-end; the phone returns the
- * complete signed transaction directly. This is the same path that
- * `@parity/product-sdk-signer` pins via `PRODUCT_SIGNER_TYPE = "createTransaction"`.
- *
- * **Why this file still exists after RFC-0022.**
- *
- * `product-sdk-terminal` now ships its own `createSessionSignerForAccount`, and
- * the derivation math below is delegated to it wholesale (see
- * `deriveProductPublicKey`). What terminal's signer does NOT carry is the
- * fast-fail for an expired statement-store allowance and the teardown-noise
- * suppression around `console.error` — both of which turn a silent 180 s hang
- * into an actionable message. Those live here, wrapped around terminal's
- * public key. Drop this file once terminal's signer grows the same behaviour.
+ * RFC-0022 puts the product account at `//product//{productId}/{index}`. The
+ * first two junctions are hard, so the key cannot be derived from the session's
+ * root public key: the SDK asks the phone for the `//product//{productId}`
+ * subtree key once and caches it in `{appId}_ProductSubtrees.json`.
  */
 
-import { toHex } from "polkadot-api/utils";
 import {
-    deriveProductPublicKey as terminalDeriveProductPublicKey,
-    sessionRootPublicKey as terminalSessionRootPublicKey,
-    INCOMPLETE_SESSION_MESSAGE as TERMINAL_INCOMPLETE_SESSION_MESSAGE,
+    AllowanceExpiredError,
+    createSessionSignerForAccount,
+    deriveProductPublicKey as sdkDeriveProductPublicKey,
+    type ProductAccountRef,
     type ProductSubtreeOptions,
     type UserSession,
 } from "@parity/product-sdk-terminal";
-import type { DerivationIndex } from "@parity/product-sdk-utils";
 import type { PolkadotSigner } from "polkadot-api";
 import { NonRetryableError } from "../../errors.js";
 import { CLI_NAME } from "../../cli-name.js";
 
-export interface ProductAccountRef {
-    productId: string;
-    derivationIndex: number;
-}
+export { INCOMPLETE_SESSION_MESSAGE, sessionRootPublicKey } from "@parity/product-sdk-terminal";
+export type { ProductAccountRef };
 
-export type { ProductSubtreeOptions };
+export const SESSION_EXPIRED_MESSAGE =
+    "Session signing allowance has expired (~2-3 days after login). " +
+    `Run \`${CLI_NAME} logout\`, then \`${CLI_NAME} login\`, to renew ` +
+    "(login alone won't refresh a stale session).";
 
-export const INCOMPLETE_SESSION_MESSAGE = TERMINAL_INCOMPLETE_SESSION_MESSAGE;
-
-/**
- * The wallet's own root account public key.
- *
- * This is the SSO handshake's `rootAccountId`, used for the `rootAddress`
- * display line and for `lookupUsername` on the People parachain. It is NOT the
- * parent of a product account — see `deriveProductPublicKey`.
- */
-export function sessionRootPublicKey(session: UserSession): Uint8Array {
-    return terminalSessionRootPublicKey(session);
-}
+/** A healthy phone answers in 3-30s; host-papp's own deadline is 240s. */
+export const SUBTREE_TIMEOUT_MS = 60_000;
 
 /**
- * The product account's sr25519 public key for `ref`.
- *
- * **RFC-0022.** A product account sits at `//product//{productId}/{index}`. The
- * first two junctions are HARD, which is the security boundary — and also why
- * this cannot be computed from `session.rootAccountId` alone: sr25519 soft
- * derivation is composable on public keys, hard derivation is not. The subtree
- * public key of `//product//{productId}` has to come from the Account Holder,
- * which `product-sdk-terminal` fetches via `session.getProductSubtree` and
- * caches on disk (`{appId}_ProductSubtrees.json`), so only the first
- * derivation per product+session needs the phone reachable.
- *
- * Delegating to terminal (rather than reimplementing the two-step
- * fetch-then-soft-derive here) is deliberate: it keeps one implementation of
- * the derivation, and the disk cache is shared with terminal's own signer.
- *
- * This is still the single source of truth for pad's product-account math —
- * both `createSessionSigner` (which signs) and `deriveSessionAddresses` (which
- * displays) go through it, so the printed address cannot desync from the key
- * that signs.
- *
- * @throws when the wallet is unreachable on a cold cache.
+ * The product account public key for `ref`. Reaches the phone only when the
+ * subtree key is not cached yet, which is normally once, right after pairing.
  */
 export async function deriveProductPublicKey(
     session: UserSession,
     ref: ProductAccountRef,
     options?: ProductSubtreeOptions,
 ): Promise<Uint8Array> {
-    return terminalDeriveProductPublicKey(session, ref, options);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([
+            sdkDeriveProductPublicKey(session, ref, options),
+            new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                    () => reject(new Error(`no reply within ${SUBTREE_TIMEOUT_MS / 1000}s`)),
+                    SUBTREE_TIMEOUT_MS,
+                );
+            }),
+        ]);
+    } catch (err) {
+        // Android drops this request without replying when the product id's TLD
+        // does not match the phone's network; a backgrounded app looks the same.
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new NonRetryableError(
+            `The phone did not return the account key for "${ref.productId}" (${reason}). ` +
+            "Keep the Polkadot app open and check that it is on the same network as this command.",
+        );
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 export async function createSessionSigner(
@@ -118,140 +85,38 @@ export async function createSessionSigner(
     ref: ProductAccountRef,
     options?: ProductSubtreeOptions,
 ): Promise<PolkadotSigner> {
-    const publicKey = await deriveProductPublicKey(session, ref, options);
-    return createSessionSignerFromKey(session, ref, publicKey);
+    const signer = await createSessionSignerForAccount(session, ref, options);
+    return {
+        publicKey: signer.publicKey,
+        signTx: withExpiredAllowanceHint(signer.signTx),
+        signBytes: withExpiredAllowanceHint(signer.signBytes),
+    };
 }
 
 /**
- * Build the signer from an ALREADY-RESOLVED public key, skipping the subtree fetch.
- *
- * Used when the wallet did not answer `getProductSubtree` in time: the CLI sends the
- * phone an account REFERENCE, so the phone still signs as the real product account —
- * this key only backs local bookkeeping and the address we display.
+ * The SDK rejects with `AllowanceExpiredError`; replace it with the remedy. Also
+ * drops the statement-store's "submitRequest failed: Not connected" teardown noise
+ * logged after a deploy has already failed.
  */
-export function createSessionSignerFromKey(
-    session: UserSession,
-    ref: ProductAccountRef,
-    publicKey: Uint8Array,
-): PolkadotSigner {
-    // host-papp wire shape: `productAccountId: [productId, DerivationIndex]`.
-    const productAccountId: [string, DerivationIndex] = [
-        ref.productId,
-        { tag: "Index", value: ref.derivationIndex },
-    ];
-
-    /**
-     * Transaction signing via `createTransaction`.
-     *
-     * Forwards the raw SCALE bytes for every signed extension to the phone;
-     * the phone uses its runtime metadata to handle unknown extensions (AsPgas,
-     * AsRingAlias, etc.) and returns the complete signed extrinsic.
-     *
-     * `signTx` returns the fully-encoded extrinsic — PAPI submits it as-is.
-     * txExtVersion = 0 for the V4 extrinsic format used on paseo-next-v2.
-     */
-    const signTx = async (
-        callData: Uint8Array,
-        signedExtensions: Record<string, { value: Uint8Array; additionalSigned: Uint8Array }>,
-        _metadata: Uint8Array,
-        _atBlockNumber: number,
-    ): Promise<Uint8Array> => {
-        const genesisHash = toHex(
-            signedExtensions["CheckGenesis"]?.additionalSigned ?? new Uint8Array(32),
-        ) as `0x${string}`;
-        // Omit CheckNonce deliberately. We forward a product-account REFERENCE, not
-        // an address, so the phone resolves and signs as the real account -- while the
-        // nonce PAPI computed here belongs to whatever address this CLI derived. Once
-        // the real account has landed one transaction those disagree and the chain
-        // rejects every attempt as Invalid::Stale (it appears to work exactly once,
-        // when both sit at zero, which is why users blamed an interrupted run).
-        //
-        // Both hosts refill an absent nonce for the account they actually sign as:
-        // Android's RealTxPayloadExtensionsResolver leaves Routing.nonce null and
-        // determineNonceSequence fetches it; iOS's fillNonceIfNeeded does the same.
-        // Neither reconstructs positionally -- the list supplies values into an
-        // extrinsic they build from their own runtime metadata -- so dropping an
-        // entry is not a malformed payload.
-        const extensions = Object.entries(signedExtensions)
-            .filter(([id]) => id !== "CheckNonce")
-            .map(([id, { value, additionalSigned }]) => ({
-                id,
-                extra: value,
-                additionalSigned,
-            }));
-        // Fast-fail for expired SSS allowance: the statement-store adapter logs
-        // "submitRequest failed: NoAllowanceError" to console.error but does NOT
-        // reject the createTransaction promise — it just hangs for 180s waiting
-        // for a phone response that never comes (the phone never got the request).
-        // Intercept the log and fail fast so the user sees a clear message instead
-        // of a 3-minute hang followed by a confusing "transaction watcher silent" error.
-        let noAllowanceMsg: string | null = null;
+function withExpiredAllowanceHint<A extends unknown[], R>(
+    fn: (...args: A) => Promise<R>,
+): (...args: A) => Promise<R> {
+    return async (...args: A): Promise<R> => {
         const origErr = console.error;
-        console.error = (...args: unknown[]) => {
-            const msg = args.map(String).join(" ");
-            if (msg.includes("NoAllowanceError") || msg.includes("no allowance set")) {
-                noAllowanceMsg = msg;
-                return; // suppress raw stack trace — NonRetryableError below is the clean message
-            }
-            // Swallow teardown noise emitted by the statement-store adapter when
-            // the deploy has already failed and the WS is being torn down. The
-            // pattern "submitRequest failed: Error: Not connected" (and similar
-            // DestroyedError / Client destroyed variants) is benign post-failure
-            // noise — the user already sees the clean Deployment failed message.
-            if (/submitRequest failed/i.test(msg) && /not connected|destroyederror|client destroyed/i.test(msg)) {
-                return;
-            }
-            origErr(...args);
+        console.error = (...errArgs: unknown[]) => {
+            const msg = errArgs.map(String).join(" ");
+            if (/submitRequest failed/i.test(msg) && /not connected|destroyederror|client destroyed/i.test(msg)) return;
+            origErr(...errArgs);
         };
-
-        let clearPoll: ReturnType<typeof setInterval> | null = null;
         try {
-            const result = await Promise.race([
-                session.createTransaction({
-                    payload: {
-                        tag: "v1",
-                        value: {
-                            signer: productAccountId,
-                            genesisHash,
-                            callData,
-                            extensions,
-                            txExtVersion: 0,
-                        },
-                    },
-                }),
-                new Promise<never>((_, reject) => {
-                    clearPoll = setInterval(() => {
-                        if (noAllowanceMsg) {
-                            reject(new NonRetryableError(
-                                "Session signing allowance has expired (~2-3 days after login). " +
-                                `Run \`${CLI_NAME} login\` to renew.`,
-                            ));
-                        }
-                    }, 200);
-                }),
-            ]);
-            if (result.isErr()) {
-                throw new Error(`Mobile signing rejected: ${result.error.message}`);
+            return await fn(...args);
+        } catch (err) {
+            if (err instanceof AllowanceExpiredError) {
+                throw new NonRetryableError(SESSION_EXPIRED_MESSAGE);
             }
-            return result.value; // complete signed extrinsic
+            throw err;
         } finally {
-            if (clearPoll !== null) clearInterval(clearPoll);
             console.error = origErr;
         }
     };
-
-    /** Raw-bytes signing keeps the `Bytes` tag so the wallet applies the
-     *  anti-phishing `<Bytes>...</Bytes>` envelope on its side. */
-    const signBytes = async (data: Uint8Array): Promise<Uint8Array> => {
-        const result = await session.signRaw({
-            productAccountId,
-            data: { tag: "Bytes", value: data },
-        });
-        if (result.isErr()) {
-            throw new Error(`Mobile signing rejected: ${result.error.message}`);
-        }
-        return result.value.signature;
-    };
-
-    return { publicKey, signTx, signBytes };
 }

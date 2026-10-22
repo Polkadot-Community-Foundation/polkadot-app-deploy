@@ -1,17 +1,22 @@
-import { test, describe, before } from "node:test";
+import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { createHash } from "node:crypto";
 import { mutateFixture, makeMultiChunkFixture } from "./helpers/e2e-fixture.js";
 import { buildFixture as buildIncrementalFixture } from "./helpers/e2e-incremental-fixture.js";
-import { buildManifestSidecar } from "./helpers/e2e-manifest-fixture.js";
+import { buildManifestSidecar, buildPvmAppManifest } from "./helpers/e2e-manifest-fixture.js";
 import { runBulletinDeploy } from "./helpers/e2e-cli.js";
-import { resolveContenthashOnChain } from "./helpers/e2e-verify.js";
+import { trackTimers, armExitGuard } from "./helpers/e2e-exit-guard.js";
+import { installE2eResultHook } from "./helpers/e2e-result.js";
+import { resolveContenthashOnChain, resolveTextRecordOnChain } from "./helpers/e2e-verify.js";
 import { startFaultProxy } from "./helpers/ws-fault-proxy.mjs";
-import { DEFAULT_MNEMONIC, sanitizeDomainLabel, DotNS, loadEnvironments, resolveEndpoints, deploy, poolAccountDerivationPath } from "@parity/polkadot-app-deploy";
+import { S3_OWNED_LABEL, tieredFixtureLabel, smokeLabel, digitsToLetters } from "../tools/lib/e2e-fixtures.mjs";
+import { DEFAULT_MNEMONIC, sanitizeDomainLabel, DotNS, deploy, poolAccountDerivationPath } from "@parity/polkadot-app-deploy";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
-import { encodeContenthash } from "@parity/polkadot-app-deploy/deploy";
+import { resolveE2eEnv, resolveE2eEnvId } from "./helpers/e2e-env.js";
+import { encodeContenthash, DEFAULT_BULLETIN_RPC } from "@parity/polkadot-app-deploy/deploy";
 import { fetchManifestRoundtrip } from "@parity/polkadot-app-deploy/manifest-roundtrip";
 import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
@@ -21,7 +26,7 @@ import {
   assertStdoutMatches,
   parseLineOrExplain,
   assertOnChainMatches,
-  failWith, classifyFixtureState } from "./helpers/e2e-failure.js";
+  failWith, assertFixtureOwnership, assertFixtureNotDrifted } from "./helpers/e2e-failure.js";
 
 // The CLI prints "CID: bafy..." at the end of a successful deploy. We parse
 // that — not a client-side recomputation — so we verify "what the CLI said
@@ -43,6 +48,56 @@ function parseDeployedCid(stdout, scenario = "deploy") {
     what: "deployed CID",
     hint: "every successful deploy ends with a 'CID: bafy...' line. Missing means the CLI failed before final-summary emission (check earlier stderr).",
   })[1];
+}
+
+// #1495: which account stored the manifest's icon and executables, and whether it is the one
+// that stored the content. The bytes are billed to the storage account's Bulletin quota, so the
+// two phases diverging means half a deploy is paid for by an account nobody provisioned — on a
+// chain whose shared pool holds no quota, that is a deploy that publishes content and then fails
+// (or silently skips) its manifest. No assertion covered this before: every e2eEligible env
+// auto-authorizes anything that asks, so both accounts always "work" here.
+//
+// Each Bulletin provider logs exactly one of these lines, and publishManifest opens its own
+// provider after the "Manifest publish — <domain>" banner, so the banner splits the phases.
+// Address equality is asserted only when the content phase named a specific account: the pool is
+// a shared identity whose members are interchangeable, so a pool deploy asserts mode parity only.
+function assertManifestStorageMatchesContent(stdout, { scenario }) {
+  const parsePhase = (text) =>
+    [...text.matchAll(/Using (pool account \d+|direct signer|external signer):\s+(\S+)/g)].map((m) => ({
+      mode: m[1].startsWith("pool account") ? "pool" : m[1],
+      address: m[2],
+    }));
+
+  const bannerAt = stdout.indexOf("Manifest publish —");
+  if (bannerAt === -1) {
+    failWith({
+      scenario,
+      message: 'no "Manifest publish —" banner in the deploy output',
+      context: stdout,
+      keywords: ["Manifest", "publish", "Using"],
+      hint: "this scenario must deploy with a manifest sidecar (--config). Without one publishManifest never runs, so there is no manifest storage account to check.",
+    });
+  }
+  // Last provider line before the banner: the one the content upload finished on (a mid-upload
+  // reconnect logs another). First after it: the manifest's own provider.
+  const content = parsePhase(stdout.slice(0, bannerAt)).pop();
+  const manifest = parsePhase(stdout.slice(bannerAt))[0];
+  if (!content || !manifest) {
+    failWith({
+      scenario,
+      message: `could not read both storage accounts (content: ${content?.mode ?? "missing"}, manifest: ${manifest?.mode ?? "missing"})`,
+      context: stdout,
+      keywords: ["Using", "signer", "pool"],
+      hint: "every Bulletin provider logs 'Using pool account N:', 'Using direct signer:' or 'Using external signer:'. A missing manifest-phase line means publishManifest never opened a provider — check for an earlier 'Manifest publish failed' line.",
+    });
+  }
+  assert.equal(manifest.mode, content.mode,
+    `>> FAIL: ${scenario}: the content upload stored from a ${content.mode} provider but the manifest used ${manifest.mode} — both halves of one deploy must be billed to the same Bulletin quota.`);
+  if (content.mode !== "pool") {
+    assert.equal(manifest.address, content.address,
+      `>> FAIL: ${scenario}: content stored from ${content.address} but the manifest from ${manifest.address}. The manifest's icon and executables spend the storage account's quota, so a second account here needs a grant nobody provisions.`);
+  }
+  return { content, manifest };
 }
 
 // Parse the chunk-skip rate from a deploy's stdout.
@@ -105,7 +160,7 @@ function applyVitePatch(targetDir, fixtureRoot) {
 async function readContenthashWithRetry(label, expected, attempts = 6, delayMs = 10_000) {
   let onChain = "";
   for (let i = 1; i <= attempts; i++) {
-    onChain = (await resolveContenthashOnChain(label, PAD_ENV)).toLowerCase();
+    onChain = (await resolveContenthashOnChain(label, E2E_ENV_ID)).toLowerCase();
     if (onChain === expected) return onChain;
     if (i < attempts) {
       console.log(`  verify attempt ${i}/${attempts}: on-chain=${onChain.slice(0, 18)}... expected=${expected.slice(0, 18)}... — retrying in ${delayMs / 1000}s`);
@@ -115,13 +170,28 @@ async function readContenthashWithRetry(label, expected, attempts = 6, delayMs =
   return onChain;
 }
 
+// Poll a text record until `ready(raw)` holds. On-chain reads can lose a race
+// with tail-in-flight txs, same as readContenthashWithRetry above.
+async function readTextRecordWithRetry(label, key, envId, ready, attempts = 6, delayMs = 10_000) {
+  let raw = "";
+  for (let i = 1; i <= attempts; i++) {
+    raw = await resolveTextRecordOnChain(label, key, envId);
+    if (ready(raw)) return raw;
+    if (i < attempts) {
+      console.log(`  ${key} text-record read attempt ${i}/${attempts}: ${raw ? "present, not ready yet" : "empty"}, retrying in ${delayMs / 1000}s`);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  return raw;
+}
+
 let signerPopStatus = -1;
 
 const ENABLED = process.env.E2E === "1";
+if (ENABLED) trackTimers();
 const SIGNER = process.env.E2E_SIGNER ?? "pool";
 const MERKLE = process.env.E2E_MERKLE ?? "js";
 const SCENARIO = process.env.E2E_SCENARIO ?? "s1";
-const RPC = process.env.BULLETIN_RPC ?? "wss://paseo-bulletin-rpc.polkadot.io";
 const PAD_ENV =
   process.env.PAD_ENV ??
   process.env.DOTNS_ENV ??
@@ -129,9 +199,8 @@ const PAD_ENV =
 if (process.env.DOTNS_ENV && !process.env.PAD_ENV) {
   console.warn("DOTNS_ENV is deprecated; use PAD_ENV. Will be removed in a future release.");
 }
-// When PAD_ENV is set, --env drives the Bulletin endpoint from environments.json.
-// Injecting BULLETIN_RPC would override it, pointing at the wrong chain.
-const rpcEnv = () => PAD_ENV ? {} : { BULLETIN_RPC: RPC };
+// The env the run deploys against, explicit or the CLI's own default.
+const E2E_ENV_ID = resolveE2eEnvId(PAD_ENV);
 const RUN_TAG = `${process.env.GITHUB_RUN_ID ?? "local"}-${(process.env.GITHUB_SHA ?? "dev").slice(0, 7)}`;
 process.env.DEPLOY_TAG ??= "e2e-local";
 if (ENABLED && !process.env.DEPLOY_TAG?.startsWith("e2e-")) {
@@ -157,6 +226,11 @@ function pickStableLabel() {
 
 function pickDirectLabel() {
   return signerPopStatus >= 2 ? "e2edirect" : "e2edirect01";
+}
+// bulletin #1623: the per-tier fixed label Alice ROOT owns for a scenario whose property
+// is not registration (see tools/lib/e2e-fixtures.mjs).
+function tieredLabel(fixture) {
+  return tieredFixtureLabel(fixture, process.env.DEPLOY_TAG);
 }
 // Per-leg domain isolation for nightly-pr-coverage (#863 follow-up). Multiple
 // pool legs (s-inc js/kubo, s-inc-roundtrip, s-inc-portability) share pickIncLabel
@@ -243,32 +317,91 @@ export function pickFreshRunLabel(prefix) {
   if (signerPopStatus < 2) return noStatusRunLabel(prefix);
   return buildFreshLabelFromTag(prefix, RUN_TAG);
 }
+// Note (#274, mirror of bulletin #1589): pickFreshRunLabel's entropy
+// (RUN_TAG/RUN_TOKEN) is shared by every matrix leg of one workflow run — a
+// fixed `prefix` alone does NOT distinguish legs. Fine for scenarios that
+// don't care (or want convergence, like S1-SMOKE). If a new scenario asserts
+// something leg-specific (e.g. a first-deploy check) under a job whose legs
+// vary MERKLE/SIGNER, fold that discriminator into the caller's own prefix —
+// see S-INC-CROSSLABEL.
+
+// Idempotency helper for the S-TRANSFER* scenarios (bulletin #1364/#1334). The
+// release retry wrapper (tools/release-retry-wrapper.mjs) re-runs this whole
+// test file on a transient failure, and RUN_TAG (`${GITHUB_RUN_ID}-${sha7}`) /
+// RUN_TOKEN are fixed for the run, so a retry reuses the SAME label the first
+// attempt used — and DotNS ownership persists on chain across that retry.
+// DotNS.register() is NOT idempotent: ensureNotRegistered throws "Domain X
+// already owned by Y" for ANY existing owner, including the same signer that
+// registered it moments ago. So a retry that got far enough to register (or
+// further) would hard-fail here instead of converging.
+//
+// Deliberately NOT a pre-read via DotNS.checkOwnership: that helper ends in
+// `catch { return { owned: false, owner: null } }` — a flaked ownerOf read
+// (the documented paseo-next-v2 timeout flake under E2E matrix load) would be
+// swallowed into "unregistered", we'd call register() anyway, and walk
+// straight into the exact "already owned by" failure this fix exists to
+// avoid. Instead, attempt register() and only treat ITS "already owned by
+// <addr>" failure — which ensureNotRegistered only ever throws after a real
+// successful non-zero ownerOf read, never on a swallowed RPC error — as a
+// converge-to-<addr> signal. Any other failure propagates unchanged. No
+// wasted on-chain writes either way: ensureNotRegistered runs (in parallel
+// with classifyName) before the commit-reveal transaction, so a thrown
+// "already owned" never got that far.
+//
+// Exported (with `reg` as an injectable param exposing only `.register`) so
+// this is unit-testable in test/test.js without a live chain.
+export async function registerOrConverge(reg, label) {
+  try {
+    await reg.register(label);
+    return null; // freshly registered by the connected signer
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const m = msg.match(/already owned by (0x[0-9a-fA-F]+)/i);
+    if (!m) throw err;
+    return m[1];
+  }
+}
+
+// Shared by S-TRANSFER and S-TRANSFER-SUBNAME's setup: registerOrConverge a
+// label, then assert its existing owner (if any) is one of the accounts this
+// scenario expects — anything else means the fixture drifted to a genuine
+// third party, and converging past that silently would hide a real problem.
+// Returns the existing owner (or null for a fresh registration) so callers
+// that need to branch on WHICH allowed account it was (S-TRANSFER: Alice vs.
+// Bob) still can.
+export async function registerOrConvergeChecked(reg, label, allowedOwners, failContext) {
+  const existingOwner = await registerOrConverge(reg, label);
+  if (existingOwner === null) return null;
+  assert.ok(
+    allowedOwners.some((addr) => addr.toLowerCase() === existingOwner.toLowerCase()),
+    `>> FAIL: ${failContext}: ${label} is owned by an unexpected third party ${existingOwner} — cannot converge as either a fresh registration or a retry of this run`,
+  );
+  return existingOwner;
+}
 
 // Burst-heavy re-upload scenarios get a DEDICATED derived signer so they don't
 // contend on Alice's shared nonce stream (the documented Invalid::Stale failure
 // mode — see the MANIFEST_SCENARIOS note below). These accounts are provisioned
 // (funded + Bulletin-authorized) by tools/setup-e2e-derivation-signers.mjs.
-// Applied UNCONDITIONALLY (even on a custom PAD_ENV), unlike the s1-direct
-// fallback which still uses Alice root on custom envs.
+// Applied regardless of E2E_ENV_ID — every other direct-signer leg signs as
+// root Alice, who owns the e2edirect fixtures on every env the harness
+// deploys to.
 const ISOLATED_DIRECT_SIGNERS = {
   "s9": "//e2e-s9",
   "s-grandpa-reupload": "//e2e-sgrandpa",
 };
 
 function directSignerDerivationPath() {
-  if (ISOLATED_DIRECT_SIGNERS[SCENARIO]) return ISOLATED_DIRECT_SIGNERS[SCENARIO];
-  if (!PAD_ENV) return "//e2e-direct";
-  return null;
+  return ISOLATED_DIRECT_SIGNERS[SCENARIO] ?? null;
 }
 
 function buildArgs(fixtureDir, label) {
   const args = [fixtureDir, label, "--tag", process.env.DEPLOY_TAG];
   if (MERKLE === "js") args.push("--js-merkle");
-  if (PAD_ENV) args.push("--env", PAD_ENV);
-  // Direct-signer e2e leg: on the default env, deploys to e2edirect.dot owned
-  // by Alice//e2e-direct (transferred from root Alice in PR #187). On custom
-  // envs (e.g. paseo-next-v2), the PR harness falls back to Alice root while
-  // still exercising the direct-signer CLI path.
+  args.push("--env", E2E_ENV_ID);
+  // Direct-signer e2e leg: signs as root Alice, who owns the e2edirect
+  // fixtures on every env the harness deploys to (isolated per-scenario
+  // signers, e.g. S9/S-GRANDPA-REUPLOAD, override via directSignerDerivationPath()).
   if (SIGNER === "direct") {
     args.push("--mnemonic", ALICE_MNEMONIC);
     const deriv = directSignerDerivationPath();
@@ -285,28 +418,43 @@ function buildArgs(fixtureDir, label) {
   // and blowing through the 3-attempt × 180s retry budget.
   const MANIFEST_SCENARIOS = new Set(["s1", "s-inc"]);
   if (MANIFEST_SCENARIOS.has(SCENARIO)) {
-    // Every caller passes an already-suffixed domain (`${label}.${tld}`), so the
-    // env's TLD is recoverable from the argument itself — buildArgs is sync and
-    // resolveE2eTld() is async, so re-resolving here isn't an option. A bare
-    // label (no dot) falls back to "dot", matching the historical default.
-    // Without this the sidecar appended a second ".dot" to "e2epoolns01.paseo"
-    // and the CLI rejected the config/deploy domain mismatch (#1244).
-    // Every caller passes an already-suffixed domain (`${label}.${tld}`), so the
-    // env's TLD is recoverable from the argument itself — buildArgs is sync and
-    // resolveE2eTld() is async, so re-resolving here isn't an option. A bare
-    // label (no dot) falls back to "dot", matching the historical default.
-    // Without this the sidecar appended a second ".dot" to "e2epoolns01.paseo"
-    // and the CLI rejected the config/deploy domain mismatch (#1244).
-    const sidecarTld = label.includes(".") ? label.slice(label.lastIndexOf(".") + 1) : "dot";
+    // Every manifest scenario passes an already-suffixed domain, so the env's
+    // TLD comes from the argument itself. A literal default would double-suffix
+    // a label that already carries a non-"dot" TLD (#1244).
+    assert.ok(label.includes("."),
+      `>> FAIL: buildArgs: ${SCENARIO} builds a manifest sidecar and needs the env's TLD, but got the bare label "${label}". Pass the domain with its resolveE2eTld() suffix.`);
+    const sidecarTld = label.slice(label.lastIndexOf(".") + 1);
     const { configPath } = buildManifestSidecar({ buildDir: fixtureDir, label, tld: sidecarTld });
     args.push("--config", configPath);
   }
   return args;
 }
 
+// Shared --product-name deploy args for S-PRODUCT-MANIFEST and
+// S-PRODUCT-MANIFEST-TRUSTED (#1484) — built here, not via buildArgs: that
+// adds --derivation-path for a pinned pool leg, which --product-name refuses
+// (it derives its own signer). NOT a general-purpose builder: "e2eproduct" is
+// hardcoded because both current callers target the same pre-owned fixture
+// (e2eprodman00.<tld>, owned by the account that name derives — see the
+// comment on S-PRODUCT-MANIFEST). A scenario needing a different product
+// name would need its own fixture anyway (see that same comment for why),
+// so take productName as a parameter here if that day comes rather than
+// assuming this generalizes as-is.
+function buildProductManifestArgs(fixtureDir, domain, configPath) {
+  return [
+    fixtureDir, domain,
+    "--tag", process.env.DEPLOY_TAG,
+    "--js-merkle",
+    "--env", E2E_ENV_ID,
+    "--mnemonic", ALICE_MNEMONIC,
+    "--product-name", "e2eproduct",
+    "--config", configPath,
+  ];
+}
+
 function buildInputCarArgs(dumpPath, label) {
   const args = ["--input-car", dumpPath, label, "--tag", process.env.DEPLOY_TAG];
-  if (PAD_ENV) args.push("--env", PAD_ENV);
+  args.push("--env", E2E_ENV_ID);
   if (SIGNER === "direct") {
     args.push("--mnemonic", ALICE_MNEMONIC);
     const deriv = directSignerDerivationPath();
@@ -319,56 +467,146 @@ function buildInputCarArgs(dumpPath, label) {
 }
 
 async function resolveDotnsEnvConnectOptions() {
-  if (!PAD_ENV) return {};
-  const { doc } = await loadEnvironments();
-  const resolved = resolveEndpoints(doc, PAD_ENV);
-  return {
-    rpc: resolved.assetHub[0],
-    assetHubEndpoints: resolved.assetHub,
-    autoAccountMapping: resolved.autoAccountMapping,
-    contracts: Object.keys(resolved.contracts).length > 0 ? resolved.contracts : undefined,
-    nativeToEthRatio: resolved.nativeToEthRatio,
-    tld: resolved.tld,
-  };
+  return (await resolveE2eEnv(E2E_ENV_ID)).dotnsConnectOptions;
 }
 
 // #paseo-tld: DotNS's TLD is per-environment (paseo-next-v2 following its
 // redeploy: "paseo" — see src/environments.ts's per-env `tld` field). Every
 // `.dot`-suffixed label/target in this file below must resolve through this
 // helper instead of hardcoding the old suffix, or deploys/assertions
-// silently target the wrong on-chain node once PAD_ENV=paseo-next-v2 runs
-// against the redeployed chain. Mirrors resolveE2eBulletinRpc's "no env
-// selected -> legacy default" fallback.
+// silently target the wrong on-chain node.
 async function resolveE2eTld() {
-  if (!PAD_ENV) return "dot";
-  const { doc } = await loadEnvironments();
-  return resolveEndpoints(doc, PAD_ENV).tld ?? "dot";
+  return (await resolveE2eEnv(E2E_ENV_ID)).tld;
 }
 
 async function resolveE2eGateway() {
   if (process.env.BULLETIN_GATEWAY) return normalizeGatewayBase(process.env.BULLETIN_GATEWAY);
-  if (!PAD_ENV) return "https://paseo-ipfs.polkadot.io";
-  const { doc } = await loadEnvironments();
-  const env = doc.environments.find((entry) => entry.id === PAD_ENV);
-  return normalizeGatewayBase(env?.ipfs ?? "https://paseo-ipfs.polkadot.io");
+  return normalizeGatewayBase((await resolveE2eEnv(E2E_ENV_ID)).gateway);
 }
 
 async function resolveE2eBulletinRpc() {
-  if (!PAD_ENV) return RPC;
-  const { doc } = await loadEnvironments();
-  return resolveEndpoints(doc, PAD_ENV).bulletin[0];
+  return (await resolveE2eEnv(E2E_ENV_ID)).bulletin;
 }
 
 function normalizeGatewayBase(url) {
   return url.replace(/\/+$/, "").replace(/\/ipfs$/, "");
 }
 
+// --- S-V060-UNBLOCK label builders (bulletin #1423, issue #1410) --------
+//
+// These build the two label SHAPES v0.6.0 unblocks, deliberately WITHOUT
+// going through sanitizeDomainLabel or noStatusRunLabel/pickFreshRunLabel —
+// both of those exist to normalize a label to something already registrable
+// on every profile, which would defeat the entire point here (the shapes
+// below are illegal PRE-v0.6.0 by design; sanitizing them away would test
+// nothing). validateDomainLabel itself does no digit-shape rewriting (only
+// charset/length/hyphen-edge checks — see src/CLAUDE.md), so a raw string
+// built here reaches classifyLabelStatus completely unmodified.
+//
+// Digit->letter substitution (0-9 -> a-j) so a numeric tag (RUN_TOKEN is
+// `${GITHUB_RUN_ID}${sha7}`) can supply per-run entropy for the BASE portion
+// of a label without ever contributing a digit itself — both builders need
+// total control over the trailing digit COUNT (exactly 2 for one, exactly 1
+// for the other), so the entropy segment must never end in (or consist of)
+// a raw digit.
+function tagToLetters(tag) {
+  return digitsToLetters(String(tag).toLowerCase().replace(/[^a-z0-9]/g, ""));
+}
+
+// Both label shapes below need a FIXED-WIDTH entropy segment (8 chars total
+// for the base-8 shape leaves only 5 free chars once the fixed prefix/anchor
+// letter are accounted for) — too narrow to embed `tag` verbatim the way
+// buildFreshLabelFromTag does. A naive tail-slice of `tag` was tried first
+// and rejected: RUN_TOKEN is `${GITHUB_RUN_ID}${sha7}`, and slicing only the
+// last N characters lands entirely inside sha7 (7 chars, longer than either
+// entropy segment), so two DIFFERENT run_ids sharing the SAME HEAD sha (the
+// exact, documented buildFreshLabelFromTag regression — sha7 genuinely
+// repeats across a run of nightlies until `main` advances) produced the
+// IDENTICAL label. Hashing the WHOLE tag (SHA-1, cheap, deterministic, no
+// external dependency) instead makes every output character sensitive to
+// every input character via the hash's avalanche property, so run_id and
+// sha7 both matter regardless of entropy-segment width.
+function hashLettersFromTag(tag, length) {
+  const hex = createHash("sha1").update(String(tag)).digest("hex");
+  return tagToLetters(hex).slice(0, length);
+}
+
+// The production "dotworld01" shape: an 8-character base with EXACTLY 2
+// trailing digits. Old profiles (poprules-startingPrice/v0.5.8-rc1):
+// baseLength = 10 - 2 = 8 (the 6-8 band), trailingDigits===2 means
+// isLiteSignal is true, so classifyByLadder returns PopLite — a NoStatus
+// signer cannot register it (classifyRegistrability itself does NOT object
+// to this shape; the demand is a personhood-TIER requirement, checked
+// separately by canRegister/classifyDotnsLabel, not a naming-rule
+// violation). v0.6.0: no lite-username match (no '.' separator), so
+// baseLength = label.length AS WRITTEN = 10 -> NoStatus, open to any account
+// (classifyLabelStatus's v0.6.0 branch, src/dotns.ts). `tag` is an explicit
+// param (mirrors buildFreshLabelFromTag) so this is unit-testable without
+// depending on module-level RUN_TOKEN state.
+export function buildBase8TwoDigitLabel(tag) {
+  const entropy = hashLettersFromTag(tag, 5);
+  const base = `dw${entropy}x`; // 2 + 5 + 1 = 8 chars, always ends in a letter
+  return `${base}01`; // 10 chars total, exactly 2 trailing digits
+}
+
+// A "myapp-pr7" shape: EXACTLY 1 trailing digit, total length >= 9 as
+// written. Old profiles: classifyLabelStatus's trailing-digit-count gate
+// fires on trailingDigits===1 regardless of baseLength -> Reserved
+// (unregistrable — classifyRegistrability itself refuses this one, rule
+// "trailing-digits"). v0.6.0: that rule is deleted entirely (#1410) ->
+// baseLength = label.length AS WRITTEN (>= 9) -> NoStatus.
+export function buildOneTrailingDigitLabel(tag) {
+  const entropy = hashLettersFromTag(tag, 8);
+  return `pr${entropy}7`; // 2 + 8 + 1 = 11 chars, exactly 1 trailing digit
+}
+
+// Detect the live DotNS ABI profile via a short-lived, read-only connection —
+// the SAME detection connect() itself runs (detectProtocolVersion, src/dotns.ts),
+// never inferred from E2E_ENV_ID's name or environments.json config (a
+// configured `dotnsProtocol` pin is asserted against the live probe, never
+// obeyed over it — see connect()'s own comment). Reads the profile via the
+// public `protocolVersion` getter, not by scraping connect()'s own log line.
+// Used by S-V060-UNBLOCK to decide whether the chain has the v0.6.0 redeploy
+// before spending a real deploy attempt on label shapes that only make sense
+// there.
+//
+// Returns a STRUCTURED outcome, not a bare profile string, because "no
+// contract code at the configured POP_RULES address" and "a different, real
+// ABI profile is live" are DIFFERENT conditions with DIFFERENT remedies (wait
+// for an in-flight redeploy vs. point --env at a chain that already has
+// v0.6.0) and must never be collapsed into one "not v0.6.0" message —
+// classifyProtocolVersion (src/dotns-protocol.ts) gives the no-code case its
+// own distinct reason text ("No contract deployed at this address…") for
+// exactly this reason; this helper preserves that distinction instead of
+// flattening it. Any OTHER detection failure (code present-or-unverified but
+// neither discriminator answered; a genuine connection/RPC error) is NOT
+// classified as either of the two known outcomes and is rethrown — an
+// unclassified condition must fail loudly, never silently read as a skip.
+async function detectDotnsProfile() {
+  const probe = new DotNS();
+  try {
+    await probe.connect({ mnemonic: DEFAULT_MNEMONIC, ...(await resolveDotnsEnvConnectOptions()) });
+    return { profile: probe.protocolVersion, noCode: false, error: null };
+  } catch (e) {
+    const msg = e?.message ?? String(e);
+    if (/No contract deployed at this address/.test(msg)) {
+      return { profile: null, noCode: true, error: msg };
+    }
+    throw e;
+  } finally {
+    probe.disconnect();
+  }
+}
+
 describe("e2e", { skip: !ENABLED }, () => {
+  // Registered before armExitGuard's `after` so the file is on disk first (#1625).
+  installE2eResultHook({ scenario: SCENARIO, signer: SIGNER, merkle: MERKLE, env: E2E_ENV_ID });
+  after(() => armExitGuard());
   before(async () => {
     signerPopStatus = await probeSignerPopStatus({
       dotnsFactory: () => new DotNS(),
       signer: SIGNER,
-      bulletinDeployEnv: PAD_ENV,
+      bulletinDeployEnv: E2E_ENV_ID,
       resolveEnvConnectOptions: resolveDotnsEnvConnectOptions,
       defaultMnemonic: DEFAULT_MNEMONIC,
       derivationPath: directSignerDerivationPath(),
@@ -383,7 +621,6 @@ describe("e2e", { skip: !ENABLED }, () => {
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
           args: buildArgs(fixtureDir, `${label}.${tld}`),
-          env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S1" });
@@ -398,15 +635,19 @@ describe("e2e", { skip: !ENABLED }, () => {
     });
   });
 
-  describe("S1-SMOKE — happy path, per-run fresh label", { skip: SCENARIO !== "s1-smoke" }, () => {
-    test(`smoke ${SIGNER}/${MERKLE} on fresh label`, { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
-      const label = pickFreshRunLabel("e2esmoke");
+  describe("S1-SMOKE — happy path, per-PR label", { skip: SCENARIO !== "s1-smoke" }, () => {
+    test(`smoke ${SIGNER}/${MERKLE} on the PR's own label`, { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
+      // bulletin #1623: one label per PR (E2E_PR_NUMBER), registered on that PR's first
+      // E2E run and redeployed by its later pushes. A shared fixed label would
+      // let two PRs (separate concurrency groups) read back each other's CID.
+      // No PR number (push to main, test-suite=pr dispatch, local) = the tier's
+      // provisioned label.
+      const label = smokeLabel(process.env.DEPLOY_TAG, process.env.E2E_PR_NUMBER);
       const tld = await resolveE2eTld();
       const { fixtureDir } = await mutateFixture(RUN_TAG);
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
           args: buildArgs(fixtureDir, `${label}.${tld}`),
-          env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assert.strictEqual(code, 0, `deploy failed (exit ${code}). Stderr tail: ${stderr.slice(-500)}`);
@@ -433,7 +674,6 @@ describe("e2e", { skip: !ENABLED }, () => {
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
           args: buildArgs(fixtureDir, `${label}.${tld}`),
-          env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S2" });
@@ -460,10 +700,16 @@ describe("e2e", { skip: !ENABLED }, () => {
     test(`register as Alice → transfer to recipient → idempotent re-run`, { timeout: DEPLOY_TIMEOUT_MS + 60_000 }, async () => {
       const label = noStatusRunLabel("e2exfer");
       const connectOpts = await resolveDotnsEnvConnectOptions();
-      const envArgs = PAD_ENV ? ["--env", PAD_ENV] : [];
+      const envArgs = ["--env", E2E_ENV_ID];
 
       // 1. Register a fresh name owned by Alice (in-process — no storage upload,
       //    keeping the flake surface to the DotNS commit-reveal path only).
+      //    Retry-safe: if a prior, transiently-failed attempt within this same
+      //    run already carried this label all the way to the recipient (Bob),
+      //    there is nothing left for Alice to register or transfer — record
+      //    that so step 2 expects the CLI's idempotent no-op output instead of
+      //    a fresh "Transferred" (see registerOrConverge above for why
+      //    register() itself can't just be re-run unconditionally).
       const reg = new DotNS();
       await reg.connect({ mnemonic: DEFAULT_MNEMONIC, ...connectOpts });
       const aliceH160 = reg.evmAddress;
@@ -471,8 +717,12 @@ describe("e2e", { skip: !ENABLED }, () => {
         aliceH160.toLowerCase(), BOB_H160.toLowerCase(),
         ">> FAIL: S-TRANSFER: worker must differ from the recipient or the transfer is a no-op",
       );
+      let preOwnedByRecipient = false;
       try {
-        await reg.register(label);
+        const existingOwner = await registerOrConvergeChecked(reg, label, [aliceH160, BOB_H160], "S-TRANSFER");
+        if (existingOwner !== null) {
+          preOwnedByRecipient = existingOwner.toLowerCase() === BOB_H160.toLowerCase();
+        }
       } finally {
         reg.disconnect();
       }
@@ -480,10 +730,12 @@ describe("e2e", { skip: !ENABLED }, () => {
       // 2. Hand over via the `transfer` CLI command (exercises commands/transfer.ts
       //    + DotNS.transferName + the live transferFloor quote). transferName
       //    asserts ownerOf == recipient before returning, so exit 0 IS the
-      //    on-chain proof the transfer landed.
+      //    on-chain proof the transfer landed. On a genuinely fresh run this
+      //    must still be a real "Transferred" — preOwnedByRecipient only
+      //    relaxes the expectation when the on-chain state already proved
+      //    (above) that a prior attempt completed the handover.
       const t1 = await runBulletinDeploy({
         args: ["transfer", label, "--to", BOB_H160, ...envArgs],
-        env: rpcEnv(),
         timeoutMs: DEPLOY_TIMEOUT_MS,
       });
       assert.equal(
@@ -491,14 +743,16 @@ describe("e2e", { skip: !ENABLED }, () => {
         `>> FAIL: S-TRANSFER: transfer command exited ${t1.code}: ${(t1.stderr || t1.stdout).split("\n").slice(-3).join(" ")}`,
       );
       assert.match(
-        t1.stdout, /Transferred .* to 0x41dccbd4/i,
-        ">> FAIL: S-TRANSFER: transfer command did not report a successful handover to the recipient",
+        t1.stdout,
+        preOwnedByRecipient ? /already owned by/i : /Transferred .* to 0x41dccbd4/i,
+        preOwnedByRecipient
+          ? ">> FAIL: S-TRANSFER: retry of an already-completed handover should report the recipient already owns it, not attempt a fresh transfer"
+          : ">> FAIL: S-TRANSFER: transfer command did not report a successful handover to the recipient",
       );
 
       // 3. Re-run: idempotent no-op (recipient already owns it).
       const t2 = await runBulletinDeploy({
         args: ["transfer", label, "--to", BOB_H160, ...envArgs],
-        env: rpcEnv(),
         timeoutMs: DEPLOY_TIMEOUT_MS,
       });
       assert.equal(
@@ -540,15 +794,26 @@ describe("e2e", { skip: !ENABLED }, () => {
       const connectOpts = await resolveDotnsEnvConnectOptions();
       const reg = new DotNS();
       await reg.connect({ mnemonic: DEFAULT_MNEMONIC, ...connectOpts });
+      const aliceH160 = reg.evmAddress;
       try {
         // freshParent: registered AND given an "app" subname, both owned by
         // Alice — the handover leg transfers app.<freshParent> to the recipient.
-        await reg.register(freshParent);
+        // Retry-safe: base-domain ownership of freshParent/otherParent is never
+        // moved by this scenario (only the "app" subname is), so on a retry
+        // within the same run Alice still owns both — registerOrConverge skips
+        // the doomed re-register instead of hitting "already owned by <Alice>".
+        // registerSubdomain itself needs no such guard: setSubnodeOwner (and,
+        // batched atomically with it, setResolver) are parent-owner-authorised,
+        // not subnode-owner-authorised, so re-running it unconditionally simply
+        // reasserts Alice as the subnode owner even if a prior attempt already
+        // handed app.<freshParent> to the recipient — converging the fixture
+        // back to the state the handover test below expects to start from.
+        await registerOrConvergeChecked(reg, freshParent, [aliceH160], "S-TRANSFER-SUBNAME setup");
         await reg.registerSubdomain("app", freshParent);
         // otherParent: registered by Alice only. No subname needed — the
         // not-parent-owner leg must fail at the parent-ownership check
         // before transferSubname ever reads the subnode.
-        await reg.register(otherParent);
+        await registerOrConvergeChecked(reg, otherParent, [aliceH160], "S-TRANSFER-SUBNAME setup");
       } finally {
         reg.disconnect();
       }
@@ -557,11 +822,10 @@ describe("e2e", { skip: !ENABLED }, () => {
     test("handover — register app.<parent> as Alice, transfer to a recipient, verify on-chain, idempotent re-run", { timeout: DEPLOY_TIMEOUT_MS + 60_000 }, async () => {
       const tld = await resolveE2eTld();
       const target = `app.${freshParent}.${tld}`;
-      const envArgs = PAD_ENV ? ["--env", PAD_ENV] : [];
+      const envArgs = ["--env", E2E_ENV_ID];
 
       const t1 = await runBulletinDeploy({
         args: ["transfer", target, "--to", RECIPIENT_H160, ...envArgs],
-        env: rpcEnv(),
         timeoutMs: DEPLOY_TIMEOUT_MS,
       });
       assert.equal(
@@ -594,7 +858,6 @@ describe("e2e", { skip: !ENABLED }, () => {
       // Re-run: idempotent no-op (recipient already owns it).
       const t2 = await runBulletinDeploy({
         args: ["transfer", target, "--to", RECIPIENT_H160, ...envArgs],
-        env: rpcEnv(),
         timeoutMs: DEPLOY_TIMEOUT_MS,
       });
       assert.equal(
@@ -614,7 +877,7 @@ describe("e2e", { skip: !ENABLED }, () => {
     test("not-parent-owner — transferring a subname under a parent you don't own fails with the actionable ownership error, not 'Invalid domain label'", { timeout: DEPLOY_TIMEOUT_MS + 60_000 }, async () => {
       const tld = await resolveE2eTld();
       const target = `app.${otherParent}.${tld}`;
-      const envArgs = PAD_ENV ? ["--env", PAD_ENV] : [];
+      const envArgs = ["--env", E2E_ENV_ID];
 
       // otherParent is owned by Alice (root, DEFAULT_MNEMONIC). Sign this
       // attempt as the well-known dev account //Bob instead — a real, funded
@@ -626,8 +889,9 @@ describe("e2e", { skip: !ENABLED }, () => {
       // derivation), giving us a distinct signer identity with zero CLI
       // plumbing changes.
       const t = await runBulletinDeploy({
+        expectFail: true,
         args: ["transfer", target, "--to", RECIPIENT_H160, ...envArgs],
-        env: { ...rpcEnv(), DOTNS_KEY_URI: `${DEFAULT_MNEMONIC}//Bob` },
+        env: { DOTNS_KEY_URI: `${DEFAULT_MNEMONIC}//Bob` },
         timeoutMs: DEPLOY_TIMEOUT_MS,
       });
       assert.notEqual(
@@ -647,7 +911,6 @@ describe("e2e", { skip: !ENABLED }, () => {
 
   describe("S3 — domain owned by different account", { skip: SCENARIO !== "s3" }, () => {
     test(`deploy to pre-owned label rejects with exit 78`, { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
-      const { fixtureDir } = await mutateFixture(RUN_TAG);
       const tld = await resolveE2eTld();
       // Env-conditional: the two fixtures are provisioned separately, so a
       // failure must name which one it actually used — otherwise the operator
@@ -660,12 +923,42 @@ describe("e2e", { skip: !ENABLED }, () => {
       // Verified live 2026-08-22 via checkOwnership: e2eownedns02.paseo owner
       // 0x237a2b1824AC4a87095c25EC30e1431060725909 (squatter), e2eownedns03.paseo
       // owner 0x41dCCBD49b26c50d34355Ed86ff0FA9E489d1e01 (Bob, BOB_H160 below).
-      const ownedLabel = PAD_ENV === "paseo-next-v2"
-        ? `e2eownedns03.${tld}`
+      const ownedLabel = E2E_ENV_ID === "paseo-next-v2"
+        ? `${S3_OWNED_LABEL}.${tld}`
         : `e2eownedns01.${tld}`;
-      const envLabel = PAD_ENV ?? "paseo-next-v2";
+      const envLabel = E2E_ENV_ID;
+      // Bob's H160 (from docs/e2e-bootstrap.md).
+      const BOB_H160 = "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01";
+      const bareLabel = ownedLabel.replace(new RegExp(`\\.${tld}$`), "");
+
+      // PRECHECK (bulletin #1378/#1341): read on-chain ownership directly,
+      // BEFORE attempting the ~2-3 minute deploy. A DotNS redeploy wipes the
+      // registry silently (CREATE3 keeps every contract address identical,
+      // so nothing else signals the reset) — without this, a wiped fixture
+      // surfaces only downstream, as "expected exit 78, got 0", which reads
+      // like a product regression instead of the environment problem it
+      // actually is. Uses a single short-lived DotNS connection dedicated to
+      // this read (S3 has no other open client to reuse) rather than
+      // inferring ownership from CLI text the way assertFixtureNotDrifted
+      // (below) does after the fact.
+      const precheckClient = new DotNS();
+      await precheckClient.connect({ mnemonic: DEFAULT_MNEMONIC, ...(await resolveDotnsEnvConnectOptions()) });
+      // register-test-fixture-equivalent admin repair can only move a name the
+      // funder (root Alice) holds. Both drift checks below use this to pick
+      // the right fix (bulletin #1398).
+      const funder = precheckClient.evmAddress;
+      let ownership;
+      try {
+        ownership = await precheckClient.checkOwnership(bareLabel, BOB_H160);
+      } finally {
+        precheckClient.disconnect();
+      }
+      assertFixtureOwnership({ ownership, label: bareLabel, tld, expectedOwner: BOB_H160, scenario: "S3", envLabel, funder });
+
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
+          expectFail: true,
           // S3 needs a label owned by a DIFFERENT account from the deploy signer.
           // `e2eowned.dot` was the historical fixture for PopFull signers but its
           // chain ownership drifted to Alice (see e2e run 26648857693 / v0.7.30-rc.1
@@ -675,40 +968,17 @@ describe("e2e", { skip: !ENABLED }, () => {
           // signers fine) and are stable-owned by Bob on both envs — use the same
           // env-conditional for every PoP status.
           args: buildArgs(fixtureDir, ownedLabel),
-          env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
-        // Bob's H160 (from docs/e2e-bootstrap.md).
-        const BOB_H160 = "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01";
         const combined = `${stdout}\n${stderr}`;
 
         // Distinguish FIXTURE DRIFT from a product regression before asserting
         // on the exit code. Both surface as "got 0", but they need completely
-        // different responses — and a bare exit-code mismatch reads like a
+        // different responses, and a bare exit-code mismatch reads like a
         // product bug, which is how this sat red for a week in bulletin-deploy.
-        const fixture = classifyFixtureState({ output: combined, expectedOwner: BOB_H160 });
-        const fixtureMissing = fixture.kind === "missing";
-        const driftedTo = fixture.kind === "drifted" ? fixture.owner : null;
-
-        if (fixtureMissing || driftedTo) {
-          const observed = fixtureMissing
-            ? `${ownedLabel} is UNREGISTERED (reported "available")`
-            : `${ownedLabel} is owned by ${driftedTo}, not Bob (${BOB_H160})`;
-          failWith({
-            scenario: "S3",
-            message:
-              `fixture drift on env "${envLabel}" — ${observed}. ` +
-              `This is a test-fixture problem, NOT a polkadot-app-deploy regression: ` +
-              `the CLI behaved correctly for the chain state it was given. ` +
-              `Fix: this scenario needs ${ownedLabel} owned by an account OTHER than the deploy signer. Ask the chain admin to register it to a third party on ${envLabel} — this repo ships no fixture-registration tool.`,
-            context: combined,
-            keywords: ["available", "already owned", "Domain"],
-            hint:
-              "A testnet re-genesis wipes registrations; the next S3 run then finds the label free " +
-              "and the deploy signer registers it to ITSELF, so every later run exits 0 instead of 78. " +
-              "register-test-fixture is idempotent and repairs both cases.",
-          });
-        }
+        // Returns without throwing when the output shows no drift, so the
+        // exit-code check below reports the failure (bulletin #1398).
+        assertFixtureNotDrifted({ output: combined, label: bareLabel, tld, expectedOwner: BOB_H160, funder, scenario: "S3", envLabel });
 
         if (code !== 78) {
           failWith({
@@ -771,7 +1041,7 @@ describe("e2e", { skip: !ENABLED }, () => {
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
           args: buildArgs(fixtureDir, `${label}.${tld}`),
-          env: { ...rpcEnv(), DOTNS_COMMITMENT_BUFFER: "0" },
+          env: { DOTNS_COMMITMENT_BUFFER: "0" },
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S5", step: "deploy after retry" });
@@ -913,7 +1183,6 @@ describe("e2e", { skip: !ENABLED }, () => {
         // Resolve the whole env (endpoints + contracts + ipfs) the same way the
         // CLI's --env does — pass `env`, NOT a partial mix of rpc + contracts,
         // so the bulletin RPC and the DotNS contract addresses stay consistent.
-        const bulletinRpc = await resolveE2eBulletinRpc();
         await deploy(fixtureDir, `${label}.${tld}`, {
           signer: polkadotSigner,
           signerAddress: account.address,
@@ -921,7 +1190,7 @@ describe("e2e", { skip: !ENABLED }, () => {
           // Alice is the pool account and is authorized on Bulletin.
           storageSigner: polkadotSigner,
           storageSignerAddress: account.address,
-          ...(PAD_ENV ? { env: PAD_ENV } : { rpc: bulletinRpc }),
+          env: E2E_ENV_ID,
           jsMerkle: true,
         });
       } finally {
@@ -956,7 +1225,6 @@ describe("e2e", { skip: !ENABLED }, () => {
       try {
         const r1 = await runBulletinDeploy({
           args: buildArgs(fix1, `${label}.${tld}`),
-          env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded(r1, { scenario: "S-INC-ROUNDTRIP" });
@@ -1011,7 +1279,6 @@ describe("e2e", { skip: !ENABLED }, () => {
         // Deploy from workspace A
         const r1 = await runBulletinDeploy({
           args: buildArgs(fix1, `${label}.${tld}`),
-          env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded(r1, { scenario: "S-INC-PORTABILITY", step: "first deploy" });
@@ -1031,7 +1298,6 @@ describe("e2e", { skip: !ENABLED }, () => {
         // Deploy from workspace B (same content, manifest imported from A)
         const r2 = await runBulletinDeploy({
           args: buildArgs(fix2, `${label}.${tld}`),
-          env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded(r2, { scenario: "S-INC-PORTABILITY", step: "second deploy" });
@@ -1059,6 +1325,131 @@ describe("e2e", { skip: !ENABLED }, () => {
     });
   });
 
+  // S-INC-CROSSLABEL verifies that Bulletin's content-addressed storage lets
+  // a byte-identical redeploy under a BRAND NEW label reuse another domain's
+  // already-uploaded chunks, even with NO previous manifest at all for the
+  // new label (manifest_source: none / first_deploy). Unlike S-INC-PORTABILITY
+  // (which carries workspace A's manifest.json into workspace B to hit the
+  // fast "embedded" path), this scenario builds workspace B from scratch —
+  // proving the probe-only path (storeChunkedContent's skipCids probe against
+  // TransactionStorage.TransactionByContentHash) is what actually enables
+  // sharing, not manifest portability. Chunk CIDs for files >= CHUNK_SIZE_TARGET
+  // (1 MiB) are a pure function of that file's bytes, independent of domain or
+  // manifest history.
+  //
+  // Spec: port of bulletin #1571/#1387.
+  describe("S-INC-CROSSLABEL — cross-label dedup with no previous manifest", { skip: SCENARIO !== "s-inc-crosslabel" }, () => {
+    test(`second label's first-ever deploy still skips section-1 chunks uploaded under the first label`, { timeout: (DEPLOY_TIMEOUT_MS + 30_000) * 2 }, async () => {
+      // #274 (mirror of bulletin #1589): the js and kubo matrix legs of one run
+      // must not share labels, or the second leg finds label B already deployed
+      // and fails the "first-ever deploy" assertion below. MERKLE is part of
+      // both names.
+      //
+      // bulletin #1623: label A only seeds the shared chunks, so it is a fixed
+      // per-tier label Alice ROOT already owns. Label B must have an EMPTY
+      // contenthash ("Manifest: first deploy" prints only when the previous
+      // contenthash reads 0x, and setContenthash cannot clear one), so it is a
+      // fresh SUBNAME of A: never deployed by construction, and
+      // registerSubdomain pays no PopRules deposit. Per-process entropy (not
+      // just RUN_TOKEN) keeps a retry inside the same run from redeploying the
+      // same B.
+      const labelA = tieredLabel(`s-inc-crosslabel-a-${MERKLE}`);
+      const labelB = `b${RUN_TOKEN}${Date.now().toString(36)}.${labelA}`;
+      const tld = await resolveE2eTld();
+      const fixA = fs.mkdtempSync(path.join(os.tmpdir(), "e2exlbl-A-"));
+      const fixB = fs.mkdtempSync(path.join(os.tmpdir(), "e2exlbl-B-"));
+      // Same seed for both — section-1 (>1 MiB + content-hashed) files must
+      // be byte-identical across workspaces for their chunk CIDs to coincide.
+      // Different runTag only affects the volatile index.html padding.
+      buildIncrementalFixture({ targetDir: fixA, seed: "s-inc-crosslabel", runTag: RUN_TAG + "-xlbl-a" });
+      try {
+        // Deploy under label A — puts the shared content on chain.
+        const rA = await runBulletinDeploy({
+          args: buildArgs(fixA, `${labelA}.${tld}`),
+          timeoutMs: DEPLOY_TIMEOUT_MS,
+        });
+        assertDeploySucceeded(rA, { scenario: "S-INC-CROSSLABEL", step: "deploy under label A" });
+
+        // Build workspace B from scratch — deliberately NOT copying fixA's
+        // .bulletin-deploy/manifest.json. Label B has never been deployed to,
+        // so this must hit the true first-deploy path (manifest_source: none).
+        // (buildIncrementalFixture never writes .bulletin-deploy/manifest.json
+        // itself — only the CLI does, during deploy — so there's no separate
+        // precondition to assert here; the "no previous manifest" property is
+        // verified below via the deploy's own "Manifest:" summary line, which
+        // is the assertion that can actually catch a regression.)
+        buildIncrementalFixture({ targetDir: fixB, seed: "s-inc-crosslabel", runTag: RUN_TAG + "-xlbl-b" });
+
+        const rB = await runBulletinDeploy({
+          args: buildArgs(fixB, `${labelB}.${tld}`),
+          timeoutMs: DEPLOY_TIMEOUT_MS,
+        });
+        assertDeploySucceeded(rB, { scenario: "S-INC-CROSSLABEL", step: "first-ever deploy under label B" });
+
+        // Manifest line must say true first-deploy (no previous manifest),
+        // confirming B's own domain genuinely has no manifest history — this
+        // is what distinguishes the scenario from S-INC-PORTABILITY.
+        assertStdoutMatches(rB.stdout, /Manifest:\s+first deploy \(no previous manifest\)/, {
+          scenario: "S-INC-CROSSLABEL",
+          what: "manifest_source: none / first_deploy for label B",
+          hint: "label B must be genuinely fresh (never deployed before). If this fails with an 'embedded'/'heuristic_fallback' line instead, label B collided with a previously-used name — check the per-process entropy in label B's sublabel.",
+        });
+
+        // Despite no previous manifest, the probe-only path must still find
+        // and skip label A's already-uploaded section-1 chunks (global,
+        // content-addressed storage — dedup doesn't need a manifest or a
+        // domain link, only coinciding chunk CIDs). Note: unlike S-INC's own
+        // >= 60% regression floor, this scenario requires a full 100% skip —
+        // every section-1 chunk was just uploaded under label A, so anything
+        // less than "all found on chain" means cross-label reuse missed one.
+        // (Unlike S-INC-PORTABILITY, which never asserts on this line at all —
+        // its embedded-manifest fast path is a different code path — this
+        // scenario's whole point is exercising the probe, so it must run.)
+        //
+        // parseChunkSkipRateFromOutput treats "0 chunks probed" as a 100 %
+        // skip (its general convention: nothing to do = nothing missed).
+        // That's the wrong read here — this scenario forces the probe-only
+        // path specifically, so "0 probed" would mean that path silently
+        // didn't run at all, which is exactly the regression this test
+        // exists to catch. Assert a non-zero probe count explicitly before
+        // trusting the shared helper's ratio.
+        assertStdoutMatches(rB.stdout, /Probed:\s+(?!0\s+chunks)\d+\s+chunks/, {
+          scenario: "S-INC-CROSSLABEL",
+          what: "at least one chunk actually probed for label B",
+          hint: "0 chunks probed means the probe-only path didn't run at all for label B — this scenario exists specifically to exercise that path.",
+        });
+        const skipRate = parseChunkSkipRateFromOutput(rB.stdout, "S-INC-CROSSLABEL");
+        if (skipRate < 1) {
+          failWith({
+            scenario: "S-INC-CROSSLABEL",
+            message: `cross-label chunk-skip rate ${(skipRate * 100).toFixed(1)}% < 100% — some section-1 chunks uploaded under label A were not found on chain for label B`,
+            context: rB.stdout,
+            keywords: ["Probed", "Cache", "Manifest"],
+            hint: "every section-1 chunk uploaded under label A should be found by label B's skipCids probe, since chunk CIDs for files >= 1 MiB are a pure function of file bytes.",
+          });
+        }
+
+        // Bytes-uploaded gate: with all section-1 chunks skipped, label B's
+        // first-ever deploy should upload only section 0 (manifest) + section
+        // 2 (root dir + volatile index.html) overhead — well under the
+        // ceiling S-INC/S-INC-PORTABILITY already use for the same fixture.
+        const bytesUploaded = parseBytesUploadedFromOutput(rB.stdout);
+        if (bytesUploaded > 50_000) {
+          failWith({
+            scenario: "S-INC-CROSSLABEL",
+            message: `bytes uploaded ${(bytesUploaded / 1024).toFixed(1)} KB > 50 KB ceiling on a cross-label, no-manifest redeploy`,
+            context: rB.stdout,
+            keywords: ["Probed", "Cache", "Manifest"],
+            hint: "live observation on S-INC/S-INC-PORTABILITY's same fixture is ~10-20 KB. Significantly more means cross-label chunk reuse silently stopped working.",
+          });
+        }
+      } finally {
+        try { fs.rmSync(fixA, { recursive: true, force: true }); } catch {}
+        try { fs.rmSync(fixB, { recursive: true, force: true }); } catch {}
+      }
+    });
+  });
+
   // S-INC-ASSET-ROTATION simulates a real frontend rebuild: one source file
   // changed, Vite emits a new content-hashed bundle filename and updates
   // index.html's script tag. The expected behaviour: the unchanged 9.1 MB
@@ -1073,7 +1464,6 @@ describe("e2e", { skip: !ENABLED }, () => {
   // Assertions:
   //   - First deploy uploads the full ~9.6 MB (probe finds 0 of N chunks on chain)
   //   - Second deploy uploads ≤ 1.5 MB (rotated bundle + section-2 overhead)
-  //   - Chunk-skip rate ≥ 85 % on second deploy
   describe("S-INC-ASSET-ROTATION — realistic Vite rebuild", { skip: SCENARIO !== "s-inc-asset-rotation" }, () => {
     test(`bundle filename rotation re-uploads only the changed file`, { timeout: (DEPLOY_TIMEOUT_MS + 30_000) * 2 }, async () => {
       const label = pickRotLabel();
@@ -1087,7 +1477,7 @@ describe("e2e", { skip: !ENABLED }, () => {
         // a prior test run — we don't assert on first-deploy chunk-skip rate).
         const r1 = await runBulletinDeploy({
           args: buildArgs(fix1, `${label}.${tld}`),
-          env: { ...rpcEnv(), NODE_OPTIONS: "--max-old-space-size=512" },
+          env: { NODE_OPTIONS: "--max-old-space-size=512" },
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded(r1, { scenario: "S-INC-ASSET-ROTATION", step: "first deploy" });
@@ -1107,7 +1497,7 @@ describe("e2e", { skip: !ENABLED }, () => {
         // Same heap bump for the redeploy — phase B re-merkleizes the same site.
         const r2 = await runBulletinDeploy({
           args: buildArgs(fix1, `${label}.${tld}`),
-          env: { ...rpcEnv(), NODE_OPTIONS: "--max-old-space-size=512" },
+          env: { NODE_OPTIONS: "--max-old-space-size=512" },
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded(r2, { scenario: "S-INC-ASSET-ROTATION", step: "second deploy" });
@@ -1117,6 +1507,21 @@ describe("e2e", { skip: !ENABLED }, () => {
         // Live observation: ~700 KB uploaded. 1.5 MB ceiling = ~2× headroom for
         // chunk-packing variability (sibling small files in the same chunk as the
         // rotated bundle may also re-upload).
+        //
+        // #1355: root cause was CONTENT_HASH_RE (src/manifest.ts) only
+        // admitting [A-Za-z0-9] in the hash segment, so Vite/Rollup bundle
+        // names whose base64url hash suffix contains "_" or "-" (e.g.
+        // errors-CHrKVge_.js) fell through to "volatile" and were fully
+        // re-uploaded on every deploy despite their CID never changing.
+        // Fixed by widening CONTENT_HASH_RE's class to admit the full
+        // base64url alphabet — a pure name-based classification with no
+        // history-dependence. (An earlier attempt fixed this via a
+        // prevManifest CID-match in the CAR-section classifier instead; that
+        // broke S-INC-PORTABILITY by letting content-identical,
+        // name-unclassified files like index.html migrate into section 1's
+        // tail between deploys — reverted.) Ceiling stays at 1.5 MB — a
+        // future regression here means the dedup broke again, not that the
+        // budget is stale.
         const bytesUploaded = parseBytesUploadedFromOutput(r2.stdout);
         if (bytesUploaded > 1_500_000) {
           failWith({
@@ -1149,7 +1554,6 @@ describe("e2e", { skip: !ENABLED }, () => {
       try {
         const r1 = await runBulletinDeploy({
           args: buildArgs(fix1, `${label}.${tld}`),
-          env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded(r1, { scenario: "S-INC", step: "first deploy" });
@@ -1183,7 +1587,6 @@ describe("e2e", { skip: !ENABLED }, () => {
         try {
           const r2 = await runBulletinDeploy({
             args: buildArgs(fix2, `${label}.${tld}`),
-            env: rpcEnv(),
             timeoutMs: DEPLOY_TIMEOUT_MS,
           });
           assertDeploySucceeded(r2, { scenario: "S-INC", step: "second deploy" });
@@ -1268,9 +1671,10 @@ describe("e2e", { skip: !ENABLED }, () => {
   //                  AND for #278's suppression NOT trapping us in an
   //                  infinite loop.
   //
-  // Uses a fresh per-run label (pickFreshRunLabel("s8smoke")) so concurrent
-  // nightly runs don't race on the same domain. Both subtests use the same
-  // label binding — pick once at describe scope, use twice. Keep the two
+  // Uses the tier's fixed label (tieredLabel("s8"), bulletin #1623): the property is the
+  // reconnect, not registration, and per-tier labels keep concurrent nightly
+  // tiers off the same domain. Both subtests use the same label binding — pick
+  // once at describe scope, use twice. Keep the two
   // subtests serial: both use the same signer/account on paseo-next-v2, so
   // overlapping deploys can race nonces and make fallback inclusion checks
   // ambiguous.
@@ -1291,7 +1695,7 @@ describe("e2e", { skip: !ENABLED }, () => {
   //     batches still trigger doReconnect rather than running the next
   //     batch against a destroyed client).
   describe("S8 — chunk-upload survives WS halt + budget bails clean on storm", { skip: SCENARIO !== "s8", concurrency: false }, () => {
-    const label = pickFreshRunLabel("s8smoke");
+    const label = tieredLabel("s8");
     test("drop-once mid-upload: deploy succeeds via reconnect, budget never trips", { timeout: DEPLOY_TIMEOUT_MS + 60_000 }, async () => {
       // Multi-chunk fixture so the upload spans long enough that mid-upload
       // is a real point in time (not after-the-fact). 7 MB → 4 chunks of 2 MB.
@@ -1369,7 +1773,9 @@ describe("e2e", { skip: !ENABLED }, () => {
         if (!(cleanSuccess || cleanBail)) {
           failWith({
             scenario: "S8",
-            message: `deploy must either survive cleanly or bail with budget/reconnect-exhausted error or ChainHead disjointed; got exit ${code}. Drops injected: ${proxy.stats.dropsInjected}`,
+            // Wording avoids the wrapper's flake needles on purpose: this
+            // message prints on failure and the wrapper scans our own output.
+            message: `deploy must either survive cleanly or bail with a retry-budget, reconnect-exhausted or chain-head error; got exit ${code}. Drops injected: ${proxy.stats.dropsInjected}`,
             context: stderr,
             keywords: ["Error", "Stale", "Connection"],
             hint: "an uncaught crash (exit 2) means #278's suppression broke.",
@@ -1401,7 +1807,7 @@ describe("e2e", { skip: !ENABLED }, () => {
           "--mnemonic", ALICE_MNEMONIC,
           ...(MERKLE === "js" ? ["--js-merkle"] : []),
           ...(directSignerDerivationPath() ? ["--derivation-path", directSignerDerivationPath()] : []),
-          ...(PAD_ENV ? ["--env", PAD_ENV] : []),
+          "--env", E2E_ENV_ID,
         ];
       }
 
@@ -1413,8 +1819,19 @@ describe("e2e", { skip: !ENABLED }, () => {
       const S9_GRANDPA_WAIT_MS = 30_000;
       const { fixtureDir: fixA } = await makeMultiChunkFixture(`s9a-${RUN_TAG}`);
       const { fixtureDir: fixB } = await makeMultiChunkFixture(`s9b-${RUN_TAG}`);
+      // #1672: the collision is staged, not left to timing. Each deploy seeds from
+      // system_accountNextIndex, which counts the other's pending txs, so whichever
+      // finished its pre-upload checks later used to seed ABOVE the first one's chunks
+      // and nothing collided. The E2E-only nonce-seed barrier (src/e2e-nonce-barrier.ts)
+      // holds each deploy between its seed read and its first chunk submit until both
+      // have seeded, so both sign chunks from the same nonce.
+      const barrierDir = fs.mkdtempSync(path.join(os.tmpdir(), "s9-nonce-barrier-"));
       try {
-        const s9Env = { ...rpcEnv(), BULLETIN_GRANDPA_NATURAL_WAIT_MS: String(S9_GRANDPA_WAIT_MS) };
+        const s9Env = {
+          BULLETIN_GRANDPA_NATURAL_WAIT_MS: String(S9_GRANDPA_WAIT_MS),
+          PAD_E2E_NONCE_SEED_BARRIER: barrierDir,
+          PAD_E2E_NONCE_SEED_BARRIER_PARTIES: "2",
+        };
         // Per-deploy timeout extends DEPLOY_TIMEOUT_MS by 5 min to absorb
         // nonce-collision retries on slower testnets (paseo-next-v2 12s blocks).
         const S9_DEPLOY_TIMEOUT_MS = DEPLOY_TIMEOUT_MS + 5 * 60 * 1000;
@@ -1426,7 +1843,18 @@ describe("e2e", { skip: !ENABLED }, () => {
         assertDeploySucceeded(rA, { scenario: "S9", step: "deploy A" });
         assertDeploySucceeded(rB, { scenario: "S9", step: "deploy B" });
 
-        const combined = rA.stdout + rA.stderr + rB.stdout + rB.stderr;
+        // Race precondition: both deploys met at the barrier with the same seed. A
+        // missed barrier or different seeds means the collision was not staged; that
+        // must fail here by name, not pass or fail on whether a collision happened anyway.
+        const outs = [rA, rB].map((r) => r.stdout + r.stderr);
+        const barrierSeeds = outs.map((o) => o.match(/E2E nonce-seed barrier met: seeds \[(\d+), (\d+)\]/));
+        assert.ok(barrierSeeds.every(Boolean),
+          ">> FAIL: S9: a deploy did not meet the other at the nonce-seed barrier (timed out or never reached it), so the chunk-nonce collision was not staged. " +
+            "Barrier lines: " + outs.map((o) => (o.match(/E2E nonce-seed barrier[^\n]*/g) ?? ["<none>"]).join(" | ")).join(" ;; "));
+        assert.ok(barrierSeeds.every((m) => m[1] === m[2]),
+          `>> FAIL: S9: the two deploys seeded different chunk nonces (${barrierSeeds.map((m) => m[0]).join(" / ")}); a third party moved the signer's nonce, so the collision was not staged`);
+
+        const combined = outs.join("");
         // Accept ANY of the deploy's nonce-collision-recovery signals — not just
         // the "consumed → included" heuristic (deploy.ts nonce-advance fallback /
         // consumed-heuristic logs), but crucially the "Nonce-collision re-upload"
@@ -1442,13 +1870,13 @@ describe("e2e", { skip: !ENABLED }, () => {
           /(nonce (advanced past \d+|consumed \(current=|\d+ consumed)|Nonce-collision re-upload|nonce-advance collision)/i,
           ">> FAIL: S9: neither parallel deploy logged any nonce-collision-recovery signal " +
             "(expected one of: 'Nonce-collision re-upload', 'nonce advanced past N', or 'nonce N consumed (current=...)'). " +
-            "Both use the same signer, so their Bulletin chunk txs share a nonce counter and MUST contend. " +
-            "If this fails, the deploys ran sequentially / fixture overlap was insufficient (the race did not stage) — " +
-            "widen makeMultiChunkFixture rather than weakening this check; not necessarily a product defect (check timestamps).",
+            "Both deploys met at the nonce-seed barrier with the same seed, so their chunk txs were signed with the same nonces " +
+            "and MUST have collided: the collision-recovery path did not log its signal. Check the chunk/retry lines of both deploys.",
         );
       } finally {
         fs.rmSync(fixA, { recursive: true, force: true });
         fs.rmSync(fixB, { recursive: true, force: true });
+        fs.rmSync(barrierDir, { recursive: true, force: true });
       }
     });
   });
@@ -1469,6 +1897,7 @@ describe("e2e", { skip: !ENABLED }, () => {
 
     test("stale chain_getFinalizedHead does not trigger re-upload; deploy exits 0", { timeout: DEPLOY_TIMEOUT_MS + STALE_DURATION_MS + 60_000 }, async () => {
       const rpc = await resolveE2eBulletinRpc();
+      const proxyStartedAt = Date.now();
       const proxy = await startFaultProxy({
         mode: "stale-finalized-head",
         staleDurationMs: STALE_DURATION_MS,
@@ -1476,7 +1905,9 @@ describe("e2e", { skip: !ENABLED }, () => {
       });
       const { fixtureDir } = await makeMultiChunkFixture(`s-grandpa-reupload-${RUN_TAG}`);
       try {
-        const label = pickFreshRunLabel("sgreupload");
+        // bulletin #1623: fixed per-tier label; the property is the stale-head probe,
+        // which runs at the end of Phase B on every deploy, owned or fresh.
+        const label = tieredLabel("s-grandpa-reupload");
         const tld = await resolveE2eTld();
         const args = [
           fixtureDir,
@@ -1484,7 +1915,7 @@ describe("e2e", { skip: !ENABLED }, () => {
           "--tag", process.env.DEPLOY_TAG,
           "--mnemonic", ALICE_MNEMONIC,
           ...(directSignerDerivationPath() ? ["--derivation-path", directSignerDerivationPath()] : []),
-          ...(PAD_ENV ? ["--env", PAD_ENV] : []),
+          "--env", E2E_ENV_ID,
         ];
         const result = await runBulletinDeploy({
           args,
@@ -1508,10 +1939,34 @@ describe("e2e", { skip: !ENABLED }, () => {
           });
         }
 
+        // A 0 here has three different causes that the count alone cannot
+        // tell apart: the client never asked for a finalised head, it asked
+        // after the stale window had closed, or it asked over a channel this
+        // proxy cannot see (a chainHead_* subscription rather than the legacy
+        // method, or a different endpoint). Dump what the proxy observed so
+        // the next occurrence answers that instead of prompting more theory.
+        //
+        // One theory already tested and rejected upstream (bulletin #1449):
+        // content-addressed chunk reuse making Phase B upload nothing.
+        // Re-running against a chain that already held identical chunks did
+        // NOT reproduce it, so the fixture is deliberately left unsalted.
+        const seenMethods = Object.entries(proxy.stats.methodCounts ?? {})
+          .sort((a, b) => b[1] - a[1]).slice(0, 12)
+          .map(([m, n]) => `${m}x${n}`).join(", ") || "(none)";
+        const windowInfo = proxy.stats.staleWindowOpenedAt
+          ? `stale window opened +${proxy.stats.staleWindowOpenedAt - proxyStartedAt}ms after proxy start`
+          : "stale window never opened (no finalised-head response passed through)";
         assert.ok(
           proxy.stats.dropsInjected >= 1,
-          `>> FAIL: S-GRANDPA-REUPLOAD: proxy intercepted ${proxy.stats.dropsInjected} chain_getFinalizedHead responses; ` +
-            "expected ≥ 1 — if 0, the GRANDPA probe never called chain_getFinalizedHead (path may have been skipped)",
+          `>> FAIL: S-GRANDPA-REUPLOAD: proxy intercepted ${proxy.stats.dropsInjected} chain_getFinalizedHead responses; expected >= 1.\n` +
+            `  chain_getFinalizedHead requests seen by proxy: ${proxy.stats.finalizedHeadRequests}\n` +
+            `  ...answered after the window closed: ${proxy.stats.finalizedHeadOutsideWindow}\n` +
+            `  ${windowInfo}\n` +
+            `  proxy connections: ${proxy.stats.connections}\n` +
+            `  methods through the proxy: ${seenMethods}\n` +
+            `  How to read it: requests=0 WITH chainHead_* present means the client used the subscription path and this ` +
+            `proxy never sees the probe. requests>0 with outsideWindow>0 means the probe ran after the window. ` +
+            `requests=0 with no chainHead_* means the probe never ran — check whether Phase B uploaded any chunks.`,
         );
 
         const combined = result.stdout + result.stderr;
@@ -1554,12 +2009,12 @@ describe("e2e", { skip: !ENABLED }, () => {
     // either because no chunk expired or because the code path is broken).
     // Deploy exit code: explicitly NOT asserted. Either outcome is fine.
     //
-    // Label uses noStatusRunLabel (PoP-independent) so the test works in
-    // both PopFull and NoStatus signer environments. Period=4 (~24s on 6s
+    // Label is the tier's fixed Alice-ROOT-owned label (bulletin #1623); the property is
+    // the chunk retry path in the storage phase, which runs before DotNS. Period=4 (~24s on 6s
     // blocks) is generous enough to let SOME chunks land while still
     // triggering expiry on slower batches.
     test("forced chunk expiry engages the retry path", { timeout: DEPLOY_TIMEOUT_MS + 3 * 60 * 1000 }, async () => {
-      const label = noStatusRunLabel("smortality");
+      const label = tieredLabel("s-mortality");
       const tld = await resolveE2eTld();
       const { fixtureDir } = await makeMultiChunkFixture(`s-mortality-${RUN_TAG}`);
       try {
@@ -1570,12 +2025,11 @@ describe("e2e", { skip: !ENABLED }, () => {
           "--mnemonic", ALICE_MNEMONIC,
           ...(MERKLE === "js" ? ["--js-merkle"] : []),
           ...(directSignerDerivationPath() ? ["--derivation-path", directSignerDerivationPath()] : []),
-          ...(PAD_ENV ? ["--env", PAD_ENV] : []),
+          "--env", E2E_ENV_ID,
         ];
         const result = await runBulletinDeploy({
           args,
           env: {
-            ...(PAD_ENV ? {} : { BULLETIN_RPC: RPC }),
             BULLETIN_CHUNK_MORTALITY_PERIOD: "4",
             // Forced expiry pushes the global recovery-budget guard
             // (RETRY_BUDGET_MAX_EVENTS=5 in RETRY_BUDGET_WINDOW_MS=30000)
@@ -1645,7 +2099,6 @@ describe("e2e", { skip: !ENABLED }, () => {
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
           args: buildArgs(fixtureDir, `${freshParent}.${tld}`),
-          env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-SUBDOMAIN before()" });
@@ -1662,7 +2115,6 @@ describe("e2e", { skip: !ENABLED }, () => {
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
           args: buildArgs(fixtureDir, target),
-          env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-SUBDOMAIN basic" });
@@ -1693,7 +2145,6 @@ describe("e2e", { skip: !ENABLED }, () => {
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
           args: buildArgs(fixtureDir, target),
-          env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-SUBDOMAIN long-digits" });
@@ -1722,8 +2173,8 @@ describe("e2e", { skip: !ENABLED }, () => {
       const { fixtureDir } = await mutateFixture(RUN_TAG + "-sub-orphan");
       try {
         const { code, stderr } = await runBulletinDeploy({
+          expectFail: true,
           args: buildArgs(fixtureDir, target),
-          env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         if (code !== 78) {
@@ -1750,18 +2201,19 @@ describe("e2e", { skip: !ENABLED }, () => {
 
   describe("S-CAR — deploy from pre-built CAR file (--input-car)", { skip: SCENARIO !== "s-car" }, () => {
     test(`deploy pool/${MERKLE} via --input-car matches normal deploy CID`, { timeout: DEPLOY_TIMEOUT_MS * 2 + 60_000 }, async () => {
-      // Use a fresh per-run label so first deploy hits register() rather than
-      // racing with S1 on the stable pool label. Env var LABEL lets the nightly workflow
-      // pass a unique per-run label; default falls back to a local stable label.
+      // bulletin #1623: the tier's fixed label, owned by Alice ROOT and
+      // provisioned from tools/lib/e2e-fixtures.mjs; separate from S1's pool
+      // label, so no race with it. The property is the --input-car CID and
+      // contenthash, not registration. LABEL still overrides it for a manual run.
       const tld = await resolveE2eTld();
-      const label = process.env.LABEL ?? (signerPopStatus >= 2 ? `e2escarpool.${tld}` : `e2escarpool01.${tld}`);
+      const label = process.env.LABEL ?? `${tieredLabel("s-car")}.${tld}`;
       const { fixtureDir } = await mutateFixture(RUN_TAG);
       const dumpPath = path.join(os.tmpdir(), `e2e-s-car-${Date.now()}.car`);
       try {
         // Step 1: Normal deploy + CAR dump — establishes the expected CID.
         const r1 = await runBulletinDeploy({
           args: buildArgs(fixtureDir, label),
-          env: { ...rpcEnv(), PAD_DUMP_CAR: dumpPath },
+          env: { PAD_DUMP_CAR: dumpPath },
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded(r1, { scenario: "S-CAR", step: "first (normal) deploy" });
@@ -1773,7 +2225,6 @@ describe("e2e", { skip: !ENABLED }, () => {
         // No build-dir positional arg when --input-car is set.
         const r2 = await runBulletinDeploy({
           args: buildInputCarArgs(dumpPath, label),
-          env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded(r2, { scenario: "S-CAR", step: "--input-car deploy" });
@@ -1811,7 +2262,6 @@ describe("e2e", { skip: !ENABLED }, () => {
         const args = [...buildArgs(fixtureDir, `${label}.${tld}`), "--config", configPath, "--no-manifest"];
         const { code, stdout, stderr } = await runBulletinDeploy({
           args,
-          env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-CONTENT-ONLY" });
@@ -1880,10 +2330,145 @@ describe("e2e", { skip: !ENABLED }, () => {
   // end-to-end behavior a unit test (which mocks the network) cannot: the
   // icon actually lands on, and is fetchable from, the resolved env's own
   // gateway.
+  // setResolver is owner-only, so every DotNS write must come from the account
+  // --product-name derives. deploy() and publishManifest() resolve it separately.
+  //
+  // The label is fixed: the product account must already own it, since a fresh
+  // register costs ~211 PAS and testnet auto-top-up targets a fraction of that.
+  describe("S-PRODUCT-MANIFEST — --product-name publishes the manifest as the account that owns the name", { skip: SCENARIO !== "s-product-manifest" }, () => {
+    test(`deploy with --product-name and a manifest signs every DotNS write as the product account`, { timeout: DEPLOY_TIMEOUT_MS + 5 * 60 * 1000 + 30_000 }, async () => {
+      const label = "e2eprodman00";
+      const tld = await resolveE2eTld();
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+      const { configPath, sidecarDir } = buildManifestSidecar({ buildDir: fixtureDir, label: `${label}.${tld}`, tld });
+      try {
+        const args = buildProductManifestArgs(fixtureDir, `${label}.${tld}`, configPath);
+        const { code, stdout, stderr } = await runBulletinDeploy({ args, timeoutMs: DEPLOY_TIMEOUT_MS });
+        assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-PRODUCT-MANIFEST" });
+
+        // The deploy and the manifest step open separate DotNS sessions. Each one
+        // that applies --product-name logs this line; a session that missed the
+        // flag stays silent and signs as the bare mnemonic account.
+        const deployers = [...stdout.matchAll(/Product deployer:\s+(\S+)/g)].map((m) => m[1]);
+        assert.ok(deployers.length >= 2,
+          `>> FAIL: S-PRODUCT-MANIFEST: expected a "Product deployer:" line from both the deploy and the manifest step, saw ${deployers.length}. publishManifest resolves its own signer; without productName it connects as the bare mnemonic account and setResolver reverts NotAuthorised.`);
+        assert.equal(new Set(deployers).size, 1,
+          `>> FAIL: S-PRODUCT-MANIFEST: every DotNS write must be signed by one account, saw ${[...new Set(deployers)].join(" and ")} — the registry refuses setResolver from anyone but the name's owner`);
+
+        // #1495: the same account must also STORE the manifest's bytes. --product-name is the
+        // case where the two can silently diverge: deploy() swaps in the product signer before
+        // selecting storage, so a manifest step that resolved storage from the raw mnemonic
+        // would upload from the root account instead — needing a second Bulletin grant.
+        const { manifest } = assertManifestStorageMatchesContent(stdout, { scenario: "S-PRODUCT-MANIFEST" });
+        assert.equal(manifest.address, deployers[0],
+          `>> FAIL: S-PRODUCT-MANIFEST: the manifest's icon and executables were stored by ${manifest.address}, not by the product account ${deployers[0]} that signs its records and paid for the content.`);
+
+        const deployedCid = parseDeployedCid(stdout, "S-PRODUCT-MANIFEST");
+        const expected = ("0x" + encodeContenthash(deployedCid)).toLowerCase();
+        const onChain = await readContenthashWithRetry(label, expected);
+        assertOnChainMatches(onChain, expected, { scenario: "S-PRODUCT-MANIFEST", label });
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+        fs.rmSync(sidecarDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // #1484 point 5: "an e2e alongside #1471 (--product-name with a manifest
+  // publish) that round-trips a trustedProducts entry through the text
+  // record." composeRoot's normalizeTrustedProducts (src/manifest/compose.ts)
+  // is unit-tested directly in test/product-manifest.test.js — that proves
+  // the COMPOSER produces the right object, but says nothing about whether
+  // that object actually lands on chain byte-for-byte as the "manifest" text
+  // record's trustedProducts field. This scenario proves the real round
+  // trip: publish a config whose grants are deliberately unsorted and
+  // duplicated, then read back the SAME on-chain text record the deploy just
+  // wrote and assert on THAT — never on a local composeRoot() call, which
+  // would only prove the composer agrees with itself.
+  //
+  // Deliberately reuses S-PRODUCT-MANIFEST's fixed pre-owned domain/account
+  // (e2eprodman00.<tld>, owned by the account --product-name e2eproduct
+  // derives) instead of a fresh label: a fresh register costs ~211 PAS and
+  // the product-derived account's testnet auto-top-up only covers a fraction
+  // of that (see the comment on S-PRODUCT-MANIFEST above) — there is no
+  // other pre-owned --product-name fixture to target. Gated on the exact
+  // SAME `skip` predicate as S-PRODUCT-MANIFEST (not a new SCENARIO value)
+  // so this only ever runs as a SECOND describe in the SAME leg/process,
+  // never in a separate CI matrix leg that could run concurrently with it —
+  // two matrix legs writing the same text record on the same
+  // --product-name-derived account (no poolIndex to pin, same as
+  // S-PRODUCT-MANIFEST) would race both the DotNS nonce and the record
+  // itself. node:test runs top-level describes within one file sequentially
+  // by default (verified empirically); `concurrency: false` pins that
+  // explicitly so this never overlaps S-PRODUCT-MANIFEST's own write to the
+  // same domain. No e2e.yml matrix entry is needed for this reason — it
+  // rides the existing `s-product-manifest` leg.
+  describe("S-PRODUCT-MANIFEST-TRUSTED — trustedProducts round-trips through the manifest text record (#1484)", { skip: SCENARIO !== "s-product-manifest", concurrency: false }, () => {
+    test(`deploy with --product-name and a trustedProducts config writes the normalized grant on chain`, { timeout: DEPLOY_TIMEOUT_MS + 5 * 60 * 1000 + 30_000 }, async () => {
+      const label = "e2eprodman00";
+      const tld = await resolveE2eTld();
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+      // Deliberately unsorted + duplicated: pins ordering, de-duplication AND
+      // the "all" collapse through one real round trip (composeRoot's
+      // normalizeTrustedProducts, src/manifest/compose.ts).
+      const trustedProducts = {
+        zed: ["storage", "all"],
+        alpha: ["context", "context"],
+      };
+      const expectedTrustedProducts = { alpha: ["context"], zed: ["all"] };
+      const { configPath, sidecarDir } = buildManifestSidecar({
+        buildDir: fixtureDir,
+        label: `${label}.${tld}`,
+        tld,
+        trustedProducts,
+      });
+      try {
+        const args = buildProductManifestArgs(fixtureDir, `${label}.${tld}`, configPath);
+        const { code, stdout, stderr } = await runBulletinDeploy({ args, timeoutMs: DEPLOY_TIMEOUT_MS });
+        assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-PRODUCT-MANIFEST-TRUSTED" });
+
+        const raw = await readTextRecordWithRetry(label, "manifest", E2E_ENV_ID, (r) => {
+          if (!r) return false;
+          try {
+            const parsed = JSON.parse(r);
+            return !!(parsed && typeof parsed === "object" && "trustedProducts" in parsed);
+          } catch { return false; }
+        });
+        assert.ok(raw,
+          `>> FAIL: S-PRODUCT-MANIFEST-TRUSTED: the "manifest" text record on ${label}.${tld} read back empty after the deploy reported success — either the setTextRecord tx never landed, or the read raced the write past the retry budget.`);
+
+        let parsed;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (err) {
+          assert.fail(`>> FAIL: S-PRODUCT-MANIFEST-TRUSTED: the on-chain "manifest" text record is not valid JSON (${err.message}): ${raw.slice(0, 200)}`);
+        }
+
+        // Two checks, not one: deepEqual alone doesn't pin key ORDER (an
+        // object with the same keys reversed still deep-equals), so the
+        // value-shape check (dedup + "all" collapse) and the key-order check
+        // (sort) are asserted separately — together they pin everything the
+        // task's unsorted/duplicated input is meant to exercise in one
+        // real round trip.
+        assert.deepEqual(parsed.trustedProducts, expectedTrustedProducts,
+          `>> FAIL: S-PRODUCT-MANIFEST-TRUSTED: on-chain trustedProducts is ${JSON.stringify(parsed.trustedProducts)}, expected ${JSON.stringify(expectedTrustedProducts)} — composeRoot's normalizeTrustedProducts should have deduped ["context","context"], collapsed ["storage","all"] to ["all"], and dropped neither key.`);
+        assert.deepEqual(Object.keys(parsed.trustedProducts ?? {}), Object.keys(expectedTrustedProducts),
+          `>> FAIL: S-PRODUCT-MANIFEST-TRUSTED: on-chain trustedProducts key order is ${JSON.stringify(Object.keys(parsed.trustedProducts ?? {}))}, expected sorted order ${JSON.stringify(Object.keys(expectedTrustedProducts))} — composeRoot must sort keys before writing the text record.`);
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+        fs.rmSync(sidecarDir, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe("S-MANIFEST-ENV — manifest publish honors --env for icon Bulletin storage on a non-default env (#1094)", { skip: SCENARIO !== "s-manifest-env" }, () => {
     test(`deploy ${SIGNER}/${MERKLE} with a manifest lands the icon on the resolved env's Bulletin chain`, { timeout: DEPLOY_TIMEOUT_MS + 5 * 60 * 1000 + 30_000 }, async () => {
-      assert.ok(PAD_ENV,
-        ">> FAIL: S-MANIFEST-ENV: requires PAD_ENV set to a non-default env (e.g. paseo-next-v2) — this scenario specifically exercises publishManifest's --env-aware Bulletin storage (#1094).");
+      // The regression this guards is publishManifest ignoring --env and
+      // uploading to the built-in endpoint, so the run's own Bulletin endpoint
+      // has to differ from it for the scenario to prove anything.
+      const envBulletinRpc = await resolveE2eBulletinRpc();
+      assert.notEqual(envBulletinRpc, DEFAULT_BULLETIN_RPC,
+        `>> FAIL: S-MANIFEST-ENV: ${E2E_ENV_ID} resolves to the built-in Bulletin endpoint ${envBulletinRpc}, so an icon uploaded to the wrong chain would be indistinguishable from a correct one. Run this scenario against an env with its own Bulletin chain.`);
 
       const label = perLegPoolLabel() ?? pickFreshRunLabel("e2emanenv");
       const tld = await resolveE2eTld();
@@ -1893,10 +2478,13 @@ describe("e2e", { skip: !ENABLED }, () => {
         const args = [...buildArgs(fixtureDir, `${label}.${tld}`), "--config", configPath];
         const { code, stdout, stderr } = await runBulletinDeploy({
           args,
-          env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-MANIFEST-ENV" });
+
+        // #1495: this leg already proves the icon lands on the right CHAIN; assert it also
+        // lands from the right ACCOUNT — the one the content upload used.
+        assertManifestStorageMatchesContent(stdout, { scenario: "S-MANIFEST-ENV" });
 
         const deployedCid = parseDeployedCid(stdout, "S-MANIFEST-ENV");
         const expected = ("0x" + encodeContenthash(deployedCid)).toLowerCase();
@@ -1938,13 +2526,338 @@ describe("e2e", { skip: !ENABLED }, () => {
         if (!gotBytes || !gotBytes.equals(wantBytes)) {
           failWith({
             scenario: "S-MANIFEST-ENV",
-            message: `icon CID ${iconCid} not retrievable (byte-identical) from ${PAD_ENV}'s own gateway (${iconUrl}) within 5 min (last HTTP status ${lastStatus})`,
+            message: `icon CID ${iconCid} not retrievable (byte-identical) from ${E2E_ENV_ID}'s own gateway (${iconUrl}) within 5 min (last HTTP status ${lastStatus})`,
             hint: "publishManifest may have uploaded the icon to the wrong Bulletin chain (DEFAULT_BULLETIN_RPC instead of the resolved env) — the #1094 regression this scenario guards against.",
           });
         }
       } finally {
         fs.rmSync(fixtureDir, { recursive: true, force: true });
         fs.rmSync(sidecarDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("S-MANIFEST-PVM: App v2 PolkaVM manifest publishes and round-trips on app.<label>", { skip: SCENARIO !== "s-manifest-pvm" }, () => {
+    test(`deploy ${SIGNER}/${MERKLE} with a PolkaVM App v2 manifest`, { timeout: DEPLOY_TIMEOUT_MS + 5 * 60 * 1000 + 30_000 }, async () => {
+      const scenario = "S-MANIFEST-PVM";
+      const label = perLegPoolLabel() ?? pickFreshRunLabel("e2epvmman");
+      const tld = await resolveE2eTld();
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+      // Nothing runs it; with manifest.json it makes detectBuildMarkers see a PolkaVM app build.
+      fs.writeFileSync(path.join(fixtureDir, "app.polkavm"), `e2e polkavm placeholder ${RUN_TAG}\n`);
+      const appManifest = buildPvmAppManifest();
+      const { configPath, sidecarDir } = buildManifestSidecar({ buildDir: fixtureDir, label: `${label}.${tld}`, tld, appManifest });
+      try {
+        const args = [...buildArgs(fixtureDir, `${label}.${tld}`), "--config", configPath];
+        const { code, stdout, stderr } = await runBulletinDeploy({
+          args,
+          timeoutMs: DEPLOY_TIMEOUT_MS,
+        });
+        assertDeploySucceeded({ code, stdout, stderr }, { scenario });
+
+        // The executable's path is the build dir, so app.<label> carries the deploy's CID.
+        const deployedCid = parseDeployedCid(stdout, scenario);
+        const expected = ("0x" + encodeContenthash(deployedCid)).toLowerCase();
+        const onChain = await readContenthashWithRetry(`app.${label}`, expected);
+        assertOnChainMatches(onChain, expected, { scenario, label: `app.${label}` });
+
+        const wantJson = JSON.stringify(appManifest);
+        const gotJson = await readTextRecordWithRetry(`app.${label}`, "executable", E2E_ENV_ID, (raw) => raw === wantJson);
+        if (gotJson !== wantJson) {
+          failWith({
+            scenario,
+            message: `'executable' text record on app.${label}.${tld} does not byte-match the validated manifest`,
+            context: `wrote: ${wantJson}\nchain: ${gotJson === "" ? "(unset)" : gotJson}`,
+            hint: "The record lands in the same tx as the contenthash checked above, and the read was retried, so this is not lag: src/manifest/publish.ts wrote bytes other than JSON.stringify of the manifest.",
+          });
+        }
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+        fs.rmSync(sidecarDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // S-V060-UNBLOCK — bulletin #1423/#1410. v0.6.0 deletes PopRules'
+  // trailing-digit-count rule and changes how baseLength is measured,
+  // unblocking two label shapes that are illegal on every earlier generation:
+  //   A. base-8 + exactly 2 trailing digits (the production "dotworld01"
+  //      shape) — old profiles: 6-8 base band + 2-digit Lite signal => PopLite.
+  //   B. exactly 1 trailing digit, base >= 9 as written ("myapp-pr7" shape)
+  //      — old profiles: the independent 1-or-3+-trailing-digit rule => Reserved.
+  // Both classify NoStatus on v0.6.0 (open to any account).
+  //
+  // NOTE — this twin has no preview env, so this scenario only ever runs
+  // against paseo-next-v2.
+  //
+  // GATED, not by SCENARIO's static describe-skip (profile is only knowable
+  // from a live chain probe), but dynamically per-test via detectDotnsProfile():
+  //   - default (no E2E_REQUIRE_PROFILE): a non-v0.6.0 chain SKIPS loudly,
+  //     naming the detected profile — a silent skip here would be a false
+  //     green identical in shape to the noStatusRunLabel blind spot this
+  //     scenario exists to close.
+  //   - E2E_REQUIRE_PROFILE=v0.6.0: a non-v0.6.0 chain FAILS instead, because
+  //     the caller explicitly asked for v0.6.0 validation and did not get it.
+  //
+  // False-green guard: on testnets, when preflight's canRegister check fails
+  // for a NoStatus signer, the CLI can self-serve a fresh personhood proof via
+  // AliasAccounts.reprove_alias_account (the "auto-reprove" path, src/dotns.ts's
+  // preflight internals) and retry — a signer whose alias happens to be stale
+  // would then pass preflight via a REFRESHED PoP grant, not via v0.6.0's
+  // NoStatus semantics, and the deploy would succeed for entirely the wrong
+  // reason on an OLD-profile chain too. Every assertion below therefore checks
+  // the MECHANISM (profile + classification + absence of that self-grant
+  // path), not just exit code 0.
+  describe("S-V060-UNBLOCK — v0.6.0 unblocks base-8+2-digit and 1-trailing-digit labels (#1410)", { skip: SCENARIO !== "s-v060-unblock" }, () => {
+    let detectedProfile = null;
+    before(async () => {
+      detectedProfile = await detectDotnsProfile();
+    });
+
+    // Returns true when the test should proceed; false when it skipped.
+    // Throws (via failWith) in gate mode when the required profile is absent.
+    //
+    // THREE distinct outcomes, never collapsed into one another — each has a
+    // different remedy:
+    //   1. profile === "v0.6.0" -> proceed.
+    //   2. noCode -> no contract code at the configured POP_RULES address
+    //      (e.g. a redeploy in flight, or a stale/wrong configured address).
+    //      This is explicitly NOT "wrong profile" and must never be reported
+    //      as such — the message says "no contract code", full stop.
+    //   3. a different, real profile answered -> "not v0.6.0", named.
+    function gateOnV060Profile(t) {
+      if (detectedProfile.profile === "v0.6.0") return true;
+
+      if (detectedProfile.noCode) {
+        if (process.env.E2E_REQUIRE_PROFILE === "v0.6.0") {
+          failWith({
+            scenario: "S-V060-UNBLOCK",
+            message: `E2E_REQUIRE_PROFILE=v0.6.0 was set but there is NO CONTRACT CODE at the configured DotNS address — v0.6.0 validation did not run`,
+            context: detectedProfile.error,
+            hint: "this is NOT \"the wrong profile\" — environments.json's configured POP_RULES address currently has nothing deployed (e.g. a redeploy in flight). Wait for the redeploy to land and re-run, or fix environments.json/--contract if the configured address is simply stale.",
+          });
+        }
+        console.log("=".repeat(60));
+        console.log(`>> S-V060-UNBLOCK: SKIPPING — NO CONTRACT CODE at the configured DotNS address; cannot determine the ABI profile at all.`);
+        console.log(`   ${detectedProfile.error}`);
+        console.log(`   This is DIFFERENT from "wrong profile" — it usually means a redeploy is in flight. Set`);
+        console.log(`   E2E_REQUIRE_PROFILE=v0.6.0 to turn this into a hard failure instead of a skip.`);
+        console.log("=".repeat(60));
+        t.skip("no contract code at the configured DotNS address — cannot determine ABI profile");
+        return false;
+      }
+
+      if (process.env.E2E_REQUIRE_PROFILE === "v0.6.0") {
+        failWith({
+          scenario: "S-V060-UNBLOCK",
+          message: `E2E_REQUIRE_PROFILE=v0.6.0 was set but the connected chain detected DotNS ABI profile "${detectedProfile.profile}" — v0.6.0 validation did not run`,
+          hint: "this env has not received the v0.6.0 DotNS redeploy yet. Point --env at an env that has the v0.6.0 redeploy, or drop E2E_REQUIRE_PROFILE to let this scenario soft-skip instead.",
+        });
+      }
+      console.log("=".repeat(60));
+      console.log(`>> S-V060-UNBLOCK: SKIPPING — detected DotNS ABI profile "${detectedProfile.profile}", not "v0.6.0".`);
+      console.log(`   This scenario exercises v0.6.0-only naming semantics (base-8+2-digit / 1-trailing-digit`);
+      console.log(`   labels) that do not exist on this chain yet. Set E2E_REQUIRE_PROFILE=v0.6.0 to turn a`);
+      console.log(`   missing v0.6.0 chain into a hard failure instead of a skip.`);
+      console.log("=".repeat(60));
+      t.skip(`detected DotNS ABI profile "${detectedProfile.profile}", not v0.6.0`);
+      return false;
+    }
+
+    // Asserts the mechanism a successful v0.6.0-unblock deploy must show, and
+    // must NOT show, for one label. Shared by both label tests below so the
+    // two can't drift apart on what "for the right reason" means.
+    async function assertV060UnblockMechanism({ label, tld, combined }) {
+      assertStdoutMatches(combined, /DotNS ABI profile v0\.6\.0 detected/, {
+        scenario: "S-V060-UNBLOCK",
+        what: `${label}: deploy log must report the v0.6.0 ABI profile`,
+        hint: "detectProtocolVersion logs 'DotNS ABI profile <profile> detected on <env>' (src/dotns.ts) — missing means the chain served a different profile mid-run, or the log line format moved.",
+      });
+
+      assertStdoutMatches(combined, new RegExp(`DotNS: ${label}\\.${tld} requires NoStatus\\b`), {
+        scenario: "S-V060-UNBLOCK",
+        what: `${label}: preflight must classify NoStatus (v0.6.0 dropped the rule that would otherwise require personhood/reject this shape)`,
+        hint: "deploy.ts logs 'DotNS: <label>.<tld> requires <Status>' via popStatusName(classification.status) — a different status here means v0.6.0 semantics did not apply as expected for this label shape.",
+      });
+
+      // False-green guard (see this describe's own doc comment): none of
+      // the auto-reprove/self-grant log markers may appear. Their presence
+      // means the deploy succeeded via a refreshed personhood proof, not via
+      // v0.6.0's NoStatus semantics — indistinguishable at the exit-code
+      // level, so this is the one place that tells the difference.
+      for (const marker of ["Submitting reprove_alias_account", "alias revision stale", "Refresh complete (revision"]) {
+        assert.ok(
+          !combined.includes(marker),
+          `>> FAIL: S-V060-UNBLOCK: ${label}: deploy log contains "${marker}" — the PoP auto-reprove/self-grant path fired. ` +
+          `That would make this deploy succeed via an on-chain personhood refresh, not v0.6.0's NoStatus semantics — a false ` +
+          `green identical to the failure mode this scenario exists to catch. seen tail: ${combined.slice(-500)}`,
+        );
+      }
+
+      // Second false-green guard, same shape as the one above but via a
+      // DIFFERENT door: RUN_TOKEN is fixed for the whole run (and across a
+      // nick-fields/retry re-attempt of this same test file — no
+      // run_attempt in its entropy, unlike sibling scenarios), so the label
+      // is IDENTICAL on a retry. If attempt 1 registered successfully but
+      // the test failed later (e.g. the contenthash read flaked) before
+      // reaching this assertion, attempt 2 finds the label already owned by
+      // this same signer — the preflight's "already-owned-by-us" branch
+      // (src/dotns.ts) returns BEFORE the classification/PoP gate ever
+      // runs, so classification/NoStatus still print (deploy.ts's reqSuffix
+      // appends this exact marker right after them) even though registration
+      // itself was never exercised on THIS run. That is a green result that
+      // never actually proved the label registrable.
+      assert.ok(
+        !combined.includes("already owned, requirement not enforced"),
+        `>> FAIL: S-V060-UNBLOCK: ${label}: deploy log contains "already owned, requirement not enforced" — this label was ` +
+        `ALREADY OWNED by this signer before this run started (likely a stale name from a prior attempt/retry sharing the ` +
+        `same RUN_TOKEN), so this run took the already-owned fast path and never exercised registration. That proves ` +
+        `nothing about the label's registrability — rerun with a fresh RUN_TOKEN (a new GITHUB_RUN_ID/sha, or transfer/` +
+        `release the stale name) so a real register() attempt runs. seen tail: ${combined.slice(-500)}`,
+      );
+    }
+
+    // Shared by both label-shape tests below — the deploy/assert/cleanup
+    // sequence is identical for both; only the label builder differs.
+    async function runV060UnblockCase(t, buildLabel) {
+      if (!gateOnV060Profile(t)) return;
+
+      const tld = await resolveE2eTld();
+      const label = buildLabel(RUN_TOKEN);
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+      try {
+        const { code, stdout, stderr } = await runBulletinDeploy({
+          args: buildArgs(fixtureDir, `${label}.${tld}`),
+          timeoutMs: DEPLOY_TIMEOUT_MS,
+        });
+        assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-V060-UNBLOCK", step: `deploy ${label}` });
+        const combined = `${stdout}\n${stderr}`;
+        await assertV060UnblockMechanism({ label, tld, combined });
+
+        const deployedCid = parseDeployedCid(stdout, "S-V060-UNBLOCK");
+        const expected = ("0x" + encodeContenthash(deployedCid)).toLowerCase();
+        const onChain = await readContenthashWithRetry(label, expected);
+        assertOnChainMatches(onChain, expected, { scenario: "S-V060-UNBLOCK", label });
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+      }
+    }
+
+    test("base-8 + 2 trailing digits unblocked (the production \"dotworld01\" shape)", { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async (t) => {
+      await runV060UnblockCase(t, buildBase8TwoDigitLabel);
+    });
+
+    test("1 trailing digit, base >= 9 as written unblocked (the \"myapp-pr7\" shape)", { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async (t) => {
+      await runV060UnblockCase(t, buildOneTrailingDigitLabel);
+    });
+  });
+
+  // S-RESERVED-INVARIANT — bulletin #1423/#1410. The invariant Deliverable-1
+  // does NOT change: base names of 5 chars or fewer stay Reserved
+  // (governance-only, never self-registrable) on EVERY DotNS generation, old
+  // and v0.6.0 alike. UNGATED — runs on every environment, every night,
+  // regardless of which profile is live, because it guards the opposite
+  // failure from S-V060-UNBLOCK: that the v0.6.0 naming change did not
+  // accidentally make a governance-reserved name self-registrable. "web3" is
+  // Reserved on both generations already (test/test.js's S-V060-UNBLOCK
+  // label-builder describe block pins the classifyDotnsLabel side of this),
+  // but for a DIFFERENT reason per generation: old profiles via the
+  // independent 1-trailing-digit rule, v0.6.0 via base length alone (4 <= 5)
+  // — this scenario doesn't care WHICH reason fired, only that the refusal
+  // happened, non-retryably, before any chain write.
+  describe("S-RESERVED-INVARIANT — base names <=5 chars stay Reserved on every DotNS generation (#1410)", { skip: SCENARIO !== "s-reserved-invariant" }, () => {
+    test('deploy to a governance-reserved label ("web3") is refused non-retryably, before any registration tx', { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
+      const tld = await resolveE2eTld();
+      const label = "web3";
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+
+      // #1588 (port of bulletin-deploy): this scenario must cost nothing at
+      // all — not just skip the DotNS registration/storage it directly
+      // guards, but also never trigger an account-mapping or top-up
+      // transaction, which DotNS.connect() can submit
+      // (ensureMappedAccountReady) BEFORE the Reserved-classification check
+      // even runs. That only holds if the signer connect() uses is already
+      // mapped and funded; on the previously-unpinned default signer (bare
+      // Alice), an environment where that account is unmapped/underfunded
+      // would silently defeat the "never writes" invariant this test exists
+      // to prove. The CI job now pins BULLETIN_POOL_ACCOUNT_INDEX to pool
+      // account 0 — see the comment on that env var in e2e.yml for why
+      // sharing an already-provisioned, concurrently-written index is safe
+      // for a scenario that (per the log-line assertions below) never signs
+      // anything itself.
+      try {
+        const { code, stdout, stderr } = await runBulletinDeploy({
+          expectFail: true,
+          args: buildArgs(fixtureDir, `${label}.${tld}`),
+          timeoutMs: DEPLOY_TIMEOUT_MS,
+        });
+        const combined = `${stdout}\n${stderr}`;
+
+        if (code !== 78) {
+          failWith({
+            scenario: "S-RESERVED-INVARIANT",
+            message: `expected EXIT_CODE_NO_RETRY (78) for governance-reserved label "${label}.${tld}", got ${code}`,
+            context: combined,
+            keywords: ["Error", "Reserved", "governance", "requires"],
+            hint: "base names <=5 chars are reserved for governance on every DotNS generation (classifyRegistrability's reserved-base rule, or the old profiles' trailing-digit rule) — this must never become registrable.",
+          });
+        }
+
+        assertStdoutMatches(combined, new RegExp(`DotNS: ${label}\\.${tld} requires Reserved\\b`), {
+          scenario: "S-RESERVED-INVARIANT",
+          what: "preflight must classify the label Reserved on every DotNS generation",
+          hint: "deploy.ts logs 'DotNS: <label>.<tld> requires <Status>' via popStatusName(classification.status) — Reserved must hold regardless of which profile is live.",
+        });
+
+        assert.match(
+          combined,
+          /reserves base names of 5 chars or fewer for governance|trailing digit/i,
+          `>> FAIL: S-RESERVED-INVARIANT: refusal reason must cite the governance-reserved rule (base length on v0.6.0, or the trailing-digit count on older profiles) — seen tail: ${combined.slice(-500)}`,
+        );
+
+        // "Cost nothing": the DotNS preflight abort throws BEFORE the Storage
+        // phase begins (deploy.ts), so no chunk upload or registration
+        // transaction is ever attempted. Belt-and-suspenders check on the
+        // observable output, in case that ordering ever regresses silently.
+        for (const marker of ["Status: Registering", "Commitment", "Storage\n" + "=".repeat(60)]) {
+          assert.ok(
+            !combined.includes(marker),
+            `>> FAIL: S-RESERVED-INVARIANT: output contains "${marker}" — a registration/storage step must never run for a governance-reserved label (this scenario must cost nothing).`,
+          );
+        }
+
+        // #1588: connect()'s account-mapping check (which runs BEFORE the
+        // Reserved refusal above) must never need to submit — or attempt to
+        // submit — a real transaction. Cover both ensureMappedAccountReady
+        // code paths (src/dotns.ts): the manual-mapping branch logs "Mapping
+        // account on Asset Hub Revive..." right before ensureAccountMapped();
+        // the auto-mapping branch (every env in assets/environments.json
+        // today) logs "is NOT mapped on Revive" as soon as it finds the
+        // account unmapped, then "Mapping requires submitting a
+        // transaction..." and "Topped up ... for auto-map" if it has to
+        // fund and submit the Revive.call auto-map trigger. None of these
+        // must appear for an already-mapped, already-funded pinned signer.
+        //
+        // This IS the proof that sharing pool index 0 with a concurrent
+        // writer leg (see e2e.yml's BULLETIN_POOL_ACCOUNT_INDEX comment) is
+        // safe: this list must stay exhaustive over every write path
+        // connect() can take. If a future change adds a new write path here
+        // that doesn't log through one of these markers, reinstate a
+        // dedicated pool index (or a nonce check) for this scenario instead
+        // of extending this list blind.
+        for (const marker of [
+          "Mapping account on Asset Hub Revive",
+          "is NOT mapped on Revive",
+          "Mapping requires submitting a transaction",
+          "Topped up",
+        ]) {
+          assert.ok(
+            !combined.includes(marker),
+            `>> FAIL: S-RESERVED-INVARIANT: output contains "${marker}" — connect()'s account-mapping check must never need to submit (or attempt) a real transaction; this scenario's signer must already be mapped and funded.`,
+          );
+        }
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
       }
     });
   });
