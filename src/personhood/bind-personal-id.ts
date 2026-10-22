@@ -7,8 +7,9 @@ import {
   buildImplicationMessage,
   buildV5GeneralExtrinsic,
   bytesToHex,
+  fillExtensionValues,
   hexToBytes,
-  readExtensionOrder,
+  selectExtensionPipeline,
   toHex,
   type ExtensionValues,
 } from "./encoding.js";
@@ -229,24 +230,24 @@ const capturePass = async ({
   let captured: CapturePass | null = null;
 
   const sentinel = new Error("__personhood_capture_sentinel__");
+  const customs = {
+    [AS_PERSON_IDENTIFIER]: {
+      value: asPersonValue,
+      additionalSigned: new Uint8Array(),
+    },
+    [VERIFY_MULTI_SIGNATURE_IDENTIFIER]: {
+      value: Enum("Disabled"),
+    },
+    RestrictOrigins: {
+      value: new Uint8Array([0x01]),
+      additionalSigned: new Uint8Array(),
+    },
+  };
   const signer: PolkadotSigner = {
     publicKey: new Uint8Array(32),
     signTx: async (callData, signedExtensions, metadata) => {
-      const order = await readExtensionOrder(metadata);
-      const byIdentifier: ExtensionValues["byIdentifier"] = {};
-      for (const id of order) {
-        const ext = signedExtensions[id];
-        if (!ext) {
-          throw new PersonalIdBindingError(
-            `papi did not produce signed extension '${id}'`,
-          );
-        }
-        byIdentifier[id] = {
-          value: ext.value,
-          additionalSigned: ext.additionalSigned,
-        };
-      }
-      captured = { callData, extensions: { order, byIdentifier } };
+      const pipeline = await selectExtensionPipeline(metadata, AS_PERSON_IDENTIFIER);
+      captured = { callData, extensions: fillExtensionValues(pipeline, signedExtensions, customs) };
       // Abort papi's signing flow — we only needed the extension bytes.
       throw sentinel;
     },
@@ -254,21 +255,7 @@ const capturePass = async ({
   };
 
   try {
-    await innerTx.sign(signer, {
-      customSignedExtensions: {
-        [AS_PERSON_IDENTIFIER]: {
-          value: asPersonValue,
-          additionalSigned: new Uint8Array(),
-        },
-        [VERIFY_MULTI_SIGNATURE_IDENTIFIER]: {
-          value: Enum("Disabled"),
-        },
-        RestrictOrigins: {
-          value: new Uint8Array([0x01]),
-          additionalSigned: new Uint8Array(),
-        },
-      },
-    });
+    await innerTx.sign(signer, { customSignedExtensions: customs });
   } catch (err) {
     if (err !== sentinel) throw err;
   }

@@ -11,12 +11,14 @@ import {
   buildV5GeneralExtrinsic,
   bytesToHex,
   encodeMembers,
+  fillExtensionValues,
   hexToBytes,
-  readExtensionOrder,
+  selectExtensionPipeline,
   toHex,
   type ExtensionValues,
 } from "./encoding.js";
 import {
+  AS_PGAS_IDENTIFIER,
   PEOPLE_MEMBER_IDENTIFIER_HEX,
   PGAS_ASSET_ID,
   PROOF_BYTES,
@@ -476,19 +478,17 @@ const capturePass = async (
 ): Promise<CapturePass> => {
   let captured: CapturePass | null = null;
   const sentinel = new Error("__pgas_capture_sentinel__");
+  const customs = {
+    [AS_PGAS_IDENTIFIER]: {
+      value: asPgasValue,
+      additionalSigned: new Uint8Array(),
+    },
+  };
   const signer: PolkadotSigner = {
     publicKey: new Uint8Array(32),
     signTx: async (callData, signedExtensions, metadata) => {
-      const order = await readExtensionOrder(metadata);
-      const byIdentifier: ExtensionValues["byIdentifier"] = {};
-      for (const id of order) {
-        const ext = signedExtensions[id];
-        byIdentifier[id] = {
-          value: ext.value,
-          additionalSigned: ext.additionalSigned,
-        };
-      }
-      captured = { callData, extensions: { order, byIdentifier } };
+      const pipeline = await selectExtensionPipeline(metadata, AS_PGAS_IDENTIFIER);
+      captured = { callData, extensions: fillExtensionValues(pipeline, signedExtensions, customs) };
       throw sentinel;
     },
     signBytes: async () => new Uint8Array(64),
@@ -496,12 +496,7 @@ const capturePass = async (
   try {
     await innerTx.sign(signer, {
       mortality: { mortal: false },
-      customSignedExtensions: {
-        AsPgas: {
-          value: asPgasValue,
-          additionalSigned: new Uint8Array(),
-        },
-      },
+      customSignedExtensions: customs,
     });
   } catch (err) {
     if (err !== sentinel) throw err;
