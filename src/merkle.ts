@@ -10,6 +10,7 @@ import { UnixFS } from "ipfs-unixfs";
 import { classifyFile } from "./manifest.js";
 import { packSection, type SectionFile } from "./chunker.js";
 import { createCID } from "./deploy.js";
+import { captureWarning, sanitizeErrorMessage } from "./telemetry.js";
 
 export interface MerkleizeResult {
   carBytes: Uint8Array;
@@ -292,13 +293,20 @@ export async function merkleizeKuboBackend(directoryPath: string): Promise<Merkl
   return { rootCid: cidStr, blocks, fileBlocks, fileCids, rootBlockCids, subdirCids };
 }
 
-// Backend chooser. useKubo=true requires `ipfs` on PATH; caller is responsible
-// for verifying via hasIPFS() before passing true.
 export async function merkleizeBackend(directoryPath: string, useKubo: boolean, phase?: string): Promise<MerkleizeOutput> {
   const tag = phase ? ` — ${phase}` : '';
   if (useKubo) {
     console.log(`   Merkleizing (Kubo${tag}): ${directoryPath}`);
-    return merkleizeKuboBackend(directoryPath);
+    try {
+      return await merkleizeKuboBackend(directoryPath);
+    } catch (err) {
+      // By Phase B the chunks are already paid for, so a failed ipfs call must
+      // not end the deploy (bulletin #1557). Kubo and JS produce the same root
+      // CID, so the fallback yields the same DAG.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`   Kubo merkleize failed, falling back to JS: ${msg}`);
+      captureWarning("Kubo merkleize failed, fell back to JS", { phase: phase ?? "none", error: sanitizeErrorMessage(msg) });
+    }
   }
   console.log(`   Merkleizing (JS${tag}): ${directoryPath}`);
   return merkleizeJSBackend(directoryPath);
@@ -425,7 +433,14 @@ export async function buildOrderedCar(
   newStable.sort((a, b) =>
     (b.size - a.size) || (a.fileCid < b.fileCid ? -1 : a.fileCid > b.fileCid ? 1 : 0)
   );
-  for (const f of newStable) section1Files.push(f);
+  // Dedup by fileCid here too, matching the anchored loop above, so Phase A
+  // and Phase B pack section 1 identically (full story: test/car-section1-dedup.test.js).
+  // `newStable`'s own filter above is now a perf nicety, not a correctness requirement.
+  for (const f of newStable) {
+    if (placed.has(f.fileCid)) continue;
+    section1Files.push(f);
+    placed.add(f.fileCid);
+  }
 
   // ─── Section 2 file order (volatile): size desc + CID asc ───────────────────
   volatileFiles.sort((a, b) =>
@@ -547,7 +562,7 @@ export async function rebuildOrderedCarFromBytes(
 export async function merkleizeWithStableOrder(
   directoryPath: string,
   prevStableOrder?: string[],
-  options?: { useKubo?: boolean; classifyFn?: (filePath: string) => "stable" | "volatile"; phase?: string }
+  options?: { useKubo?: boolean; classifyFn?: (filePath: string, fileCid?: string) => "stable" | "volatile"; phase?: string }
 ): Promise<MerkleizeStableResult> {
   const useKubo = options?.useKubo ?? false;
   const phase = options?.phase;

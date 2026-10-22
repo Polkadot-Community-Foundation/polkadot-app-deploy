@@ -13,18 +13,18 @@ import {
   assertWithinBudget,
   getTextRecordBudgetBytes,
   DEFAULT_TEXT_RECORD_BUDGET_BYTES,
+  PLACEHOLDER_CID,
   loadProductConfig,
   preflightProductConfig,
   checkProductConfigFilesExist,
   publishManifest,
   formatConfigLoadError,
 } from "../dist/index.js";
-import { registerOrEnsureResolver } from "../dist/manifest/publish.js";
+import { registerOrEnsureResolver, domainMatchesEnvTld, manifestSignerOptions } from "../dist/manifest/publish.js";
+import { composeRoot } from "../dist/manifest/compose.js";
 import { NonRetryableError } from "../dist/errors.js";
-import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints } from "../dist/deploy.js";
-import { KNOWN_TLDS as DOTNS_KNOWN_TLDS } from "../dist/dotns.js";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints, __selectStorageProviderModeForTest, resolveProductSigner } from "../dist/deploy.js";
+import { deriveProductSigner } from "../dist/product-account.js";
 
 describe("validateRootManifest", () => {
   test("accepts a well-formed v1 root manifest", () => {
@@ -48,15 +48,55 @@ describe("validateRootManifest", () => {
     assert.ok(result.errors.some(e => e.includes("$v must be 1")));
   });
 
-  test("rejects unknown icon format", () => {
+  // A Host reading this on-chain record must not fail validation over an
+  // unrecognised icon.format — it renders a placeholder and keeps the
+  // product launchable. This test used to assert the reverse (rejection);
+  // that strictness still exists, just on the publish side — see
+  // validateProductConfig's "still rejects an unrecognised icon.format" test
+  // below, unaffected by this change.
+  test("tolerates an unrecognised icon.format (read side must not fail)", () => {
     const result = validateRootManifest({
       $v: 1,
       displayName: "DemoApp",
       description: "",
       icon: { cid: "bafy", format: "webp" },
     });
-    assert.equal(result.ok, false);
-    assert.ok(result.errors.some(e => e.includes("icon.format")));
+    assert.equal(
+      result.ok,
+      true,
+      `>> FAIL: validateRootManifest unrecognised-icon-format-tolerated: a Host must not fail validation over an unrecognised icon.format and must instead render a placeholder; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  // The exemption is for an unrecognised *value*, not a missing or
+  // wrong-typed field. Shape stays strict on both sides, same as icon.cid
+  // right next to it.
+  test("rejects icon.format entirely absent — shape error, not an unrecognised value", () => {
+    const result = validateRootManifest({
+      $v: 1,
+      displayName: "DemoApp",
+      description: "",
+      icon: { cid: "bafy" },
+    });
+    assert.equal(
+      result.ok,
+      false,
+      `>> FAIL: validateRootManifest icon-format-absent-rejected: a missing icon.format is a shape error (same as a missing icon.cid), not the unrecognised-value exemption; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  test("rejects a non-string icon.format — shape error, not an unrecognised value", () => {
+    const result = validateRootManifest({
+      $v: 1,
+      displayName: "DemoApp",
+      description: "",
+      icon: { cid: "bafy", format: 42 },
+    });
+    assert.equal(
+      result.ok,
+      false,
+      `>> FAIL: validateRootManifest icon-format-non-string-rejected: icon.format must be a string before "is it a recognised one" is even the question; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
   });
 
   test("rejects when icon is missing entirely", () => {
@@ -68,12 +108,74 @@ describe("validateRootManifest", () => {
     assert.equal(result.ok, false);
   });
 
+  // #1487 regression guard: the fix for #1487 only adds an unknown-top-level-field
+  // check to validateProductConfig. These two cases are the RFC-protected
+  // leniency validateRootManifest must keep even after that change — RFC
+  // lines 464/492: "Two things are exempt and MUST NOT fail validation: an
+  // unrecognised grant value in trustedProducts" (icon.format's own RFC-464
+  // exemption is a separate, pre-existing gap — see PR description).
+  test("tolerates an unrecognised trustedProducts grant value (RFC line 492 — read side must not fail)", () => {
+    const result = validateRootManifest({
+      $v: 1,
+      displayName: "DemoApp",
+      description: "",
+      icon: { cid: "bafy", format: "png" },
+      trustedProducts: { dim2: ["context", "some-future-grant"] },
+    });
+    assert.equal(
+      result.ok,
+      true,
+      `>> FAIL: validateRootManifest unrecognised-grant-tolerated: a Host MUST ignore an unrecognised trustedProducts grant value and keep validating, per RFC line 492; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  test("tolerates a TLD-suffixed trustedProducts key (RFC line 494 — entry is inert, not invalid)", () => {
+    const result = validateRootManifest({
+      $v: 1,
+      displayName: "DemoApp",
+      description: "",
+      icon: { cid: "bafy", format: "png" },
+      trustedProducts: { "dim2.paseo": ["context"] },
+    });
+    assert.equal(
+      result.ok,
+      true,
+      `>> FAIL: validateRootManifest tld-suffixed-key-inert: a TLD-suffixed trustedProducts key resolves to a name that does not exist and must be inert, not a validation error, per RFC line 494; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
   test("rejects non-object inputs", () => {
     assert.equal(validateRootManifest(null).ok, false);
     assert.equal(validateRootManifest("string").ok, false);
     assert.equal(validateRootManifest([]).ok, false);
   });
 });
+
+const APP_V2_MANIFEST = {
+  $v: 2,
+  kind: "app",
+  appVersion: [0, 1, 7],
+  runtime: {
+    kind: "polkavm",
+    abiVersion: 2,
+    entrypoint: "app.polkavm",
+  },
+  capabilities: {
+    graphics: {
+      abiVersion: 1,
+      profile: "framebuffer",
+      requiredFeatures: [],
+    },
+    deviceInput: {
+      abiVersion: 1,
+      requiredFeatures: ["pointer", "keyboard"],
+    },
+    audio: {
+      abiVersion: 1,
+      requiredFeatures: [],
+    },
+  },
+};
 
 describe("validateExecutableManifest — app", () => {
   test("accepts a minimal app manifest", () => {
@@ -97,6 +199,59 @@ describe("validateExecutableManifest — app", () => {
   test("rejects 5-element appVersion", () => {
     const result = validateExecutableManifest({ $v: 1, kind: "app", appVersion: [1, 0, 0, "tag", "extra"] });
     assert.equal(result.ok, false);
+  });
+});
+
+describe("validateExecutableManifest — App v2", () => {
+  test("accepts PolkaVM and web runtime variants", () => {
+    assert.equal(validateExecutableManifest(APP_V2_MANIFEST).ok, true);
+    assert.equal(
+      validateExecutableManifest({
+        $v: 2,
+        kind: "app",
+        appVersion: [1, 0, 0],
+        runtime: { kind: "web", entrypoint: "index.html" },
+      }).ok,
+      true,
+    );
+  });
+
+  test("rejects unknown required features and unsafe entrypoints", () => {
+    const unknownFeature = structuredClone(APP_V2_MANIFEST);
+    unknownFeature.capabilities.deviceInput.requiredFeatures.push("gamepad");
+    const featureResult = validateExecutableManifest(unknownFeature);
+    assert.equal(featureResult.ok, false);
+    assert.ok(featureResult.errors.some((error) => error.includes("gamepad")));
+
+    const unsafeEntrypoint = structuredClone(APP_V2_MANIFEST);
+    unsafeEntrypoint.runtime.entrypoint = "../app.polkavm";
+    const entrypointResult = validateExecutableManifest(unsafeEntrypoint);
+    assert.equal(entrypointResult.ok, false);
+    assert.ok(entrypointResult.errors.some((error) => error.includes("entrypoint")));
+  });
+
+  test("accepts runtime ABI 1 and 2, rejects other values", () => {
+    const abi1 = structuredClone(APP_V2_MANIFEST);
+    abi1.runtime.abiVersion = 1;
+    assert.equal(validateExecutableManifest(abi1).ok, true);
+
+    const abi3 = structuredClone(APP_V2_MANIFEST);
+    abi3.runtime.abiVersion = 3;
+    const result = validateExecutableManifest(abi3);
+    assert.equal(result.ok, false);
+    assert.ok(
+      result.errors.some((error) =>
+        error.includes("runtime.abiVersion must be 1 or 2"),
+      ),
+    );
+  });
+
+  test("rejects PolkaVM manifests without graphics", () => {
+    const missingGraphics = structuredClone(APP_V2_MANIFEST);
+    delete missingGraphics.capabilities.graphics;
+    const result = validateExecutableManifest(missingGraphics);
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((error) => error.includes("graphics")));
   });
 });
 
@@ -219,7 +374,32 @@ describe("validateExecutableManifest — worker", () => {
       entrypoint: "index.js", includes: { chat: false, pocket: false },
     });
     assert.equal(result.ok, false);
-    assert.ok(result.errors.some(e => e.includes("at least one of chat / pocket")));
+    assert.ok(result.errors.some(e => e.includes("at least one of chat / pocket / funding")));
+  });
+
+  test("accepts a worker whose only ceiling is funding", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "worker", appVersion: [1, 0, 0],
+      entrypoint: "index.js", includes: { chat: false, pocket: false, funding: true },
+    });
+    assert.equal(result.ok, true);
+  });
+
+  test("accepts a worker record published before funding existed", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "worker", appVersion: [1, 0, 0],
+      entrypoint: "index.js", includes: { chat: false, pocket: true },
+    });
+    assert.equal(result.ok, true);
+  });
+
+  test("rejects a non-boolean funding ceiling", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "worker", appVersion: [1, 0, 0],
+      entrypoint: "index.js", includes: { chat: true, pocket: false, funding: "yes" },
+    });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes("includes.funding")));
   });
 
   test("rejects worker entrypoint with leading slash", () => {
@@ -270,6 +450,110 @@ describe("validateProductConfig", () => {
     assert.equal(result.ok, true);
   });
 
+  // #1487: an unknown top-level field must be reported, not silently
+  // dropped — a typo'd or unsupported key deploys green today and the
+  // field simply never reaches chain (this is how #1484 presented).
+  test("rejects an unknown top-level field", () => {
+    const result = validateProductConfig({ ...VALID_CONFIG, banana: "oops" });
+    assert.equal(
+      result.ok,
+      false,
+      ">> FAIL: validateProductConfig unknown-top-level-field: a config carrying an unrecognised top-level key must not validate silently",
+    );
+    assert.ok(
+      result.errors.some((e) => e.includes("unknown field 'banana'")),
+      `>> FAIL: validateProductConfig unknown-top-level-field: expected an error naming the offending field 'banana'; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  test("rejects a misspelled known field ('trustedProduct' singular) as unknown — the exact #1484 failure mode", () => {
+    const { trustedProducts, ...rest } = VALID_CONFIG;
+    const result = validateProductConfig({
+      ...rest,
+      trustedProduct: { dim2: ["context"] },
+    });
+    assert.equal(
+      result.ok,
+      false,
+      ">> FAIL: validateProductConfig typo-top-level-field: a typo'd field name (trustedProduct vs trustedProducts) must be reported, not silently ignored",
+    );
+    assert.ok(
+      result.errors.some((e) => e.includes("unknown field 'trustedProduct'")),
+      `>> FAIL: validateProductConfig typo-top-level-field: expected an error naming the typo'd field 'trustedProduct'; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  test("reports every unknown top-level field, not just the first", () => {
+    const result = validateProductConfig({
+      ...VALID_CONFIG,
+      banana: "oops",
+      kiwi: "also oops",
+    });
+    assert.equal(result.ok, false, ">> FAIL: validateProductConfig multiple-unknown-top-level-fields: expected rejection");
+    assert.ok(
+      result.errors.some((e) => e.includes("'banana'")) &&
+        result.errors.some((e) => e.includes("'kiwi'")),
+      `>> FAIL: validateProductConfig multiple-unknown-top-level-fields: expected an error naming each offending field; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  // A typo on a REQUIRED field is the case that compounds: the key is
+  // unknown AND the field it was meant to be is now missing, so the operator
+  // gets both messages. Worth pinning because the order matters — the
+  // unknown-field check runs first, so the actionable "you wrote 'domian'"
+  // leads and the generic "domain must be…" trails. The two tests above only
+  // typo an optional field, where the second message never fires.
+  test("a typo on a required field reports both the unknown key and the missing field", () => {
+    const { domain, ...rest } = VALID_CONFIG;
+    const result = validateProductConfig({ ...rest, domian: "myapp.dot" });
+    assert.equal(result.ok, false, ">> FAIL: validateProductConfig required-field-typo: expected rejection");
+    assert.ok(
+      result.errors.some((e) => e.includes("unknown field 'domian'")),
+      `>> FAIL: validateProductConfig required-field-typo: expected an error naming the typo'd key 'domian'; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+    assert.ok(
+      result.errors.some((e) => e.includes("domain must be")),
+      `>> FAIL: validateProductConfig required-field-typo: expected the missing-required-field error alongside the unknown-key one, so the operator sees what the key should have been; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  // Regression guard: the new top-level-field check must not interfere with
+  // the pre-existing, RFC-required strictness *within* known fields on this
+  // (publish) side — icon.format (RFC line 337) and a trustedProducts grant
+  // value (RFC line 338) both still MUST fail validation here, same as
+  // before #1487.
+  test("still rejects an unrecognised icon.format (RFC line 337 — strict on the publishing side, unchanged)", () => {
+    const result = validateProductConfig({
+      ...VALID_CONFIG,
+      icon: { path: "./icon.png", format: "webp" },
+    });
+    assert.equal(
+      result.ok,
+      false,
+      ">> FAIL: validateProductConfig icon-format-still-strict: publish-side icon.format strictness must be unaffected by the #1487 top-level-field fix",
+    );
+  });
+
+  test("still rejects an unrecognised trustedProducts grant value (RFC line 338 — strict on the publishing side, unchanged)", () => {
+    const result = validateProductConfig({
+      ...VALID_CONFIG,
+      trustedProducts: { dim2: ["some-future-grant"] },
+    });
+    assert.equal(
+      result.ok,
+      false,
+      ">> FAIL: validateProductConfig grant-value-still-strict: publish-side trustedProducts grant strictness must be unaffected by the #1487 top-level-field fix",
+    );
+  });
+
+  // The read-side tolerance for an unrecognised icon.format does not extend
+  // to the publish side — publishers MUST NOT emit an unrecognised format.
+  test("still rejects an unrecognised icon.format on the publish side", () => {
+    const result = validateProductConfig({ ...VALID_CONFIG, icon: { path: "./icon.png", format: "webp" } });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((e) => e.includes("icon.format")));
+  });
+
   test("rejects a domain without .dot suffix", () => {
     const result = validateProductConfig({ ...VALID_CONFIG, domain: "demoapp" });
     assert.equal(result.ok, false);
@@ -285,27 +569,59 @@ describe("validateProductConfig", () => {
       `>> FAIL: validateProductConfig .paseo: expected ok:true, got errors: ${JSON.stringify(result.ok ? [] : result.errors)}`);
   });
 
-  test("still rejects a domain ending in an unknown TLD", () => {
-    const result = validateProductConfig({ ...VALID_CONFIG, domain: "demoapp.example" });
-    assert.equal(result.ok, false,
-      ">> FAIL: validateProductConfig unknown TLD: 'demoapp.example' must still be rejected — only KNOWN_TLDS suffixes are valid");
+  // Domain validation is shape-based, not an enumerated TLD allowlist, so a
+  // network DotNS has never been configured for validates with no code
+  // change. This is the property that broke when previewnet's real TLD
+  // changed underneath a hardcoded allowlist in bulletin-deploy (#1241).
+  for (const tld of ["dot", "paseo", "example", "newnet"]) {
+    test(`accepts a domain ending in an arbitrary well-formed TLD (.${tld})`, () => {
+      const result = validateProductConfig({ ...VALID_CONFIG, domain: `demoapp.${tld}` });
+      assert.equal(
+        result.ok,
+        true,
+        `expected domain 'demoapp.${tld}' to validate; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+      );
+    });
+  }
+
+  test("accepts a subdomain under an arbitrary well-formed TLD", () => {
+    const result = validateProductConfig({ ...VALID_CONFIG, domain: "sub.demoapp.example" });
+    assert.equal(result.ok, true);
   });
 
-  // Keeps src/manifest/schema.ts's hand-copied KNOWN_TLDS list (documented as
-  // "kept in sync with dotns.ts's KNOWN_TLDS by hand") from silently drifting
-  // — schema.ts deliberately doesn't import dotns.ts (stays free of the
-  // polkadot-api dep), so nothing else would catch a divergence.
-  test("schema.ts's KNOWN_TLDS list stays in sync with dotns.ts's KNOWN_TLDS", () => {
-    const schemaSrc = readFileSync(fileURLToPath(new URL("../src/manifest/schema.ts", import.meta.url)), "utf8");
-    const m = schemaSrc.match(/const KNOWN_TLDS = \[([^\]]+)\] as const;/);
-    assert.ok(m, ">> FAIL: could not find schema.ts's KNOWN_TLDS declaration to compare");
-    const schemaTlds = m[1].split(",").map((s) => s.trim().replace(/^"|"$/g, "")).filter(Boolean);
-    assert.deepEqual(
-      schemaTlds.sort(),
-      [...DOTNS_KNOWN_TLDS].sort(),
-      `>> FAIL: KNOWN_TLDS drift: src/manifest/schema.ts has ${JSON.stringify(schemaTlds)} but src/dotns.ts has ${JSON.stringify(DOTNS_KNOWN_TLDS)} — a config domain valid on-chain could now fail schema validation, or vice versa`,
-    );
-  });
+  // bulletin-deploy #1449 (folded into #1443): subname depth is observed at
+  // deploy time (src/deploy.ts), not gated at schema-validation time —
+  // validateProductConfig accepts a product-config domain at any nesting
+  // depth, same as parseDomainName itself accepts any depth. There is no
+  // cap and no override flag anywhere in this CLI.
+  for (const domain of ["demoapp.dot", "worker.demoapp.dot", "worker.app.demoapp.dot", "a.b.c.d.dot"]) {
+    test(`accepts domain '${domain}' regardless of subname nesting depth`, () => {
+      const result = validateProductConfig({ ...VALID_CONFIG, domain });
+      assert.equal(
+        result.ok,
+        true,
+        `expected domain '${domain}' to validate; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+      );
+    });
+  }
+
+  for (const domain of [
+    "demoapp.d", // TLD shorter than 2 chars
+    "demoapp.d0t", // digit in TLD
+    "demoapp.do-t", // hyphen in TLD
+    "demoapp.12", // all-digit TLD
+    "demoapp.", // empty TLD
+    "-demoapp.dot", // label starts with hyphen
+    "demoapp-.dot", // label ends with hyphen
+    "my..app.dot", // empty label
+    "my_app.dot", // underscore not allowed
+  ]) {
+    test(`rejects malformed domain '${domain}'`, () => {
+      const result = validateProductConfig({ ...VALID_CONFIG, domain });
+      assert.equal(result.ok, false, `expected domain '${domain}' to be rejected`);
+      assert.ok(result.errors.some((e) => e.includes("domain")));
+    });
+  }
 
   test("rejects empty executables array", () => {
     const result = validateProductConfig({ ...VALID_CONFIG, executables: [] });
@@ -337,6 +653,32 @@ describe("validateProductConfig", () => {
     assert.equal(result.ok, false);
     assert.ok(result.errors.length >= 3);
   });
+});
+
+test("validateProductConfig accepts an App v2 manifest as the single version source", () => {
+  const result = validateProductConfig({
+    ...VALID_CONFIG,
+    executables: [
+      { kind: "app", path: "./dist/app", manifest: APP_V2_MANIFEST },
+    ],
+  });
+  assert.equal(result.ok, true, result.ok ? "" : result.errors.join("; "));
+});
+
+test("validateProductConfig rejects duplicate App version sources", () => {
+  const result = validateProductConfig({
+    ...VALID_CONFIG,
+    executables: [
+      {
+        kind: "app",
+        path: "./dist/app",
+        appVersion: [0, 1, 7],
+        manifest: APP_V2_MANIFEST,
+      },
+    ],
+  });
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes("exactly one")));
 });
 
 test("defineConfig returns its input unchanged", () => {
@@ -436,6 +778,50 @@ describe("preflightProductConfig", () => {
   });
 });
 
+test("preflight writes the exact App v2 text-record bytes into the artifact", async () => {
+  const dir = await mkTmp("pfl-app-v2-");
+  const config = {
+    ...VALID_CONFIG,
+    executables: [
+      { kind: "app", path: "./dist/app", manifest: APP_V2_MANIFEST },
+    ],
+  };
+  const cfgPath = path.join(dir, "product.config.mjs");
+  await fs.writeFile(cfgPath, `export default ${JSON.stringify(config)};`);
+  await fs.writeFile(path.join(dir, "icon.png"), "x");
+  await fs.mkdir(path.join(dir, "dist/app"), { recursive: true });
+
+  await preflightProductConfig({ path: cfgPath });
+
+  const embedded = await fs.readFile(path.join(dir, "dist/app/manifest.json"), "utf8");
+  assert.equal(embedded, JSON.stringify(APP_V2_MANIFEST));
+});
+
+test("publish rejects changed App v2 embedded bytes before network work", async () => {
+  const dir = await mkTmp("publish-app-v2-mismatch-");
+  const config = {
+    ...VALID_CONFIG,
+    executables: [
+      { kind: "app", path: "./dist/app", manifest: APP_V2_MANIFEST },
+    ],
+  };
+  await fs.mkdir(path.join(dir, "dist/app"), { recursive: true });
+  await fs.writeFile(path.join(dir, "dist/app/manifest.json"), "{}");
+
+  await assert.rejects(
+    () =>
+      publishManifest({
+        loaded: { config, sourcePath: path.join(dir, "bulletin-deploy.config.mjs") },
+        domain: config.domain,
+      }),
+    (error) => {
+      assert.match(error.message, /embedded manifest verification failed/);
+      assert.match(error.message, /differs/);
+      return true;
+    },
+  );
+});
+
 describe("assertWithinBudget", () => {
   test("ok when value fits", () => {
     const result = assertWithinBudget("k", "short", 100);
@@ -490,6 +876,264 @@ describe("pessimisticSizePreflight", () => {
     const report = pessimisticSizePreflight(config, 256);
     assert.equal(report.ok, false);
     assert.ok(report.checks.some(c => c.key.endsWith("#manifest") && !c.ok));
+  });
+
+  test("root check byte count agrees with composeRoot's own serialisation", () => {
+    // publish.ts and byte-budget.ts both compose the root manifest — this
+    // pins them to the same shared composer (src/manifest/compose.ts) so a
+    // future edit to one path can't silently drift from the other.
+    const report = pessimisticSizePreflight(VALID_CONFIG);
+    const rootCheck = report.checks.find((c) =>
+      c.key.endsWith("#manifest"),
+    );
+    assert.ok(rootCheck);
+    const expectedBytes = Buffer.byteLength(
+      JSON.stringify(composeRoot(VALID_CONFIG, PLACEHOLDER_CID)),
+      "utf8",
+    );
+    assert.equal(rootCheck.bytes, expectedBytes);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1484: composeRoot's normalizeTrustedProducts() decides what the host sees
+// as "no grants" (absence / {} / a per-key []), and pins the deterministic
+// key+grant ordering that keeps setTextRecord's skip-if-unchanged pre-check
+// working when a config is merely reordered, not substantively changed.
+// ---------------------------------------------------------------------------
+describe("composeRoot — trustedProducts (#1484)", () => {
+  test("includes an exact trustedProducts object when the config sets one", () => {
+    const config = { ...VALID_CONFIG, trustedProducts: { dim2: ["context"] } };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(manifest, {
+      $v: 1,
+      displayName: VALID_CONFIG.displayName,
+      description: VALID_CONFIG.description,
+      icon: { cid: PLACEHOLDER_CID, format: VALID_CONFIG.icon.format },
+      trustedProducts: { dim2: ["context"] },
+    });
+  });
+
+  test("omits trustedProducts entirely when the config doesn't set it", () => {
+    const manifest = composeRoot(VALID_CONFIG, PLACEHOLDER_CID);
+    assert.equal(
+      "trustedProducts" in manifest,
+      false,
+      ">> FAIL: composeRoot trustedProducts-absent: field must not appear on the manifest at all when the config never sets it",
+    );
+  });
+
+  test("omits trustedProducts when the config sets an empty object", () => {
+    const config = { ...VALID_CONFIG, trustedProducts: {} };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.equal(
+      "trustedProducts" in manifest,
+      false,
+      ">> FAIL: composeRoot trustedProducts-empty-object: {} must normalize to field-absent, not an empty-object literal",
+    );
+  });
+
+  test("omits trustedProducts when every key's grant array is empty", () => {
+    const config = { ...VALID_CONFIG, trustedProducts: { dim2: [] } };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.equal(
+      "trustedProducts" in manifest,
+      false,
+      ">> FAIL: composeRoot trustedProducts-per-key-empty: a key with an empty grant array must be dropped, and dropping the only key must drop the field entirely",
+    );
+  });
+
+  test("de-duplicates grants within a key", () => {
+    const config = {
+      ...VALID_CONFIG,
+      trustedProducts: { dim2: ["context", "context"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(manifest.trustedProducts, { dim2: ["context"] });
+  });
+
+  test("sorts keys and grants so config ordering doesn't affect the serialised record", () => {
+    const configA = {
+      ...VALID_CONFIG,
+      trustedProducts: { zed: ["storage", "all"], alpha: ["context"] },
+    };
+    const configB = {
+      ...VALID_CONFIG,
+      trustedProducts: { alpha: ["context"], zed: ["all", "storage"] },
+    };
+    assert.equal(
+      JSON.stringify(composeRoot(configA, PLACEHOLDER_CID)),
+      JSON.stringify(composeRoot(configB, PLACEHOLDER_CID)),
+      ">> FAIL: composeRoot trustedProducts-ordering: differently-ordered but equivalent configs must serialise identically, or setTextRecord's skip-if-unchanged pre-check would bill a pointless on-chain write on every reorder",
+    );
+  });
+
+  // RFC line 142: "all" is a superset, not a peer — ["all", "storage"] IS
+  // ["all"]. Collapsing it both saves bytes against the only unbounded field
+  // in the 1024-byte budget, and keeps a purely cosmetic tidy-up from
+  // producing different bytes and defeating setTextRecord's
+  // skip-if-unchanged pre-check.
+  test("collapses a grant array containing 'all' down to exactly ['all']", () => {
+    const config = {
+      ...VALID_CONFIG,
+      trustedProducts: { dim2: ["all", "storage"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { dim2: ["all"] },
+      ">> FAIL: composeRoot trustedProducts-all-superset: ['all','storage'] must collapse to ['all'] per RFC 142",
+    );
+  });
+
+  test("leaves a grant array of just ['all'] unchanged", () => {
+    const config = { ...VALID_CONFIG, trustedProducts: { dim2: ["all"] } };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { dim2: ["all"] },
+      ">> FAIL: composeRoot trustedProducts-all-alone: ['all'] must stay ['all']",
+    );
+  });
+
+  test("leaves a grant array with no 'all' unchanged apart from sorting", () => {
+    const config = {
+      ...VALID_CONFIG,
+      trustedProducts: { dim2: ["storage", "context"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { dim2: ["context", "storage"] },
+      ">> FAIL: composeRoot trustedProducts-no-all: a grant array without 'all' must keep every recognised value, just sorted",
+    );
+  });
+
+  // RFC line 143: "A product listing itself is ignored." composeRoot has the
+  // full ProductConfig in hand, so the product's own bare label — domain up
+  // to the first '.' — is knowable without a chain call.
+  test("drops a key equal to the product's own label", () => {
+    const config = {
+      ...VALID_CONFIG, // domain: "demoapp.dot"
+      trustedProducts: { demoapp: ["all"], wallet: ["storage"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { wallet: ["storage"] },
+      ">> FAIL: composeRoot trustedProducts-self-listing: a key equal to the product's own bare label must be dropped per RFC 143",
+    );
+  });
+
+  test("omits trustedProducts entirely when the only key is the self-listing", () => {
+    const config = {
+      ...VALID_CONFIG, // domain: "demoapp.dot"
+      trustedProducts: { demoapp: ["all"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.equal(
+      "trustedProducts" in manifest,
+      false,
+      ">> FAIL: composeRoot trustedProducts-self-listing-only-key: dropping the only key (the self-listing) must omit the field entirely, exactly like {}",
+    );
+  });
+
+  test("drops a self-listing key case-insensitively", () => {
+    const config = {
+      ...VALID_CONFIG, // domain: "demoapp.dot"
+      trustedProducts: { demoapp: ["all"], wallet: ["storage"] },
+    };
+    const upperDomainConfig = { ...config, domain: "DemoApp.dot" };
+    const manifest = composeRoot(upperDomainConfig, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { wallet: ["storage"] },
+      ">> FAIL: composeRoot trustedProducts-self-listing-case-insensitive: the self-listing match between config.domain's label and a trustedProducts key must be case-insensitive",
+    );
+  });
+
+  // Subname depth is deliberately unchecked (#1449), so a config domain can
+  // carry a modality subname. The product is then the label under the TLD,
+  // not the first one — reading the first segment would drop a grant issued
+  // to a different product that happens to share that subname's name.
+  test("takes the self-label from under the TLD, not the first segment, on a deep domain", () => {
+    const config = {
+      ...VALID_CONFIG,
+      domain: "worker.demoapp.dot",
+      trustedProducts: { worker: ["storage"], demoapp: ["all"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { worker: ["storage"] },
+      ">> FAIL: composeRoot trustedProducts-self-listing-deep-domain: on 'worker.demoapp.dot' the product is 'demoapp', so only that key may be dropped — dropping 'worker' would silently lose a grant to an unrelated product of that name",
+    );
+  });
+});
+
+describe("pessimisticSizePreflight — trustedProducts (#1484)", () => {
+  // Many keys x all three grants each, so the composed root JSON grows well
+  // past a small explicit budget without relying on BULLETIN_TEXT_BUDGET.
+  function bigTrustedProducts(n) {
+    const out = {};
+    for (let i = 0; i < n; i++) {
+      out[`product${String(i).padStart(3, "0")}dim`] = [
+        "all",
+        "storage",
+        "context",
+      ];
+    }
+    return out;
+  }
+
+  test("a large trustedProducts pushes the #manifest check over budget", () => {
+    const config = {
+      ...VALID_CONFIG,
+      trustedProducts: bigTrustedProducts(20),
+    };
+    const bytesWithField = Buffer.byteLength(
+      JSON.stringify(composeRoot(config, PLACEHOLDER_CID)),
+      "utf8",
+    );
+    const budget = bytesWithField - 1;
+
+    const report = pessimisticSizePreflight(config, budget);
+    const manifestCheck = report.checks.find((c) =>
+      c.key.endsWith("#manifest"),
+    );
+    assert.ok(manifestCheck, ">> FAIL: pessimisticSizePreflight trustedProducts-over-budget: expected a '#manifest' check in the report");
+    assert.equal(
+      manifestCheck.ok,
+      false,
+      ">> FAIL: pessimisticSizePreflight trustedProducts-over-budget: composeRoot's shared use in the preflight must count trustedProducts bytes, but the #manifest check still passed",
+    );
+    assert.equal(report.ok, false);
+  });
+
+  test("the same budget passes once trustedProducts is absent (mirror)", () => {
+    const configWithField = {
+      ...VALID_CONFIG,
+      trustedProducts: bigTrustedProducts(20),
+    };
+    const bytesWithField = Buffer.byteLength(
+      JSON.stringify(composeRoot(configWithField, PLACEHOLDER_CID)),
+      "utf8",
+    );
+    const budget = bytesWithField - 1;
+
+    const configWithoutField = { ...VALID_CONFIG };
+    delete configWithoutField.trustedProducts;
+
+    const report = pessimisticSizePreflight(configWithoutField, budget);
+    const manifestCheck = report.checks.find((c) =>
+      c.key.endsWith("#manifest"),
+    );
+    assert.ok(manifestCheck, ">> FAIL: pessimisticSizePreflight trustedProducts-absent-mirror: expected a '#manifest' check in the report");
+    assert.equal(
+      manifestCheck.ok,
+      true,
+      ">> FAIL: pessimisticSizePreflight trustedProducts-absent-mirror: the same budget that failed with trustedProducts present must pass once it's absent",
+    );
   });
 });
 
@@ -616,6 +1260,28 @@ describe("formatConfigLoadError — pure helper", () => {
     const message = formatConfigLoadError("/proj/polkadot-app-deploy.config.ts", "plain string throw");
     assert.match(message, /threw while loading: plain string throw\./, `>> FAIL: formatConfigLoadError non-Error throw: expected stringified value (got "${message}")`);
   });
+});
+
+// The schema validator no longer enumerates TLDs (shape only), so a typo'd
+// TLD like ".dto" validates as well-formed and reaches the publish layer.
+// This guard is the only thing that names the mismatch; uncaught, the full
+// mismatched domain flows into ensureContentResolver, which appends the env
+// TLD again and namehashes a compound nobody owns, surfacing as an opaque
+// not-the-owner revert from deep inside a chain call.
+describe("manifest/publish.ts: the wrong-env-TLD guard", () => {
+  for (const { domain, tld, expected, why } of [
+    { domain: "myapp.paseo", tld: "paseo", expected: true, why: "the env's own TLD must pass" },
+    { domain: "myapp.dto", tld: "paseo", expected: false, why: "a typo'd TLD must be rejected here — the schema validator no longer enumerates TLDs" },
+    { domain: "myapp.dot", tld: "paseo", expected: false, why: "another environment's real TLD is still wrong for THIS env" },
+    { domain: "MyApp.PASEO", tld: "paseo", expected: true, why: "must match case-insensitively, like stripTldSuffix and DOMAIN_RE" },
+    { domain: "paseo", tld: "paseo", expected: false, why: "the bare TLD carries no label, so it is a mismatch not a match" },
+    { domain: "myapp.paseo.dot", tld: "paseo", expected: false, why: "the TLD must be the FINAL segment, not merely present" },
+  ]) {
+    test(`domainMatchesEnvTld("${domain}", "${tld}") === ${expected}`, () => {
+      assert.strictEqual(domainMatchesEnvTld(domain, tld), expected,
+        `>> FAIL: manifest/publish.ts domainMatchesEnvTld("${domain}", "${tld}") should be ${expected}: ${why}`);
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -772,6 +1438,9 @@ describe("publishManifest — Bulletin endpoint resolution (#1094)", () => {
     const loaded = {
       config: {
         ...VALID_CONFIG,
+        // #1572: must carry the DEFAULT env's real TLD (the fork's devnet ->
+        // "dot") — otherwise the env-TLD guard fires before this test ever
+        // reaches the icon read it means to exercise.
         domain: "manifestrpctest.dot",
         icon: { path: "./missing-icon.png", format: "png" },
         executables: [],
@@ -793,5 +1462,157 @@ describe("publishManifest — Bulletin endpoint resolution (#1094)", () => {
       ["wss://bulletin-paseo.tservices.es:8443", "wss://bullet.sik.rocks"],
       ">> FAIL: publishManifest #1094 default-env: omitting --env must still resolve to devnet's OWN Bulletin endpoints, not the unrelated DEFAULT_BULLETIN_RPC seed constant",
     );
+  });
+});
+
+describe("reconcileManifestDomain (#1572)", () => {
+  test("bare CLI label + suffixed config domain matches (documented normal case)", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.doesNotThrow(
+      () => reconcileManifestDomain("myapp.dot", "myapp", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
+      ">> FAIL: reconcileManifestDomain bare-label-matches-suffixed-config: a bare CLI label naming the same target as a .<tld>-suffixed config domain must not throw",
+    );
+  });
+
+  test("both sides suffixed and identical matches", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.doesNotThrow(
+      () => reconcileManifestDomain("myapp.dot", "myapp.dot", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
+      ">> FAIL: reconcileManifestDomain both-sides-suffixed-identical: two identical, already-suffixed domains must not throw",
+    );
+  });
+
+  test("different labels throws, naming both raw values", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.throws(
+      () => reconcileManifestDomain("padtesting-pr2.dot", "padtesting-pr", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
+      (error) => {
+        assert.match(error.message, /padtesting-pr2/,
+          ">> FAIL: reconcileManifestDomain different-labels-names-both: error must name the config's raw domain value");
+        assert.match(error.message, /padtesting-pr\b/,
+          ">> FAIL: reconcileManifestDomain different-labels-names-both: error must name the deploy target's raw value");
+        return true;
+      },
+      ">> FAIL: reconcileManifestDomain different-labels-names-both: two genuinely different labels must throw",
+    );
+  });
+
+  test("config domain carrying the wrong environment's TLD throws (does not weaken the env-TLD guard)", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.throws(
+      () => reconcileManifestDomain("myapp.dot", "myapp", "paseo", "/cfg/polkadot-app-deploy.config.mjs"),
+      /does not end in this environment's DotNS TLD/,
+      ">> FAIL: reconcileManifestDomain wrong-env-tld-still-rejected: a config domain whose TLD is not the current env's TLD must still throw, even though both sides name the same label",
+    );
+  });
+
+  test("deploy argument carrying a different known TLD throws", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.throws(
+      () => reconcileManifestDomain("myapp.dot", "myapp.paseo", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
+      undefined,
+      ">> FAIL: reconcileManifestDomain deploy-arg-wrong-known-tld: a deploy argument suffixed with a DIFFERENT known TLD than the env's must throw, not silently misparse",
+    );
+  });
+
+  test("case differences match case-insensitively", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.doesNotThrow(
+      () => reconcileManifestDomain("MyApp.DOT", "myapp", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
+      ">> FAIL: reconcileManifestDomain case-insensitive-match: differently-cased domains naming the same target must not throw",
+    );
+  });
+
+  test("trailing-digit label (myapp2) bare vs suffixed config matches", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.doesNotThrow(
+      () => reconcileManifestDomain("myapp2.dot", "myapp2", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
+      ">> FAIL: reconcileManifestDomain trailing-digit-label-matches: a bare label ending in a digit must match its suffixed config counterpart unchanged",
+    );
+  });
+
+  test("subdomain-shaped deploy target matches an identically-shaped config domain", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.doesNotThrow(
+      () => reconcileManifestDomain("app.myapp.dot", "app.myapp", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
+      ">> FAIL: reconcileManifestDomain subdomain-shape-matches: a nested subname must normalize and compare the same as a top-level label",
+    );
+  });
+});
+
+describe("manifestSignerOptions", () => {
+  const MNEMONIC = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+
+  test("passes the mnemonic through when no product name is set", () => {
+    assert.deepEqual(manifestSignerOptions({ mnemonic: MNEMONIC, derivationPath: "//a" }), { mnemonic: MNEMONIC, derivationPath: "//a" });
+  });
+
+  test("signs manifest writes as the product account under --product-name", () => {
+    const r = manifestSignerOptions({ mnemonic: MNEMONIC, productName: "uid.paseo" });
+    assert.equal(r.signerAddress, deriveProductSigner(MNEMONIC, "uid.paseo").ss58,
+      ">> FAIL: setResolver on the registry is owner-only; the manifest must be signed by the same account deploy() registered the name with");
+    assert.equal(r.mnemonic, undefined);
+    assert.equal(r.localSigner, true);
+  });
+});
+
+// Issue #1495. The manifest's icon and executables are billed to the storage account's Bulletin
+// quota, so they must be stored by the SAME account the content upload used — on a chain whose
+// shared pool holds no quota (no testnet authorizer), any divergence is a deploy that writes its
+// content and then fails, or silently skips, the manifest half.
+//
+// publishManifest cannot call deploy()'s resolution directly (it runs as a separate step, from
+// its own options), so the property under test is that both paths feed
+// selectStorageReconnect the same thing: this asserts manifestSignerOptions' output resolves to
+// the identical provider mode AND account as the options deploy() would hold at that point.
+describe("publishManifest — storage identity matches the content upload (#1495)", () => {
+  const PHRASE = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+
+  test("--mnemonic: both halves upload from the deployer's own account", () => {
+    const manifest = manifestSignerOptions({ mnemonic: PHRASE, derivationPath: "//deploy/3" });
+    // What deploy() holds for the same invocation: no product name, no slot, so the mnemonic
+    // passes through untouched (src/deploy.ts's resolveProductSigner returns null).
+    const content = { mnemonic: PHRASE, derivationPath: "//deploy/3" };
+    assert.equal(__selectStorageProviderModeForTest(manifest), "direct");
+    assert.equal(__selectStorageProviderModeForTest(manifest), __selectStorageProviderModeForTest(content));
+    assert.equal(manifest.mnemonic, content.mnemonic);
+    assert.equal(manifest.derivationPath, content.derivationPath);
+  });
+
+  test("--product-name: the manifest stores from the product account, not the root mnemonic", () => {
+    const manifest = manifestSignerOptions({ mnemonic: PHRASE, productName: "getcash" });
+    // deploy() applies exactly this before selecting storage:
+    //   options = { ...options, ...resolveProductSigner(options) }
+    const content = { mnemonic: PHRASE, ...resolveProductSigner({ productName: "getcash", mnemonic: PHRASE }) };
+    assert.equal(__selectStorageProviderModeForTest(manifest), "signer",
+      ">> FAIL: under --product-name deploy() stores content from the product account (it swaps the signer before selecting storage). A manifest that falls back to the mnemonic's root account needs a second Bulletin grant nobody provisions.");
+    assert.equal(__selectStorageProviderModeForTest(manifest), __selectStorageProviderModeForTest(content));
+    assert.equal(manifest.signerAddress, content.signerAddress,
+      ">> FAIL: the manifest's icon and executables must be stored by the same account as the content — the product account that owns the name.");
+    assert.equal(manifest.signerAddress, deriveProductSigner(PHRASE, "getcash").ss58);
+    assert.equal(manifest.mnemonic, undefined,
+      ">> FAIL: leaving the mnemonic set would let it win the storage precedence over the product signer.");
+  });
+
+  test("login session: the allowance slot carries over to the manifest", () => {
+    const slot = { storageSigner: { sign: () => {} }, storageSignerAddress: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY" };
+    const manifest = manifestSignerOptions({ ...slot });
+    assert.equal(__selectStorageProviderModeForTest(manifest), "storageSigner",
+      ">> FAIL: a signed-in deploy stores content on the user's own Bulletin allowance slot; without the slot here the manifest silently falls back to the shared pool.");
+    assert.equal(manifest.storageSignerAddress, slot.storageSignerAddress);
+  });
+
+  test("slot outranks the mnemonic, exactly as it does in deploy()", () => {
+    const manifest = manifestSignerOptions({
+      mnemonic: PHRASE,
+      storageSigner: { sign: () => {} },
+      storageSignerAddress: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+    });
+    assert.equal(__selectStorageProviderModeForTest(manifest), "storageSigner",
+      ">> FAIL: storage precedence is storageSigner > signer > mnemonic > pool on both paths; diverging here puts the two halves of one deploy on different accounts.");
+  });
+
+  test("no credentials at all: the shared pool is still the fallback", () => {
+    assert.equal(__selectStorageProviderModeForTest(manifestSignerOptions({})), "pool");
   });
 });

@@ -23,18 +23,6 @@ The same applies to `--mnemonic`: pass the pool root mnemonic whose `//deploy/N`
 
 Note that the `bulletinAuthorizer` fallback only applies when `--env` is passed — a bare `polkadot-app-bootstrap` with neither `--env` nor `--authorizer` has no environment to read a fallback from, so it also prints "no known authorizer" rather than defaulting to anything.
 
-### Environment config: Browse Publisher contract
-
-Bootstrap grants **Bulletin storage** authorization only. Listing apps in **Browse** is a separate, Asset-Hub-side capability provided by the `Publisher` contract, and it is configured in `environments.json` — not by this CLI. When you stand up a new environment, check both.
-
-Make sure the env's `contracts` map in `environments.json` includes a **`PUBLISHER`** entry pointing at the Browse Publisher deployed on that environment's Asset Hub. Whether `--publish` does anything is gated purely on that field being present and non-zero — there's no separate allowlist of which environment IDs support it. If it is missing (or zero), `polkadot-app-deploy --publish --env <id>` prints `Publish: not supported on this environment — will be skipped` and silently does nothing: apps deploy but never appear in Browse.
-
-Checklist for a new environment:
-
-1. Confirm the Browse `Publisher` contract is deployed on the env's Asset Hub — there is bytecode at the address, `owner()` is the products deployer, and `isPublished(labelhash)` returns `true` for an already-listed app (and `false` for a control label).
-2. Add its address to the env's `contracts.PUBLISHER` in `environments.json`, alongside the other `contracts` entries. It must be a valid, non-zero EVM address (the deploy CLI validates the format).
-3. Verify: a deploy with `--publish --env <id>` lists the app and does **not** print the "not supported" message.
-
 ## Usage
 
 ```bash
@@ -45,7 +33,7 @@ Options:
 
 | Flag | What it does |
 |---|---|
-| `--mnemonic "..."` | Pool root mnemonic used to derive the pool accounts. Also readable from `BULLETIN_POOL_MNEMONIC`, then `MNEMONIC`. Defaults to the well-known dev phrase — the same key the deploy path uses. |
+| `--mnemonic "..."` | Pool root mnemonic used to derive the pool accounts. Also readable from `BULLETIN_POOL_MNEMONIC`. Defaults to the well-known dev phrase — the same key, read the same way, as the deploy path (`resolvePoolMnemonic` in `src/pool.ts` is the one resolver both use). `MNEMONIC` is deliberately **not** consulted: it names the DotNS signing account, and honouring it here authorized a set of `//deploy/N` accounts no deploy ever uploads from. Bootstrap warns when `MNEMONIC` is set and `BULLETIN_POOL_MNEMONIC` is not, and prints the derived `//deploy/0` so you can compare it against the deploy's own "Using pool account 0: <ss58>" line. |
 | `--authorizer "..."` | Seed/mnemonic of the key that holds authorization authority on this chain (e.g. `//Alice`, a full mnemonic, or a hex seed). If omitted, falls back to the `--env`'s declared `bulletinAuthorizer` (e.g. `//Alice` on `paseo-next-v2`); if the env declares none (or `--env` isn't given), the run is status-only. |
 | `--rpc wss://...` | Override the Bulletin RPC endpoint. Also readable from `BULLETIN_RPC`. |
 | `--env <id>` | Load environment by id from `environments.json` (sets the default RPC). |

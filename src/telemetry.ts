@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import pkg from "../package.json";
+import { SHIPPED_CONFIG_ORIGIN, FALLBACK_CONFIG_ORIGIN } from "./errors.js";
 import { maybeWriteMemoryReport, sampleFromBytes, type MemorySampleMb, type DeployContextForReport, type MemoryReport } from "./memory-report.js";
 import { writeRunState } from "./run-state.js";
 import type { CodePath } from "./code-paths.js";
@@ -163,8 +164,15 @@ export function markRelaunchOomHintShown(): void {
 
 // Awaitable Sentry flush-and-close. Exposed so the CLI signal handlers can
 // await the flush before calling process.exit — fire-and-forget loses the
-// trace when the process exits before the transport completes.
+// trace when the process exits before the transport completes. An open root
+// span is ended first: a span that never ends is never sent.
 export async function closeTelemetry(timeoutMs: number): Promise<void> {
+  if (deployRootSpan) {
+    // No sampleMemory: it would overwrite the run-state lastStage with "end".
+    if (deployRootSpan === deploySpan) deployRootSpan.setAttribute("deploy.outcome", computeDeployOutcome(currentErrorCategory, currentDeploySad, currentSadReason));
+    deployRootSpan.end();
+    deployRootSpan = null;
+  }
   if (!Sentry) return;
   try {
     await Sentry.close(timeoutMs);
@@ -192,6 +200,9 @@ export function initTelemetry(): void {
     // Sentry Node SDK captures os.hostname() by default, which leaks personal
     // machine names (e.g. "Mac.fritz.box"). Override to something anonymous.
     serverName: process.env.CI ? (process.env.RUNNER_NAME ?? "ci") : "local",
+    // Library mode registers no uncaughtException listener, so Sentry's fatal
+    // handler is what exits the process; report the deploy as failed first.
+    integrations: [Sentry.onUncaughtExceptionIntegration({ onFatalError: exitOnFatalError })],
     beforeSend(event) {
       if (event.server_name) event.server_name = process.env.CI ? (process.env.RUNNER_NAME ?? "ci") : "local";
       if (event.message) event.message = scrubPaths(event.message);
@@ -334,6 +345,15 @@ const DEPLOY_SEED_POOL: Record<string, number> = {
   "deploy.pool.nonce_collision_reupload_count": 0,
 };
 
+// #1637: pool accounts skipped because their pending-tx queue was stuck
+// (system_accountNextIndex far ahead of the on-chain nonce). Comma-joined pool
+// indices, "none" when nothing was skipped. A string seed, unlike
+// DEPLOY_SEED_POOL, so count_if(deploy.pool.stuck_skipped, "none") has a
+// denominator on every span.
+const DEPLOY_SEED_POOL_HEALTH: Record<string, string> = {
+  "deploy.pool.stuck_skipped": "none",
+};
+
 // Manifest fetch outcome. Seeded so every span carries the attributes even when
 // fetchPreviousManifest is never reached (first deploy, early error, non-incremental path).
 // "none" + "0" form the denominator for ratio queries.
@@ -387,6 +407,7 @@ export function getDeployAttributes(domain: string): Record<string, string | num
     ...DEPLOY_SEED_STORAGE,
     ...DEPLOY_SEED_PROBE,
     ...DEPLOY_SEED_POOL,
+    ...DEPLOY_SEED_POOL_HEALTH,
     ...DEPLOY_SEED_MANIFEST,
     ...DEPLOY_SEED_BULLETIN_UPLOAD,
     ...DEPLOY_SEED_RECEIPTS,
@@ -399,6 +420,15 @@ export function getDeployAttributes(domain: string): Record<string, string | num
     "deploy.tool_version": VERSION,
     "deploy.runner": resolveRunner(),
     "deploy.runner_type": resolveRunnerType(),
+    // #1646: the telemetry verifier scopes its Sentry query to the current CI run
+    // with these (strings, present on every span: both-values rule).
+    "deploy.ci_run_id": process.env.GITHUB_RUN_ID || "none",
+    "deploy.ci_run_attempt": process.env.GITHUB_RUN_ATTEMPT || "none",
+    // bulletin #1626: the E2E harness sets PAD_E2E_EXPECT_FAIL=1 on a deploy it
+    // asserts will fail (S3 owned-elsewhere, governance-reserved, subdomain
+    // orphan…), so the E2E dashboard can exclude those deliberate error spans.
+    // A tag only: nothing else reads the var. Unconditional (both-values rule).
+    "deploy.expected_error": String(process.env.PAD_E2E_EXPECT_FAIL === "1"),
   };
   if (hostApp) attrs["deploy.host_app"] = hostApp;
   const hostAppVersion = process.env.PAD_HOST_APP_VERSION;
@@ -406,22 +436,48 @@ export function getDeployAttributes(domain: string): Record<string, string | num
   return attrs;
 }
 
+const CONTRACT_ADDRESS_FAILURE = /no contract deployed at|invalid contract address for|contract call returned empty data/i;
+
+// Read from the same constants describeContractSources formats, so a reword
+// there cannot leave this matching a string nobody produces any more.
+function cameFromOurConfig(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return lower.includes(`came from ${SHIPPED_CONFIG_ORIGIN.toLowerCase()}`)
+    || lower.includes(`came from ${FALLBACK_CONFIG_ORIGIN.toLowerCase()}`);
+}
+
+// #1363: nonInteractivePhoneConfirmationError's (src/deploy.ts) fixed message
+// prefix. Shared with the ERROR_KIND_RULES entry further down so the two
+// classifications can't independently drift out of sync with a future
+// reword of that message — only one string to update.
+const PHONE_NONINTERACTIVE_FRAGMENT = "phone confirmation required for .+ but this run is non-interactive";
+
+// Context-dependent attribution for the contract-address kinds. A wrong contract
+// address is the operator's only when it came from their own file or --contract.
+// A bad address in a config we ship is our failure and stays visible; with no
+// stated origin we cannot tell, so it stays visible too ('unknown' prompts a bug
+// report). "Could not determine the DotNS ABI profile" is a chain-generation
+// problem outside the tool, hence environment.
+function contractAddressCategory(msg: string): DeployErrorCategory {
+  if (CONTRACT_ADDRESS_FAILURE.test(msg) && /this address came from/i.test(msg) && !cameFromOurConfig(msg)) return 'user';
+  return /could not determine the DotNS ABI profile/i.test(msg) ? 'environment' : 'unknown';
+}
+
+// The single place a mechanism kind becomes a fault category: the flat
+// ERROR_KIND_CATEGORY map, except where attribution depends on the message.
+function categoryOf(kind: DeployErrorKind, msg: string): DeployErrorCategory {
+  if (kind === 'naming.contract_unavailable' || kind === 'naming.contract_function_removed') return contractAddressCategory(msg);
+  return ERROR_KIND_CATEGORY[kind];
+}
+
 export function isExpectedError(msg: string): boolean {
-  // "cannot register it" (#1185): formatUnregistrableReason's distinctive
-  // phrase, common to all three classifyRegistrability rules (trailing-digits,
-  // hyphen-base, reserved-base) and both ownership branches. Without it, the
-  // trailing-digits variant has no other matching pattern here and would
-  // fall through to a bug-report prompt for a plain operator naming mistake.
-  return /personhood|owned by|owner mismatch|reserved for original|invalid domain label|not authorized for bulletin|insufficient balance|insufficient funds|quota exhausted|insufficient .* authorization|bip39 mnemonic|ipfs cli not installed|base name is \d+ chars|cannot register it|NameNotAvailable|name must be lowercase/i.test(msg);
+  return classifyDeployError(msg) === 'user';
 }
 
 export type DeployErrorCategory = 'user' | 'environment' | 'internal' | 'unknown';
 
 export function classifyDeployError(msg: string): DeployErrorCategory {
-  if (isExpectedError(msg)) return 'user';
-  if (/chunk.*failed after.*retr|tx dropped from best chain|timed out after \d+s waiting for block|Contract reverted|Contract execution would revert|dotns register failed|All promises were rejected|"type"\s*:\s*"Invalid"|Commitment still too new|not finalised after \d+s|chain may have (dropped|evicted)|ReviveApi.*timed out|ReviveApi.*returned empty result|\b(?:commit|register|setSubnodeOwner|setResolver|setContenthash|setText|publish|unpublish|Revive\.call|Utility\.batch_all) timed out after \d+ms|transaction watcher silent for/i.test(msg)) return 'environment';
-  if (/javascript heap out of memory|allocation failed.*heap|External signer mode is not supported with dotns-cli/i.test(msg)) return 'internal';
-  return 'unknown';
+  return categoryOf(classifyErrorKind(msg), msg);
 }
 
 export function classifySadReason(message: string): string {
@@ -458,17 +514,39 @@ export function computeDeployOutcome(
 //   connection                     — WS disconnect, heartbeat timeout, ChainHead disjointed
 //   naming.pop_required            — label requires ProofOfPersonhoodFull but signer is NoStatus
 //   naming.nostatus_required       — label requires NoStatus but signer has ProofOfPersonhood
-//   naming.contract_unavailable    — DotNS contract ABI call returned zero data (contract not deployed or wrong address)
+//   naming.contract_unavailable    — no contract at the probed address: an ABI call returned zero data, classifyProtocolVersion's hasCode===false, or the environment config carries a wrong/absent address
+//   naming.contract_function_removed — the DotNS ABI profile could not be determined although code may be present: the probed accessors did not answer (an unrecognised chain generation). p-a-d carries only this rule of bulletin's #1345 split
 //   dotns.abi_decode_empty          — raw ABI decode of zero/empty ("0x") data outside the DotNS-guard wrapper path
 //   naming.already_owned           — domain is already owned by a different EVM address
 //   naming.governance_reserved     — label DotNS naming rules forbid registering (Reserved/trailing-digit/hyphen-base), decided by ownership in preflight (#1185)
+//   naming.short_names_closed      short base refused because PopRules.shortNamesEnabled is off. Not a personhood problem; only the PopRules owner can open the band
+//   naming.soulbound               — name was issued through the PoP gateway and is permanently non-transferable (DotnsRegistrar.isSoulbound, v0.6.0+)
 //   naming.subdomain_orphan        — subdomain parent is owned by a different address
+//   naming.tld_mismatch            — local namehash(tld) disagrees with the on-chain DotnsProtocolRegistry.tldNode()
+//   funding.insufficient_balance   — the DotNS signer's free balance is below what the operation needs ("insufficient balance", "insufficient funds", "signer balance ... < estimated fee")
+//   funding.transfer_failed        — Revive TransferFailed module error: the signer's balance was spent between the preflight check and execution (typically concurrent deploys sharing one signer)
+//   naming.invalid_label           — label violates DotNS charset/length rules (invalid domain label, PopError "Name must be lowercase ..."); operator typo
+//   naming.name_unavailable        — contract reverted NameNotAvailable: the name is taken or otherwise not registrable
+//   signer.invalid_mnemonic        — the supplied mnemonic is not valid BIP39
+//   storage.allowance_insufficient — Bulletin allowance too small for the upload ("insufficient ... authorization"). Named without the Sentry-masked substring, see storage.rejected
+//   tool.ipfs_missing              — the ipfs CLI is required (kubo merkleizer) but not installed
+//   tool.out_of_memory             — the Node process ran out of heap
+//   tool.external_signer_unsupported — external signer mode combined with dotns-cli, which does not support it
+//   chain.chunk_failed             — a chunk upload failed after its retry budget and no more specific cause was recognised
+//   chain.chunk_unverified        — the best-block TransactionByContentHash probe gave no answer, so chunk inclusion could not be verified
+//   chain.chunk_not_included      — the chain accepts the account's txs but still has not included the chunk after the re-upload rounds
+//   chain.queue_stuck             — the signer's pending-tx queue is stuck behind a head tx the node is not including (pinned pool account or direct signer)
+//   chain.tx_dropped               — tx dropped from best chain / chain may have dropped or evicted the extrinsic
+//   chain.tx_invalid               — extrinsic rejected with a generic Invalid::* error not covered by a specific kind
+//   chain.not_finalised            — an extrinsic did not finalise within the wait budget
+//   dotns.register_failed          — wrapper "dotns register failed" whose nested cause matched no more specific kind
+//   network.endpoints_failed       — every RPC endpoint rejected ("All promises were rejected")
 //   verify.contenthash_mismatch    — post-deploy on-chain contenthash differs from what was written
 //   verify.dagpb_not_finalised     — DAG-PB root not finalised; chain may have dropped the extrinsic
 //   network.recovery_exhausted     — retry budget exhausted after too many recovery attempts
 //   account.mapping_pending        — EVM account auto-mapping submitted but not yet reflected on-chain
 //   chain.api_timeout              — ReviveApi call timed out (EVM address resolution)
-//   chain.tx_timeout               — outer per-op budget hit during signed-tx submission (commit / register / setSubnodeOwner / setResolver / setContenthash / setText / publish / unpublish / Revive.call / Utility.batch_all)
+//   chain.tx_timeout               — outer per-op budget hit during signed-tx submission (commit / register / setSubnodeOwner / setResolver / setContenthash / setText / Revive.call / Utility.batch_all)
 //   chain.tx_silent                — signSubmitAndWatch observable emitted no events for the no-progress threshold; watchdog tripped
 //   chain.extrinsic_expired        — tx rejected because the mortality window passed (AncientBirthBlock)
 //   chain.quota_exhausted          — Bulletin chain storage quota exhausted
@@ -480,6 +558,10 @@ export function computeDeployOutcome(
 //                                    NOT named *_not_authorized / *_auth_*: Sentry's org relayPiiConfig masks any attribute VALUE containing "auth", so such a kind would
 //                                    render as asterisks in every dashboard grouped by deploy.error_kind — verified empirically, see the sweep write-up.
 //   user.aborted                   — operator interrupted the run (Ctrl-C / SIGINT); not a product failure
+//   signer.phone_confirmation_unavailable — phone-confirmation gate fired with no TTY/interactive
+//                                    session to answer it (#1363) — distinct from user.aborted so a
+//                                    non-interactive caller (CI, no --mnemonic) that hits the gate
+//                                    isn't misclassified as an operator cancellation
 //   tool.invariant                 — internal invariant assertion failed
 //   unknown                        — none of the above patterns matched
 export type DeployErrorKind =
@@ -490,16 +572,41 @@ export type DeployErrorKind =
   | 'naming.pop_required'
   | 'naming.nostatus_required'
   | 'naming.contract_unavailable'
+  | 'naming.contract_function_removed'
   | 'dotns.abi_decode_empty'
   | 'naming.already_owned'
   | 'naming.governance_reserved'
+  | 'naming.short_names_closed'
+  | 'naming.soulbound'
   | 'naming.subdomain_orphan'
+  | 'naming.tld_mismatch'
+  | 'funding.insufficient_balance'
+  | 'funding.transfer_failed'
+  | 'naming.invalid_label'
+  | 'naming.name_unavailable'
+  | 'signer.invalid_mnemonic'
+  | 'storage.allowance_insufficient'
+  | 'tool.ipfs_missing'
+  | 'tool.out_of_memory'
+  | 'tool.external_signer_unsupported'
+  | 'chain.chunk_failed'
+  // ChunkInclusionUnverifiedError, probe branch: the TransactionByContentHash probe at the best block gave no answer, so inclusion could not be verified
+  | 'chain.chunk_unverified'
+  // ChunkInclusionUnverifiedError, re-upload branch: the chain accepts the account's txs but still does not include the chunk
+  | 'chain.chunk_not_included'
+  // stuckQueueMessage (src/pool.ts): the signer's pending-tx queue is stuck behind a head tx the node is not including
+  | 'chain.queue_stuck'
+  | 'chain.tx_dropped'
+  | 'chain.tx_invalid'
+  | 'chain.not_finalised'
+  | 'dotns.register_failed'
+  | 'network.endpoints_failed'
   | 'verify.contenthash_mismatch'
   | 'verify.dagpb_not_finalised'
   | 'network.recovery_exhausted'
   | 'account.mapping_pending'
   | 'chain.api_timeout'
-  // outer per-op budget hit during signed-tx submission (commit / register / setSubnodeOwner / setResolver / setContenthash / setText / publish / unpublish / Revive.call / Utility.batch_all)
+  // outer per-op budget hit during signed-tx submission (commit / register / setSubnodeOwner / setResolver / setContenthash / setText / Revive.call / Utility.batch_all)
   | 'chain.tx_timeout'
   // signSubmitAndWatch observable emitted no events for the no-progress threshold; watchdog tripped
   | 'chain.tx_silent'
@@ -509,6 +616,7 @@ export type DeployErrorKind =
   | 'signer.message_too_large'
   | 'storage.rejected'
   | 'user.aborted'
+  | 'signer.phone_confirmation_unavailable'
   | 'tool.invariant'
   | 'unknown';
 
@@ -520,6 +628,8 @@ export type DeployErrorKind =
 const TLD_FRAGMENT = "[a-z]{2,}";
 
 // Precedence-ordered list of (regex, kind) tuples. First match wins.
+// Order is priority: specific rules above the looser block and the trailing fallbacks; the corpus test
+// (test/fixtures/error-classification-corpus.json) pins the result.
 // Strong-signal infra kinds first, then naming, then verify, then network/chain, then tool.
 const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // Wrapper messages that interpolate a nested cause must precede the generic
@@ -529,12 +639,21 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // (2026-08-06 telemetry sweep: this was the largest live `unknown` bucket —
   // 31 spans, 30 of them env=preview, from the per-env authorizer gap #1209.)
   [/is not authorized for Bulletin storage/i, 'storage.rejected'],
+  // The three chunk-inclusion / stuck-queue messages (src/deploy.ts
+  // ChunkInclusionUnverifiedError, src/pool.ts stuckQueueMessage). Ahead of the
+  // generic infra rules: the unverified message interpolates the probe's failure
+  // reason, which routinely reads "timed out" / "websocket closed" and would be
+  // claimed by chain-timeout or connection; the stuck-queue message says "every
+  // chunk would time out", and both inclusion messages end up before the broader
+  // /chunk.*failed after.*retr/ and /not finalised after/ fallbacks.
+  [/Could not verify that chunk .+ is stored on-chain/i, 'chain.chunk_unverified'],
+  [/still absent at the best block after \d+ re-upload rounds/i, 'chain.chunk_not_included'],
+  [/has a stuck pending-tx queue/i, 'chain.queue_stuck'],
   // Revive surfaces the personhood gate as a bare revert reason rather than the
   // "requires ProofOfPersonhoodX, but this signer is NoStatus" prose matched
   // further down — same user-actionable cause, so it shares that kind. Ordered
-  // ahead of contract-revert, which would otherwise claim it: both the
-  // "(flags=N)" shape and the decoded `Publisher.publish reverted:` shape are
-  // contract-revert alternatives, and NoPersonhood arrives as the latter. The
+  // ahead of contract-revert, which would otherwise claim it: the "(flags=N)"
+  // shape is a contract-revert alternative that NoPersonhood arrives as. The
   // specific kind names the remedy, so it wins.
   [/reverted:\s*NoPersonhood\b/i, 'naming.pop_required'],
   // Operator interrupt (Ctrl-C). Its own kind so dashboards can exclude it from
@@ -546,10 +665,36 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // shows up in the data later, widening this is a one-line change with evidence
   // behind it; over-matching now would be invisible.
   [/^aborted by user\b/i, 'user.aborted'],
-  // `Publisher\.(?:un)?publish reverted:` — decoded ABI custom-error reverts
-  // from src/dotns.ts's publishLabel/unpublishLabel Publisher call paths.
-  [/Contract reverted|Contract execution would revert|revert(?:ed|ing)?\s*\(flags=[0-9]+\)|"type"\s*:\s*"ContractReverted"|Publisher\.(?:un)?publish reverted:/i, 'contract-revert'],
-  [/timed out after \d+s waiting for block|Transaction not included after \d+s|Transaction did not settle within|Commitment still too new after \d+s/i, 'chain-timeout'],
+  // #1363: nonInteractivePhoneConfirmationError's fixed prefix (src/deploy.ts)
+  // — the phone-confirmation gate fired with no TTY/interactive session to
+  // answer it. Ordered right after user.aborted (same family, opposite cause:
+  // this one is NEVER a deliberate cancellation) so a non-interactive caller
+  // that hits the gate is never folded into the operator-cancellation kind.
+  // Deliberately UNANCHORED (unlike user.aborted just above): traced the full
+  // propagation path (confirmPhoneReady → _awaitPhoneReady → contractTransaction
+  // → {submitCommitment,finalizeRegistration,setContenthash} → withSpan chain →
+  // withDeploySpan) and confirmed every hop rethrows the same Error object
+  // unchanged — no wrapper currently prefixes this message. But this rule ADDS
+  // a bucket rather than removing spans from the failure rate (contrast
+  // user.aborted, anchored because over-matching there silently deletes real
+  // failures) and the phrase can't plausibly appear as a sub-clause of an
+  // unrelated error, so there's no upside to anchoring — only fragility if a
+  // future wrapper is added upstream.
+  [new RegExp(PHONE_NONINTERACTIVE_FRAGMENT, 'i'), 'signer.phone_confirmation_unavailable'],
+  // Ahead of the generic contract-revert rule: a soulbound refusal is a
+  // permanent naming fact, not a transient chain error.
+  [/is soulbound and cannot be transferred/i, 'naming.soulbound'],
+  // Operator-fixable phrasings, above contract-revert so the actionable kind wins over the wrapper.
+  // formatUnregistrableReason's phrase (#1185); above the label rules since it can quote the PopError it explains.
+  [/cannot register it|base name is \d+ chars|reserved for original/i, 'naming.governance_reserved'],
+  [/NameNotAvailable/i, 'naming.name_unavailable'],
+  [/invalid domain label|name must be lowercase/i, 'naming.invalid_label'],
+  [/insufficient balance|insufficient funds|signer balance .* < estimated fee/i, 'funding.insufficient_balance'],
+  [/insufficient .* authorization/i, 'storage.allowance_insufficient'],
+  [/bip39 mnemonic/i, 'signer.invalid_mnemonic'],
+  [/ipfs cli not installed/i, 'tool.ipfs_missing'],
+  [/Contract reverted|Contract execution would revert|revert(?:ed|ing)?\s*\(flags=[0-9]+\)|"type"\s*:\s*"ContractReverted"/i, 'contract-revert'],
+  [/timed out after \d+s waiting for block|Transaction not included after \d+s|Transaction did not settle within|Commitment still too new/i, 'chain-timeout'],
   [/\bstale\b.*nonce|nonce.*\bstale\b|"type"\s*:\s*"(?:Future|Stale)"|Invalid::Future|tx rejected by pool/i, 'nonce-stale'],
   // Invalid::BadProof: the extrinsic's signature didn't verify (wrong genesis
   // hash / mortality window / spec version, or a re-signed payload mismatch).
@@ -557,46 +702,70 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // src/deploy.ts truncate the inner chain error at 100 chars.
   [/BadProof/i, 'chain.bad_proof'],
   [/heartbeat timeout|WS halt|Unable to connect|ChainHead disjointed|websocket.*closed|socket closed|disconnect/i, 'connection'],
+  // Our preflight wording and the chain's own revert. Kept separate from
+  // pop_required: grouping them would hide a config change behind a label the
+  // user can act on.
+  [/short names are not on sale on|Short names are not for sale/i, 'naming.short_names_closed'],
   [/requires ProofOfPersonhood(?:Full|Lite|Light),\s*but this signer is NoStatus/i, 'naming.pop_required'],
   [/requires NoStatus,\s*but this signer is ProofOfPersonhood/i, 'naming.nostatus_required'],
+  // checkTldNodeConsistency's safety-net throw (src/dotns.ts), anchored on the stable
+  // prefix, never on the interpolated namehash values.
+  [/DotNS tldNode mismatch: local namehash/i, 'naming.tld_mismatch'],
+  // Anchored on the stable "DotNS signer ... PAS free; needs ≥" shape, never on the
+  // interpolated address/amounts — those vary per signer and per fee floor.
+  [/DotNS signer .+ PAS free; needs ≥/i, 'funding.insufficient_balance'],
+  // Other personhood phrasings ("Requires Full Personhood verification", "personhood check failed"): after both specific rules above so their kinds win.
+  [/personhood/i, 'naming.pop_required'],
+  // Revive's TransferFailed module error, raised by register / finalize-registration
+  // (formatDispatchError JSON) when concurrent deploys on one shared signer spent its
+  // balance after the preflight check passed. Matches the variant name alone: the
+  // enclosing JSON can be cut by truncation, the innermost variant is the tail.
+  [/"type"\s*:\s*"TransferFailed"/i, 'funding.transfer_failed'],
   [/Cannot decode zero data.*with ABI parameters/i, 'dotns.abi_decode_empty'],
   // Issue #1060: contractCall's own empty-`0x`-data guard (src/dotns.ts, #729) throws
   // an actionable wrapper instead of letting the raw viem message above reach a
   // caller. Same failure family (a DotNS contract read came back empty) — classify
   // it the same way instead of letting it fall into 'unknown'.
-  [/No contract deployed at .+ returned empty success data/i, 'naming.contract_unavailable'],
+  //
+  // Phrase alone: classifyProtocolVersion (src/dotns-protocol.ts) throws it with
+  // a different ending (#272). Those two are its only producers in src/.
+  [/No contract deployed at /i, 'naming.contract_unavailable'],
   [/Contract call returned empty data — contract=/i, 'naming.contract_unavailable'],
   // Same failure family caught one step earlier: the environment config carries
   // a zero/absent address, so the call is refused before it is made rather than
   // coming back with empty data.
   [/Invalid contract address for \w+ in environment/i, 'naming.contract_unavailable'],
-  [new RegExp(`Domain\\s+\\S+\\.${TLD_FRAGMENT}\\s+is already owned by\\s+0x[a-fA-F0-9]+`, 'i'), 'naming.already_owned'],
-  // #1185: formatUnregistrableReason's distinctive phrase — present in both
-  // the unregistered ("...is not registered, and bulletin-deploy cannot
-  // register it: ...") and owned-by-another-account ("...is owned by
-  // 0x..., and bulletin-deploy cannot register it for a different account:
-  // ...") variants, so one rule classifies both. Ordered before
-  // naming.subdomain_orphan (a different message shape entirely) and after
-  // naming.already_owned (whose "already owned by 0x..." phrasing this rule
-  // never produces, so there's no overlap either way).
-  [/cannot register it/i, 'naming.governance_reserved'],
+  // detectProtocolVersion's branches where the probed accessors did not answer: the
+  // function problem, not a missing contract.
+  [/Could not determine the DotNS ABI profile/i, 'naming.contract_function_removed'],
   [new RegExp(`Cannot deploy\\s+[\\w.-]+\\.${TLD_FRAGMENT}:\\s*parent\\s+[\\w.-]+\\.${TLD_FRAGMENT}\\s+is owned by`, 'i'), 'naming.subdomain_orphan'],
+  // After subdomain_orphan, whose "is owned by" it would otherwise claim.
+  [/owner mismatch|\bowned by\b/i, 'naming.already_owned'],
   [/Post-deploy verification failed for .+: on-chain contenthash is /i, 'verify.contenthash_mismatch'],
   [/Deploy verification failed:\s*DAG-PB root.+not finalised/i, 'verify.dagpb_not_finalised'],
   [/Retry budget exhausted:.*recovery attempts/i, 'network.recovery_exhausted'],
   [/Account auto-mapping did not take effect on-chain/i, 'account.mapping_pending'],
-  [/ReviveApi\.\w+ timed out after \d+ms/i, 'chain.api_timeout'],
-  [/ReviveApi\.\w+ returned empty result/i, 'chain.api_timeout'],
-  [/transaction watcher silent for \d+s/i, 'chain.tx_silent'],
-  [/(?:commit|register|setSubnodeOwner|setResolver|setContenthash|setText|publish|unpublish|Revive\.call|Utility\.batch_all) timed out after \d+ms/i, 'chain.tx_timeout'],
+  [/ReviveApi.*timed out/i, 'chain.api_timeout'],
+  [/ReviveApi.*returned empty result/i, 'chain.api_timeout'],
+  [/transaction watcher silent for/i, 'chain.tx_silent'],
+  [/(?:commit|register|setSubnodeOwner|setResolver|setContenthash|setText|Revive\.call|Utility\.batch_all) timed out after \d+ms/i, 'chain.tx_timeout'],
   // Prefix, not the full `AncientBirthBlock` variant name: at 17 chars it is
   // long enough to be cut in half by the 100-char truncation both src/deploy.ts
   // producer sites apply to the inner chain error, which sent a live span to
   // `unknown` with the message ending `"type": "AncientBirth`.
   [/AncientBirth/i, 'chain.extrinsic_expired'],
-  [/Bulletin quota exhausted/i, 'chain.quota_exhausted'],
-  [/Mobile signing (?:failed|rejected).*message too big/i, 'signer.message_too_large'],
+  [/quota exhausted/i, 'chain.quota_exhausted'],
+  [/Mobile (?:transaction )?signing (?:failed|rejected).*message too big/i, 'signer.message_too_large'],
   [/^INVARIANT FAILED:/i, 'tool.invariant'],
+  // Broad fallbacks, last.
+  [/javascript heap out of memory|allocation failed.*heap/i, 'tool.out_of_memory'],
+  [/External signer mode is not supported with dotns-cli/i, 'tool.external_signer_unsupported'],
+  [/All promises were rejected/i, 'network.endpoints_failed'],
+  [/tx dropped from best chain|chain may have (?:dropped|evicted)/i, 'chain.tx_dropped'],
+  [/not finalised after \d+s/i, 'chain.not_finalised'],
+  [/chunk.*failed after.*retr/i, 'chain.chunk_failed'],
+  [/"type"\s*:\s*"Invalid"/i, 'chain.tx_invalid'],
+  [/dotns register failed/i, 'dotns.register_failed'],
 ];
 
 export function classifyErrorKind(msg: string): DeployErrorKind {
@@ -605,6 +774,66 @@ export function classifyErrorKind(msg: string): DeployErrorKind {
   }
   return 'unknown';
 }
+
+// Fault attribution per mechanism kind (user: operator can fix; environment:
+// chain/network/contract generation; internal: tool bug; unknown: needs a human
+// to look). Exhaustive on purpose: a new DeployErrorKind will not compile until
+// its category is decided. categoryOf() reads this, except for the
+// contract-address kind whose answer depends on whose config is wrong.
+export const ERROR_KIND_CATEGORY: Record<DeployErrorKind, DeployErrorCategory> = {
+  'contract-revert': 'environment',
+  'chain-timeout': 'environment',
+  'nonce-stale': 'environment',
+  'connection': 'environment',
+  'naming.pop_required': 'user',
+  'naming.nostatus_required': 'user',
+  'naming.contract_unavailable': 'unknown', // see contractAddressCategory
+  'naming.contract_function_removed': 'unknown', // see contractAddressCategory
+  'dotns.abi_decode_empty': 'unknown', // never attributed; kept visible
+  'naming.already_owned': 'user',
+  'naming.governance_reserved': 'user',
+  'naming.short_names_closed': 'user',
+  'naming.soulbound': 'user',
+  'naming.subdomain_orphan': 'user',
+  'naming.tld_mismatch': 'environment',
+  'naming.invalid_label': 'user',
+  'naming.name_unavailable': 'user',
+  'funding.insufficient_balance': 'user',
+  'funding.transfer_failed': 'user',
+  'verify.contenthash_mismatch': 'environment',
+  'verify.dagpb_not_finalised': 'environment',
+  'network.recovery_exhausted': 'environment',
+  'network.endpoints_failed': 'environment',
+  'account.mapping_pending': 'environment',
+  'chain.api_timeout': 'environment',
+  'chain.tx_timeout': 'environment',
+  'chain.tx_silent': 'environment',
+  'chain.extrinsic_expired': 'environment',
+  'chain.quota_exhausted': 'user',
+  'chain.bad_proof': 'environment',
+  'chain.chunk_failed': 'environment',
+  'chain.chunk_unverified': 'environment',
+  'chain.chunk_not_included': 'environment',
+  // Always the node's pool state, not the operator's: a pinned index is only the
+  // remedy (unset/pick another), the stuck queue is the cause, and the same
+  // message is also thrown for a direct signer that pinned nothing.
+  'chain.queue_stuck': 'environment',
+  'chain.tx_dropped': 'environment',
+  'chain.tx_invalid': 'environment',
+  'chain.not_finalised': 'environment',
+  'dotns.register_failed': 'environment',
+  'signer.message_too_large': 'environment',
+  'signer.invalid_mnemonic': 'user',
+  'storage.rejected': 'user',
+  'storage.allowance_insufficient': 'user',
+  'user.aborted': 'user',
+  'signer.phone_confirmation_unavailable': 'user',
+  'tool.invariant': 'internal',
+  'tool.ipfs_missing': 'user',
+  'tool.out_of_memory': 'internal',
+  'tool.external_signer_unsupported': 'internal',
+  'unknown': 'unknown',
+};
 
 // Single computation for the message-derived classification attributes any
 // error-ending span writes. Every path that stamps `deploy.error` (or a leaf
@@ -703,6 +932,8 @@ let memoryPeak: RawMemorySample | null = null;
 // unreliable for attributes set late in the deploy lifecycle).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let deployRootSpan: any | null = null;
+// The open withDeploySpan span; deployRootSpan can instead be a manifest span.
+let deploySpan: any | null = null;
 // Per-stage memory snapshots kept alongside the peak. Flushed to the
 // threshold-triggered memory report (memory-report.ts) if the deploy
 // exceeded the threshold AND we're in an internal context.
@@ -800,6 +1031,7 @@ export async function withDeploySpan<T>(domain: string, fn: () => T | Promise<T>
   try {
     return await Sentry.startSpan({ op: "deploy", name: `deploy ${domain}`, attributes: attrs }, async (span) => {
       deployRootSpan = span;
+      deploySpan = span;
       // Redundant with the getDeployAttributes() seed — kept so wrapper code
       // that overrides `attrs` can't accidentally drop the tool version.
       span.setAttribute("deploy.tool_version", VERSION);
@@ -827,27 +1059,7 @@ export async function withDeploySpan<T>(domain: string, fn: () => T | Promise<T>
         span.setAttribute("deploy.status", "ok");
         return result;
       } catch (error) {
-        const msg = (error as Error).message ?? String(error);
-        span.setAttribute("deploy.status", "error");
-        // Mechanism classification (how it failed, not whose fault).
-        // Propagated from the leaf chain-op span up to the root deploy span so
-        // dashboards can group by deploy.error_kind without drilling into child spans.
-        setDeployErrorOnSpan(span, msg);
-        const errorCategory = classifyDeployError(msg);
-        span.setAttribute("deploy.error_category", errorCategory);
-        currentErrorCategory = errorCategory;
-        // Expected refusals (owned-by, reserved label, insufficient balance…)
-        // are product rules, not tool friction: keep sad="false" so dashboards
-        // filtering `deploy.sad:true` (and `NOT deploy.expected:true` on error
-        // widgets) reflect the tool's health, not the user's typing. A later
-        // captureWarning during the refusal flow will still flip sad back to
-        // "true" — intentional, friction during a refusal is still friction.
-        const isExpected = isExpectedError(msg);
-        span.setAttribute("deploy.expected", isExpected ? "true" : "false");
-        span.setAttribute("deploy.sad", isExpected ? "false" : "true");
-        if (!isExpected) {
-          span.setStatus({ code: 2, message: "internal_error" });
-        }
+        recordDeployFailure(span, error);
         throw error;
       } finally {
         // sampleMemory folds the "end" point into the running peak and writes
@@ -899,6 +1111,7 @@ export async function withDeploySpan<T>(domain: string, fn: () => T | Promise<T>
   } finally {
     memoryPeak = null;
     deployRootSpan = null;
+    deploySpan = null;
     stageSamples = {};
     reportContext = {};
     currentErrorCategory = null;
@@ -923,9 +1136,8 @@ export function setDeployAttribute(key: string, value: string | number | boolean
 
 // Sets `deploy.error` + its classification (`deploy.error_kind`,
 // `deploy.error_message`, `deploy.error_pattern_signature`) on `span` in one
-// call. Used by withDeploySpan's catch block; also exported (see
-// setDeployError below) as the choke point any future error-ending path
-// should route through instead of setting deploy.error alone.
+// call. Used by recordDeployFailure, and by setDeployError for the active root
+// span; route error recording through it rather than setting deploy.error alone.
 function setDeployErrorOnSpan(span: { setAttribute: (k: string, v: string | number | boolean) => void }, msg: string): void {
   const { kind, message, pattern } = classifyErrorForSpan(msg);
   span.setAttribute("deploy.error", msg.slice(0, 500));
@@ -934,16 +1146,46 @@ function setDeployErrorOnSpan(span: { setAttribute: (k: string, v: string | numb
   span.setAttribute("deploy.error_pattern_signature", pattern);
 }
 
-// Global-root-span convenience wrapper for setDeployErrorOnSpan, mirroring
-// setDeployAttribute's calling convention (no explicit span argument — writes
-// to the currently active deploy's root span, no-op outside a deploy). Exists
-// so a future caller outside a withDeploySpan callback (e.g. a process-level
-// uncaughtException/unhandledRejection handler) can record deploy.error
-// without bypassing classification, instead of calling setDeployAttribute
-// directly with the raw message.
+// setDeployErrorOnSpan on the active deploy's root span; no-op outside a deploy.
 export function setDeployError(msg: string): void {
   if (!deployRootSpan) return;
   setDeployErrorOnSpan(deployRootSpan, msg);
+}
+
+function recordDeployFailure(span: any, error: unknown): void {
+  const msg = (error as Error)?.message ?? String(error);
+  span.setAttribute("deploy.status", "error");
+  // Mechanism classification (how it failed, not whose fault).
+  // Propagated from the leaf chain-op span up to the root deploy span so
+  // dashboards can group by deploy.error_kind without drilling into child spans.
+  setDeployErrorOnSpan(span, msg);
+  const errorCategory = classifyDeployError(msg);
+  span.setAttribute("deploy.error_category", errorCategory);
+  currentErrorCategory = errorCategory;
+  // Expected refusals (owned-by, reserved label, insufficient balance…)
+  // are product rules, not tool friction: keep sad="false" so dashboards
+  // filtering `deploy.sad:true` (and `NOT deploy.expected:true` on error
+  // widgets) reflect the tool's health, not the user's typing. A later
+  // captureWarning during the refusal flow will still flip sad back to
+  // "true". That is intended: friction during a refusal is still friction.
+  const isExpected = isExpectedError(msg);
+  span.setAttribute("deploy.expected", isExpected ? "true" : "false");
+  span.setAttribute("deploy.sad", isExpected ? "false" : "true");
+  if (!isExpected) {
+    span.setStatus({ code: 2, message: "internal_error" });
+  }
+}
+
+// A manifest span reports its own result, so only a deploy span is marked.
+export function markDeployFatal(error: unknown): void {
+  if (deployRootSpan && deployRootSpan === deploySpan) recordDeployFailure(deployRootSpan, error);
+}
+
+// Runs after Sentry has captured the fatal event.
+function exitOnFatalError(error: Error): void {
+  console.error(error);
+  markDeployFatal(error);
+  void closeTelemetry(2000).finally(() => process.exit(1));
 }
 
 // @internal — test hook: injects a fake root span so unit tests can assert

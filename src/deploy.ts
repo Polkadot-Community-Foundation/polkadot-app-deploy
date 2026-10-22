@@ -3,7 +3,8 @@ import * as fs from "fs";
 import * as path from "path";
 import { execSync } from "child_process";
 import { CLI_NAME } from "./cli-name.js";
-import { hasPersistedSession, STALE_SESSION_MESSAGE, DOT_DAPP_ID, DOT_PRODUCT_ID, getPeopleChainEndpoints } from "./auth-config.js";
+import { resolveEffectiveMnemonic } from "./mnemonic.js";
+import { hasPersistedSession, STALE_SESSION_DEPLOY_MESSAGE, getPeopleChainEndpoints } from "./auth-config.js";
 import { statementSigningAccount } from "./sss-allowance.js";
 import { preflightSssAllowance } from "./sss-allowance-cache.js";
 import { sha256 } from "@noble/hashes/sha256";
@@ -19,23 +20,25 @@ import { UnixFS } from "ipfs-unixfs";
 import { merkleizeJS, merkleizeWithStableOrder, rebuildOrderedCarFromBytes } from "./merkle.js";
 import { extractManifestFromCar, fetchPreviousManifest, writePersistentLocalManifest } from "./manifest-fetch.js";
 import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "./manifest-embed.js";
-import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManifest, type ManifestFileEntry, type ManifestChunkEntry } from "./manifest.js";
-import { probeChunks, probeFinalityGap, getBestBlockNumber } from "./chunk-probe.js";
+import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManifest, CONTENT_HASH_RE, type ManifestFileEntry, type ManifestChunkEntry } from "./manifest.js";
+import { probeChunks, probeFinalityGap, getBestBlockNumber, type ChunkProbeResult } from "./chunk-probe.js";
 import { computeStats, telemetryAttributes, renderSummary } from "./incremental-stats.js";
-import { keccak256, toBytes } from "viem";
-import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, PublisherNotSupportedError, PUBLISHER_ABI, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD } from "./dotns.js";
-import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep, DotNSConnectOptions } from "./dotns.js";
+import { DotNS, fetchNonce, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD, computeDomainNode, topUpTargetFor, AUTO_MAP_RENT_HEADROOM } from "./dotns.js";
+import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep, DotNSConnectOptions, DotnsSuccessAction } from "./dotns.js";
+import type { DotnsAbiProfile } from "./dotns-protocol.js";
+import { subnameNestingLevels } from "./subname-depth.js";
 export type { PhoneSignatureStep };
 import { cryptoWaitReady } from "@polkadot/util-crypto";
-import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet } from "./pool.js";
+import { derivePoolAccounts, fetchPoolAuthorizations, selectHealthyPoolAccount, checkPoolAccountNonceHealth, StuckPoolAccountError, STUCK_NONCE_GAP_THRESHOLD, withTimeout, stuckQueueMessage, parsePoolDerivationIndex, NONCE_HEALTH_SAMPLES, type NonceHealth, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet, resolvePoolMnemonic } from "./pool.js";
 import type { BulletinAuthorization, PoolAuthorization } from "./pool.js";
 import { initTelemetry, withSpan, withDeploySpan, setDeployAttribute, setDeploySentryTag, sampleMemory, setDeployReportContext, captureWarning, flush, VERSION, resolveRunner, resolveRunnerType, truncateAddress } from "./telemetry.js";
-import { loadEnvironments, resolveEndpoints, getPopSelfServeConfig, DEFAULT_ENV_ID } from "./environments.js";
+import { loadEnvironments, describeContractSources, resolveEndpoints, getPopSelfServeConfig, DEFAULT_ENV_ID } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
 import { setDeployContext as setBugReportContext } from "./bug-report.js";
 import { getPolkadotSigner } from "polkadot-api/signer";
 import { sr25519CreateDerive } from "@polkadot-labs/hdkd";
 import { mnemonicToEntropy, entropyToMiniSecret, ss58Address } from "@polkadot-labs/hdkd-helpers";
+import { deriveProductSigner } from "./product-account.js";
 import type { PolkadotSigner } from "polkadot-api";
 import { CarReader } from "@ipld/car/reader";
 import {
@@ -43,19 +46,40 @@ import {
   BulletinSlotAuthError,
 } from "./storage-signer.js";
 import { resolveStorageSigner } from "./deploy-actors.js";
-import { requestResourceAllocation, createSlotAccountSigner, BULLETIN_RESOURCE } from "./auth/index.js";
+import { requestResourceAllocation, createSlotAccountSigner, BULLETIN_RESOURCE, SESSION_EXPIRED_MESSAGE } from "./auth/index.js";
 
 export interface DeployResult {
   domainName: string;
   fullDomain: string;
   cid: string;
   ipfsCid?: string;
+  /**
+   * The env-aware browser URL for the deployed site — same value browserUrlFor()
+   * produces for the "Check it out here" console line (issue #1157). Exposed here
+   * so callers embedding deploy() as a library (and the CLI's GITHUB_OUTPUT write,
+   * and the reusable workflow's PR-comment step) can reuse the ONE resolution
+   * instead of recomputing a gateway URL from a hardcoded default.
+   */
+  browserUrl: string;
+  /**
+   * The Bulletin allowance-slot signer this deploy stored its content with, when it resolved
+   * one from a login session (`resolveStorageSigner`). Exposed so the CLI can hand the SAME
+   * identity to `publishManifest` immediately afterwards: the manifest's icon and executables
+   * are billed to the storage account's quota, and a session deploy whose manifest fell back
+   * to the shared pool would fail on any chain whose pool holds no quota. Undefined when
+   * storage ran on a mnemonic, an external signer, or the pool — those the manifest step
+   * resolves for itself from the options it is already given.
+   */
+  storageSigner?: PolkadotSigner;
+  /** SS58 address of that slot account. Set whenever `storageSigner` is. */
+  storageSignerAddress?: string;
 }
 
 export type DeployContent = string | Uint8Array | Uint8Array[];
 
 export { NonRetryableError, EXIT_CODE_NO_RETRY } from "./errors.js";
 import { NonRetryableError } from "./errors.js";
+import { e2eNonceSeedBarrier } from "./e2e-nonce-barrier.js";
 
 // Bulletin's signed extension returns InvalidTransaction::Payment when a storage tx
 // exceeds the signer's quota — Bulletin has no fees, so "Payment" means quota.
@@ -87,10 +111,21 @@ interface ExistingProvider { client?: any; unsafeApi?: any; signer?: PolkadotSig
    * computes and stores the real root, which becomes the contenthash.
    */
   skipRootStore?: boolean;
+  /**
+   * When true, a client storeChunkedContent created by reconnecting is handed back
+   * via `liveProvider` alive, and closing it becomes the caller's job (#1672).
+   * storeDirectoryV2 sets it: it probes finality with that client afterwards.
+   * Callers that drop liveProvider leave it unset, and the client is closed here.
+   */
+  handOffLiveClient?: boolean;
 }
 interface ChainReceipt { txHash: string; blockHash: string; blockNumber: number; }
+// viaFallback: not confirmed by a watch event (a best-block CID probe, or provisional pending the
+// post-batch verify loop, which every such chunk must pass before storeChunkedContent returns).
 interface StoredChunk { cid: CID; len: number; viaFallback?: boolean; receipt?: ChainReceipt; }
-interface WatchTransactionOptions { label?: string; rpc?: string | string[]; senderSS58?: string; expectedNonce?: number; timeoutMs?: number; fetchNonce?: (rpc: string | string[], ss58: string) => Promise<number>; }
+// confirmIncluded: positive on-chain evidence for the tx's effect at the BEST block (a CID probe),
+// asked when the watch gives up. Only `true` resolves the watch; anything else is a rejection.
+interface WatchTransactionOptions { label?: string; timeoutMs?: number; confirmIncluded?: () => Promise<boolean>; }
 interface WatchResult<T> { value: T; viaFallback: boolean; receipt?: ChainReceipt; }
 
 export const DEFAULT_BULLETIN_RPC = "wss://paseo-bulletin-rpc.polkadot.io";
@@ -100,6 +135,16 @@ export const DEFAULT_POOL_SIZE = 10;
 // backups here once the Bulletin team publishes them (no code change needed).
 export let BULLETIN_ENDPOINTS: string[] = [DEFAULT_BULLETIN_RPC];
 let POOL_SIZE = DEFAULT_POOL_SIZE;
+// bulletin #1362/#1095: the resolved env's environments.json `network` field.
+// Threaded into ensureAuthorized by the provider helpers below so their
+// detectTestnet call decides from the declared env, not a chain spec_name
+// guess, whenever one is available. Module-level (like BULLETIN_ENDPOINTS/
+// POOL_SIZE above) because getProvider/getDirectProvider/getSignerProvider
+// run outside deploy()'s own scope. Also read by isPoolFallbackAllowed below
+// to gate whether a failed Bulletin allowance slot may fall back to the
+// shared pool — the pool is derived from the well-known dev phrase and holds
+// no grant on mainnet.
+let bulletinNetwork: string | undefined;
 
 /**
  * Bulletin RPC override precedence, shared by every caller that resolves an
@@ -131,6 +176,24 @@ export function resolveBulletinEndpoints(envBulletin: string[], rpcOverride?: st
  */
 export function setBulletinEndpoints(endpoints: string[]): void {
   BULLETIN_ENDPOINTS = endpoints;
+}
+
+/**
+ * Set the module-level `bulletinNetwork` context declared above. `manifest/publish.ts`
+ * opens its own storage provider and can run without a preceding in-process `deploy()`,
+ * in which case `bulletinNetwork` would still be undefined — the historical
+ * (testnet-shaped) fallback behavior, not a hard failure on mainnet, and detectTestnet's
+ * own spec_name guess would also be skipped. Same reasoning as `setBulletinEndpoints`:
+ * ESM named imports are read-only bindings, so a setter is the only way for another
+ * module to update this `let`.
+ */
+export function setBulletinNetworkContext(network: string | undefined): void {
+  bulletinNetwork = network;
+}
+
+/** The value above, for tests that assert the wiring without a chain connection. */
+export function __getBulletinNetworkContextForTest(): string | undefined {
+  return bulletinNetwork;
 }
 // Module-level flag: flipped by getWsProvider's onStatusChanged if papi
 // connects to a non-primary endpoint. Flushed into the deploy span at the end
@@ -273,6 +336,49 @@ export function retryBudgetExhausted(
   return inWindow > maxEvents;
 }
 
+// twin: upstream defines this next to its ChainError type, as part of an earlier
+// change (InvalidTransaction variant carried structurally) this repo has not
+// taken. Only the pure extractor is brought in, because isNonceCollisionError
+// needs it; nothing here sets chainErrorVariant, so the message is the carrier.
+/**
+ * Pulls the InvalidTransaction variant name (e.g. "AncientBirthBlock",
+ * "BadProof", "Payment") out of the raw `{ "type": "Invalid", "value": {
+ * "type": "<Variant>" } }` shape substrate's signed extension returns.
+ */
+export function extractInvalidTransactionVariant(msg: string): string | undefined {
+  return /"type"\s*:\s*"Invalid"[\s\S]*?"value"\s*:\s*\{\s*"type"\s*:\s*"([^"]+)"/.exec(msg)?.[1];
+}
+
+/**
+ * How the root-node store loop answers a failed submit (#1672). A tx the pool
+ * rejects for its nonce is a nonce collision, not a lost connection: a sibling
+ * deploy on the same signer took that nonce (S9), so the fix is a fresh nonce,
+ * and a reconnect only burns budget. papi reports it as InvalidTxError Stale once
+ * the block holding the other tx finalises, or as isValid:false on a reorg. A WS
+ * halt or a connection error means the client is dead. Anything else keeps the
+ * historical reconnect.
+ */
+export function classifyRootSubmitError(error: any, wsHalted: boolean): "reconnect" | "nonce-collision" {
+  if (wsHalted || isConnectionError(error)) return "reconnect";
+  return isNonceCollisionError(error) ? "nonce-collision" : "reconnect";
+}
+
+/** The pool rejected the tx for its nonce: InvalidTxError Stale, or isValid:false (#1672). */
+export function isNonceCollisionError(error: any): boolean {
+  const msg = String(error?.message ?? error);
+  return (error?.chainErrorVariant ?? extractInvalidTransactionVariant(msg)) === "Stale" || msg.includes("isValid:false");
+}
+
+// Wait before re-reading the nonce after a collision (#1672). Two deploys on one
+// signer see their Stale at the same finalised block and re-read the same
+// nextIndex, so without a random offset they collide again on every retry.
+const defaultNonceCollisionBackoff = (): number => RETRY_BASE_DELAY_MS + Math.round(Math.random() * 10_000);
+let nonceCollisionBackoffMs: () => number = defaultNonceCollisionBackoff;
+/** Test-only: replace the collision backoff (null restores the default). */
+export function __setNonceCollisionBackoffForTest(fn: (() => number) | null): void {
+  nonceCollisionBackoffMs = fn ?? defaultNonceCollisionBackoff;
+}
+
 export function isConnectionError(error: any): boolean {
   const msg = error?.message || String(error);
   // `ChainHead disjointed` is PAPI's error when chainHead subscription state
@@ -404,7 +510,28 @@ function toHashingEnum(mhCode: number): { type: string; value: undefined } {
   }
 }
 
-async function getProvider(): Promise<ProviderResult> {
+// bulletin #1637: reads for checkPoolAccountNonceHealth. The on-chain nonce comes from the deploy's own
+// client at the BEST block. Each nextIndex sample goes through fetchNonce, which opens a fresh
+// WebSocket per call (a new load-balancer backend pick), the same path chunk nonces are read
+// through. Samples are spread round-robin over the endpoints.
+async function checkSignerQueue(unsafeApi: any, who: string, address: string): Promise<NonceHealth> {
+  const h = await checkPoolAccountNonceHealth(address, {
+    readOnchainNonce: async (a: string) => Number((await unsafeApi.query.System.Account.getValue(a, { at: "best" })).nonce),
+    readNextIndex: (a: string, sample: number) => fetchNonce(BULLETIN_ENDPOINTS[sample % BULLETIN_ENDPOINTS.length], a),
+    samples: NONCE_HEALTH_SAMPLES * BULLETIN_ENDPOINTS.length,
+  });
+  console.log(h.verdict === "unknown"
+    ? `   Could not check ${who}'s pending-tx queue (${h.reason}); continuing`
+    : `   Pending-tx queue (${who}): on-chain nonce ${h.onchain}, nextIndex samples [${h.samples.join(", ")}] -> ${h.verdict}`);
+  return h;
+}
+
+// bulletin #1637: which accounts a deploy refused because their queue was stuck. Seeded "none".
+function recordStuckSkipped(ids: Array<number | string>): void {
+  if (ids.length > 0) setDeployAttribute("deploy.pool.stuck_skipped", ids.join(","));
+}
+
+async function getProvider({ checkQueue = true }: { checkQueue?: boolean } = {}): Promise<ProviderResult> {
   const primary = BULLETIN_ENDPOINTS[0];
   console.log(`   Connecting to Bulletin: ${primary}`);
   const client = createPolkadotClient(getWsProvider(
@@ -415,8 +542,9 @@ async function getProvider(): Promise<ProviderResult> {
 
   try {
     await cryptoWaitReady();
-    const poolMnemonic = process.env.BULLETIN_POOL_MNEMONIC || undefined;
-    const poolAccounts = derivePoolAccounts(POOL_SIZE, poolMnemonic);
+    // One resolver, shared with bin/polkadot-app-bootstrap, so the accounts an operator authorizes
+    // are the accounts a deploy uploads from (see resolvePoolMnemonic's doc comment).
+    const poolAccounts = derivePoolAccounts(POOL_SIZE, resolvePoolMnemonic());
     const authorizations = await fetchPoolAuthorizations(unsafeApi, poolAccounts);
     const poolIndexEnv = process.env.BULLETIN_POOL_ACCOUNT_INDEX;
     let pinnedPoolIndex: number | undefined;
@@ -427,10 +555,23 @@ async function getProvider(): Promise<ProviderResult> {
       }
       pinnedPoolIndex = n;
     }
-    const selectionResult = selectAccount(authorizations, Math.random, pinnedPoolIndex);
+    // bulletin #1637: skip (or, when pinned, fail fast on) an account whose pending-tx queue is stuck.
+    let selectionResult;
+    try {
+      selectionResult = await selectHealthyPoolAccount(authorizations, {
+        pinnedIndex: pinnedPoolIndex,
+        checkHealth: checkQueue
+          ? (a) => checkSignerQueue(unsafeApi, `pool account ${a.index}`, a.address)
+          : async () => ({ verdict: "unknown", samples: [], reason: "skipped on reconnect" }),
+      });
+    } catch (e) {
+      if (e instanceof StuckPoolAccountError) recordStuckSkipped(e.skippedStuck.map((s) => s.index));
+      throw e;
+    }
     const selectedAccount = selectionResult.account;
     const eligibleCount = selectionResult.eligibleCount;
-    await ensureAuthorized(unsafeApi, selectedAccount.address, `pool account ${selectedAccount.index}`);
+    recordStuckSkipped(selectionResult.skippedStuck.map((s) => s.index));
+    await ensureAuthorized(unsafeApi, selectedAccount.address, `pool account ${selectedAccount.index}`, { network: bulletinNetwork });
 
     console.log(`   Using pool account ${selectedAccount.index}: ${selectedAccount.address}`);
     setDeployAttribute("deploy.signer.mode", "pool");
@@ -444,7 +585,7 @@ async function getProvider(): Promise<ProviderResult> {
   }
 }
 
-export async function getDirectProvider(mnemonic: string, derivationPath: string = ""): Promise<ProviderResult> {
+async function getDirectProvider(mnemonic: string, derivationPath: string = "", { checkQueue = true }: { checkQueue?: boolean } = {}): Promise<ProviderResult> {
   const primary = BULLETIN_ENDPOINTS[0];
   console.log(`   Connecting to Bulletin: ${primary}`);
   const client = createPolkadotClient(getWsProvider(
@@ -456,14 +597,29 @@ export async function getDirectProvider(mnemonic: string, derivationPath: string
 
   console.log(`   Using direct signer: ${ss58}${derivationPath ? ` (path: ${derivationPath})` : ""}`);
 
+  // bulletin #1637: a direct signer has no other account to fall back to, so a stuck queue fails fast
+  // instead of 3 x 180 s chunk timeouts. "unknown" (RPC trouble) proceeds as before. The check
+  // never rejects and runs alongside the authorization read; it is awaited before ensureAuthorized.
+  const queueCheck: Promise<NonceHealth> = checkQueue
+    ? checkSignerQueue(unsafeApi, "direct signer", ss58)
+    : Promise.resolve({ verdict: "unknown", samples: [] });
   let [auth, currentBlock] = await Promise.all([
     readAccountAuthorization(unsafeApi, ss58),
     client.getFinalizedBlock(),
   ]);
+  const queue = await queueCheck;
+  if (queue.verdict === "stuck") {
+    client.destroy();
+    recordStuckSkipped([parsePoolDerivationIndex(derivationPath) ?? "direct"]);
+    throw new NonRetryableError(stuckQueueMessage(
+      `Direct signer${derivationPath ? ` ${derivationPath}` : ""}`, ss58, queue,
+      "Deploy with another signer or derivation path, or wait for the queue to clear.",
+    ));
+  }
   let now = currentBlock.number;
   if (!isAuthorizationSufficient(auth, now)) {
     try {
-      await ensureAuthorized(unsafeApi, ss58 as string, "direct signer");
+      await ensureAuthorized(unsafeApi, ss58 as string, "direct signer", { network: bulletinNetwork });
       [auth, currentBlock] = await Promise.all([
         readAccountAuthorization(unsafeApi, ss58),
         client.getFinalizedBlock(),
@@ -499,7 +655,7 @@ async function getSignerProvider(signer: PolkadotSigner, ss58: string): Promise<
   let now = currentBlock.number;
   if (!isAuthorizationSufficient(auth, now)) {
     try {
-      await ensureAuthorized(unsafeApi, ss58, "external signer");
+      await ensureAuthorized(unsafeApi, ss58, "external signer", { network: bulletinNetwork });
       [auth, currentBlock] = await Promise.all([
         readAccountAuthorization(unsafeApi, ss58),
         client.getFinalizedBlock(),
@@ -517,23 +673,19 @@ async function getSignerProvider(signer: PolkadotSigner, ss58: string): Promise<
   return { client, unsafeApi, signer, ss58 };
 }
 
-/**
- * Resolve the mnemonic the CLI should act with, in precedence order:
- * `--mnemonic` flag > `MNEMONIC` env var > `DOTNS_MNEMONIC` env var.
- *
- * Exists so the bin's flag/env resolution is unit-testable and so the two
- * env vars are forwarded consistently: previously the bin only forwarded
- * `flags.mnemonic` into `options.mnemonic`, so an env-only mnemonic never
- * reached `chooseSignerInput` and a persisted session silently won instead —
- * even though `chooseSignerInput` already prefers mnemonic first.
- */
-export function resolveEffectiveMnemonic(opts: {
-  flagMnemonic: string | undefined;
-  envMnemonic: string | undefined;
-  envDotnsMnemonic: string | undefined;
-}): string | undefined {
-  return opts.flagMnemonic ?? opts.envMnemonic ?? opts.envDotnsMnemonic;
-}
+// #1107 introduced this resolver so the bin's flag/env resolution is
+// unit-testable and so the two env vars are forwarded consistently
+// (previously the bin only forwarded `flags.mnemonic` into
+// `options.mnemonic`, so an env-only mnemonic never reached
+// `chooseSignerInput` and a persisted session silently won instead — even
+// though `chooseSignerInput` already prefers mnemonic first).
+//
+// bulletin #1553/#1461: moved to src/mnemonic.ts and re-exported here
+// (rather than defined locally) so `DotNS.connect` (src/dotns.ts) can share
+// the exact same precedence logic without a deploy.ts <-> dotns.ts import
+// cycle — deploy.ts already imports from dotns.ts. Keeping one definition
+// removes the possibility of the two files' precedence drifting apart again.
+export { resolveEffectiveMnemonic, mnemonicConflictNotice } from "./mnemonic.js";
 
 /**
  * Resolve the environment id the CLI should target, in precedence order:
@@ -568,32 +720,62 @@ export function shouldPublishManifest(opts: {
 }
 
 /**
- * Reject the contradictory `--no-manifest`/`--content-only` + `--publish`
- * combination up front. `--publish` lists the domain in the on-chain
- * Publisher registry, which reads the manifest's text records (Browse relies
- * on them) — skipping manifest publishing while also asking to list the
- * domain would silently publish a domain with no manifest data. Returns an
- * error message string to print + exit on, or `null` when the combination is
- * fine. Exported for unit testing.
+ * Choose the post-deploy banner text (#1164). Pure and unit-testable without
+ * a live deploy. `manifestPending` is opt-in on `DeployOptions` — every
+ * existing library caller (e.g. playground-cli) leaves it unset and keeps
+ * today's "DEPLOYMENT COMPLETE!" banner.
  */
-export function validateNoManifestFlags(opts: {
-  noManifest: boolean;
-  publish: boolean;
-}): string | null {
-  if (opts.noManifest && opts.publish) {
-    return "Error: --no-manifest (--content-only) and --publish are mutually exclusive — --publish requires the manifest records that --no-manifest skips.";
-  }
-  return null;
+export function pickPostDeployBannerText(manifestPending: boolean | undefined): string {
+  return manifestPending ? "CONTENT DEPLOYED — publishing product manifest…" : "DEPLOYMENT COMPLETE!";
 }
 
-/** storageSigner > signer > mnemonic > pool precedence for storage routing. Exported for unit testing. */
+/**
+ * Print the real completion banner + browser URL. Called by `deploy()` itself
+ * when `manifestPending` is unset/false, and by `bin/polkadot-app-deploy` once
+ * its own subsequent `publishManifest()` call succeeds when it is set.
+ */
+export function printDeploymentCompleteBanner(fullDomain: string, browserUrl: string): void {
+  console.log("\n" + "=".repeat(60));
+  console.log("DEPLOYMENT COMPLETE!");
+  console.log("=".repeat(60));
+  console.log("\nCheck it out here:");
+  console.log(`   ${browserUrl}`);
+  console.log(`   ${fullDomain}  (in a Polkadot app: mobile or desktop)`);
+  console.log("\n" + "=".repeat(60) + "\n");
+}
+
+/**
+ * storageSigner > signer (unless session-backed with no slot, bulletin #1452) > mnemonic > pool
+ * precedence for storage routing. `selectStorageReconnect` delegates to this so the two
+ * never drift apart. Exported for unit testing.
+ */
 export function __selectStorageProviderModeForTest(
-  options: Pick<DeployOptions, "storageSigner" | "storageSignerAddress" | "signer" | "signerAddress" | "mnemonic">,
+  options: Pick<DeployOptions, "storageSigner" | "storageSignerAddress" | "signer" | "signerAddress" | "mnemonic" | "sessionSigner">,
 ): "storageSigner" | "signer" | "direct" | "pool" {
   if (options.storageSigner && options.storageSignerAddress) return "storageSigner";
-  if (options.signer && options.signerAddress) return "signer";
+  // bulletin #1452: a phone-backed session signer with no allowance slot must fall through to
+  // pool/mnemonic, not sign chunks itself. A caller-injected external signer (sessionSigner
+  // unset — e.g. playground-cli) is unaffected and still routes to "signer" here.
+  if (options.signer && options.signerAddress && !options.sessionSigner) return "signer";
   if (options.mnemonic) return "direct";
   return "pool";
+}
+
+/**
+ * Build the signer-related DeployOptions fields from a resolved `resolveDeployActors`
+ * result. Pulled out of the resolve branch (bulletin #1452) so the session-vs-local
+ * distinction that gates Bulletin storage routing is directly unit-testable without
+ * exercising `resolveDeployActors`' SSO stack. Exported for unit testing.
+ */
+export function deployActorsToSignerOptions(
+  actors: { worker: { signer: PolkadotSigner; address: string; source: string }; recipientH160?: string },
+): Pick<DeployOptions, "signer" | "signerAddress" | "transferTo" | "sessionSigner"> {
+  return {
+    signer: actors.worker.signer,
+    signerAddress: actors.worker.address,
+    ...(actors.recipientH160 ? { transferTo: actors.recipientH160 } : {}),
+    sessionSigner: actors.worker.source === "session",
+  };
 }
 
 /**
@@ -632,9 +814,41 @@ export function chooseSignerInput(opts: {
 // Gates both the up-front "phone ready" banner and the per-step "check your phone"
 // reminder — they must agree, so they read the same predicate.
 export function isPhoneSignerActive(
-  options: Pick<DeployOptions, "signer" | "signerAddress" | "transferTo">,
+  options: Pick<DeployOptions, "signer" | "signerAddress" | "transferTo" | "localSigner">,
 ): boolean {
-  return !!(options.signer && options.signerAddress && !options.transferTo);
+  return !!(options.signer && options.signerAddress && !options.transferTo && !options.localSigner);
+}
+
+/**
+ * Build the error bin/polkadot-app-deploy's `confirmPhoneReady` hook throws when
+ * the phone-confirmation gate fires in a non-interactive environment (issue #1363).
+ *
+ * Pre-fix, the CLI unconditionally created a `readline` interface and awaited a
+ * keypress; in a non-interactive shell (no TTY, or CI) readline's `"close"` event
+ * fires immediately because there is no input to deliver, and the gate rejected
+ * with `new Error("aborted by user")` — indistinguishable from a deliberate
+ * Ctrl-C, blaming an operator who was never there. There is no safe default to
+ * fall back to here: unlike a yes/no prompt, silently proceeding would submit a
+ * transaction nobody approved on their phone. So a non-interactive caller must
+ * hard-fail with a message naming the actual fix — swap to a signer that never
+ * needs phone confirmation.
+ *
+ * `NonRetryableError` (not a plain `Error`): retrying in the same CI environment
+ * fails the identical way every time, so bin/polkadot-app-deploy should exit
+ * with EXIT_CODE_NO_RETRY rather than a retryable-looking generic failure.
+ *
+ * Pure and readline-free (unlike the CLI's readline wiring) so it's directly
+ * unit-testable; bin/polkadot-app-deploy calls this only after checking
+ * version-check.ts's `isInteractive()` itself, reusing that existing TTY/CI
+ * detection rather than adding a second one.
+ */
+export function nonInteractivePhoneConfirmationError(label: string): NonRetryableError {
+  return new NonRetryableError(
+    `Phone confirmation required for "${label}" but this run is non-interactive ` +
+      `(no TTY, or a CI environment was detected) — there is nobody to press Y. ` +
+      `Use a signer that never needs phone confirmation: pass --mnemonic, or set ` +
+      `the MNEMONIC or DOTNS_MNEMONIC environment variable.`,
+  );
 }
 
 /**
@@ -709,8 +923,53 @@ export function describeSlotFallbackReason(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-function selectStorageReconnect(options: DeployOptions): () => Promise<ProviderResult> {
-  if (options.storageSigner && options.storageSignerAddress) {
+/**
+ * May a failed allowance slot fall back to the shared `//deploy/N` pool?
+ *
+ * Only off mainnet. The pool is derived from the well-known dev phrase, so on a mainnet chain it
+ * holds no authorization and the fallback cannot succeed — it just trades a precise slot error
+ * for an out-of-quota failure later in the upload, behind a warning that says the situation is
+ * fine. Keyed on the resolved env's declared `network`, the same field used elsewhere to
+ * distinguish testnet-vs-mainnet wording; an env that declares nothing (custom presets, library
+ * callers that never set it) keeps the historical fallback rather than newly hard-failing.
+ */
+export function isPoolFallbackAllowed(network?: string): boolean {
+  return network !== "mainnet";
+}
+
+/**
+ * The refusal itself, extracted so the mainnet branch is unit-testable without a WS connection
+ * (same reasoning as describeSlotFallbackReason). Returns normally when the fallback is allowed;
+ * throws on mainnet, carrying the slot's own failure reason so the message says what actually
+ * went wrong rather than only that storage is unavailable.
+ */
+export function assertPoolFallbackAllowed(network: string | undefined, reason: string): void {
+  if (isPoolFallbackAllowed(network)) return;
+  throw new NonRetryableError(
+    `Bulletin allowance slot not usable: ${reason}. ` +
+    `On mainnet storage must run on your own allowance — the shared pool account holds no ` +
+    `quota there, so there is nothing to fall back to. Run: ${CLI_NAME} logout && ${CLI_NAME} login`,
+  );
+}
+
+// bulletin #1637: the pending-tx queue check costs 8 fresh connections per endpoint (plus a 12 s confirm
+// wait on a large gap), and behind a halted endpoint each sample waits out fetchNonce's 8 s timer.
+// Run it on the first provider a deploy creates, not on every mid-upload reconnect (S8's budget).
+function firstCallChecksQueue(make: (checkQueue: boolean) => Promise<ProviderResult>): () => Promise<ProviderResult> {
+  let first = true;
+  return () => {
+    const checkQueue = first;
+    first = false;
+    return make(checkQueue);
+  };
+}
+
+export function selectStorageReconnect(options: DeployOptions): () => Promise<ProviderResult> {
+  // Delegate the mode decision to the pure, unit-tested selector (bulletin #1452) so this
+  // function and __selectStorageProviderModeForTest can never disagree about which branch runs.
+  const mode = __selectStorageProviderModeForTest(options);
+  const pool = firstCallChecksQueue((checkQueue) => getProvider({ checkQueue }));
+  if (mode === "storageSigner") {
     // Committed-signer: once the slot provider fails on the first attempt,
     // every subsequent reconnect uses pool. Prevents signer drift mid-upload
     // (nonce/attribution would break if storage switched signers between chunks).
@@ -720,40 +979,42 @@ function selectStorageReconnect(options: DeployOptions): () => Promise<ProviderR
     // unavailable (or retries were exhausted) — not a single WS blip.
     let useSlot = true;
     return async () => {
-      if (!useSlot) return getProvider();
+      if (!useSlot) return pool();
       try {
         return await getSlotSignerProvider(options.storageSigner!, options.storageSignerAddress!);
       } catch (e) {
+        const reason = describeSlotFallbackReason(e);
+        // The pool cannot store on mainnet (dev-phrase accounts, no grant), so falling back
+        // would only defer the failure past the upload. Fail here, where the cause is known.
+        // Attribute first: the refusal throws, and the reason must reach telemetry either way.
+        setDeployAttribute("deploy.signer.fallback_reason", reason);
+        assertPoolFallbackAllowed(bulletinNetwork, reason);
         useSlot = false;
         setDeployAttribute("deploy.signer.mode", "pool-fallback");
-        const reason = describeSlotFallbackReason(e);
-        setDeployAttribute("deploy.signer.fallback_reason", reason);
         console.warn(
           `⚠  Bulletin allowance slot not usable: ${reason}\n` +
           `   Falling back to the shared pool account for storage (fine on testnet).\n` +
           `   To use your own allowance, run: ${CLI_NAME} logout && ${CLI_NAME} login`,
         );
-        // TODO (mainnet): hard-fail here instead of pool fallback when running against mainnet
-        // (tie to the open mainnet-storage-signer gap in src/CLAUDE.md). Env-gating deferred
-        // until mainnet is live.
-        return getProvider();
+        return pool();
       }
     };
   }
-  // External signer (options.signer + options.signerAddress): use getSignerProvider for
-  // Bulletin storage when no dedicated slot signer is available. This supports
-  // programmatic callers (playground-cli, library consumers) that pass their own
-  // PolkadotSigner without a pre-allocated BulletInAllowance slot key.
-  if (options.signer && options.signerAddress)
+  // External signer (options.signer + options.signerAddress, NOT session-backed): use
+  // getSignerProvider for Bulletin storage when no dedicated slot signer is available.
+  // This supports programmatic callers (playground-cli, library consumers) that pass
+  // their own PolkadotSigner without a pre-allocated BulletInAllowance slot key. A
+  // phone-backed session signer with no slot (mode "pool" — bulletin #1452) falls
+  // through below.
+  if (mode === "signer")
     return () => getSignerProvider(options.signer!, options.signerAddress!);
-  if (options.mnemonic)
-    return () => getDirectProvider(options.mnemonic!, options.derivationPath);
-  return () => getProvider();
+  if (mode === "direct")
+    return firstCallChecksQueue((checkQueue) => getDirectProvider(options.mnemonic!, options.derivationPath, { checkQueue }));
+  return pool;
 }
 
-function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuccess: (event?: any) => T, { label = "transaction", rpc, senderSS58, expectedNonce, timeoutMs, fetchNonce: fetchNonceOverride }: WatchTransactionOptions = {}): Promise<WatchResult<T>> {
+function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuccess: (event?: any) => T, { label = "transaction", timeoutMs, confirmIncluded }: WatchTransactionOptions = {}): Promise<WatchResult<T>> {
   const timeout = timeoutMs ?? TX_TIMEOUT_MS;
-  const _fetchNonce = fetchNonceOverride ?? fetchNonce;
   return new Promise<WatchResult<T>>((resolve, reject) => {
     let settled = false;
     let sub: any;
@@ -764,31 +1025,31 @@ function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuc
       try { sub?.unsubscribe(); } catch {}
       fn(...args);
     };
-    // Nonce-based fallback: check whether nonce advanced (tx actually got
-    // included) even though the subscription can't confirm it. Uses
-    // verifyNonceAdvanced (allSettled + any-peer-advanced) when multiple
-    // endpoints are provided — prevents a fast-but-stale primary from masking
-    // confirmation seen by a backup peer (AC#1 from #153).
-    const tryNonceFallback = async (): Promise<boolean> => {
-      if (!rpc || !senderSS58 || expectedNonce == null) return false;
+    // Chain-evidence fallback (#1656): when the subscription cannot confirm the
+    // tx, ask the chain whether its effect (the stored CID) is at the best
+    // block. The old fallback compared system_accountNextIndex with the tx's
+    // nonce; nextIndex counts the pool, including this very tx while it is
+    // still pending, so a pending chunk read as "included".
+    const tryChainFallback = async (): Promise<boolean> => {
+      if (!confirmIncluded) return false;
       try {
-        const endpoints = Array.isArray(rpc) ? rpc : [rpc];
-        const verified = await verifyNonceAdvanced(endpoints, senderSS58, expectedNonce);
+        const present = await confirmIncluded();
         if (settled) return true;
-        if (verified.advanced) {
-          console.log(`      ${label}: nonce advanced past ${expectedNonce} (witnessed by ${verified.witnessRpc}), tx was included`);
+        if (present) {
+          console.log(`      ${label}: found at the best block by a content-hash probe, tx was included`);
           settle(resolve)({ value: onSuccess(), viaFallback: true });
           return true;
         }
+        console.log(`      ${label}: not found at the best block`);
       } catch (e: any) {
         if (settled) return true;
-        console.log(`      ${label}: nonce fallback failed: ${e.message?.slice(0, 80)}`);
+        console.log(`      ${label}: best-block probe failed: ${e.message?.slice(0, 80)}`);
       }
       return false;
     };
     const timer = setTimeout(async () => {
       if (settled) return;
-      if (await tryNonceFallback()) return;
+      if (await tryChainFallback()) return;
       settle(reject)(new Error(`${label} timed out after ${timeout / 1000}s waiting for block confirmation`));
     }, timeout);
     sub = tx.signSubmitAndWatch(signer, txOpts).subscribe({
@@ -810,7 +1071,7 @@ function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuc
         //                   reorged out and waiting to re-include). Normal pre-
         //                   inclusion state — keep waiting.
         //   isValid:false → tx has been rejected by the pool and will never
-        //                   include. Run the nonce fallback (in case the chain
+        //                   include. Probe the best block (in case the chain
         //                   actually included it but a peer disagrees) then
         //                   reject so the retry loop can reissue with a fresh
         //                   nonce. The previous code counted every isValid:true
@@ -818,8 +1079,8 @@ function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuc
         //                   spurious `tx dropped from best chain 5 times`
         //                   failures on slow blocks.
         if (event.isValid === false) {
-          console.log(`      ${label}: tx rejected by pool (isValid:false), checking nonce fallback...`);
-          if (await tryNonceFallback()) return;
+          console.log(`      ${label}: tx rejected by pool (isValid:false), probing the best block...`);
+          if (await tryChainFallback()) return;
           settle(reject)(new Error(`${label} tx rejected by pool (isValid:false)`));
         }
       },
@@ -832,30 +1093,139 @@ function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuc
 }
 
 /**
- * Reconcile-before-resubmit (#1051). Pure decision function — no chain I/O —
- * so it's directly unit-testable. Decides whether a timed-out chunk tx
- * should be treated as already included (skip the resubmit, avoid a
- * duplicate content write) based on two independent signals:
- *   - nonce advance: the account's nonce moved past the chunk's assigned
- *     nonce. Only meaningful when `nonceHeuristicValid` — false after a pool
- *     account rotation, where the old nonce baseline belongs to a different
- *     account (#951).
- *   - CID presence at best-block: a direct probe of the chunk's own content
- *     hash, independent of account/nonce bookkeeping entirely. Catches
- *     inclusion the nonce heuristic can miss (e.g. the endpoint used for the
- *     nonce fetch is briefly behind a peer that already saw the tx land).
- * Either signal alone is sufficient.
+ * Reconcile-before-resubmit (#1051), decided by chain evidence only (#1641,
+ * #1656). Pure, no chain I/O. Three outcomes for a timed-out chunk tx:
+ *   - "included": its CID is present at the best block. The only signal that
+ *     counts as stored.
+ *   - "verify": the account's nonce moved past the chunk's nonce, but its CID
+ *     is not at best. The nonce was read from system_accountNextIndex, which
+ *     counts pool txs: the chunk's own pending tx, or a sibling deploy's tx on
+ *     the same signer (S9), moves it too. So this is a ROUTING signal, never
+ *     inclusion: the chunk is marked provisional and the post-batch verify
+ *     loop probes it, re-uploading at a fresh nonce if it is absent. Only
+ *     meaningful when `nonceHeuristicValid`, false after a pool account
+ *     rotation, where the old nonce belongs to another account (#951).
+ *   - "resubmit": neither.
  */
+export type ReconcileDecision = "included" | "verify" | "resubmit";
 export function reconcileTimedOutChunk(opts: {
   originalNonce: number | undefined;
   currentNonce: number;
   nonceHeuristicValid: boolean;
   cidPresentAtBest: boolean | null;
-}): boolean {
+}): ReconcileDecision {
   const { originalNonce, currentNonce, nonceHeuristicValid, cidPresentAtBest } = opts;
-  if (cidPresentAtBest === true) return true;
-  if (nonceHeuristicValid && originalNonce !== undefined && originalNonce < currentNonce) return true;
-  return false;
+  if (cidPresentAtBest === true) return "included";
+  if (nonceHeuristicValid && originalNonce !== undefined && originalNonce < currentNonce) return "verify";
+  return "resubmit";
+}
+
+/**
+ * Bounded nonce read for every Bulletin nonce a chunk/root tx is signed with
+ * (#1641). system_accountNextIndex is pool-aware, which a shared signer needs
+ * (S9: a second deploy must stack above the first one's pending txs), but a
+ * load-balanced backend holding a stuck, never-gossiped run reports a future
+ * nonce. The first read goes over the deploy's own connection (the backend its
+ * txs are submitted to, so its pool view is the one that matters); re-reads
+ * use fresh connections (a new backend pick). The floor is the on-chain nonce
+ * at the BEST block:
+ *   - nextIndex at most `bound` (STUCK_NONCE_GAP_THRESHOLD, the #1640 in-flight
+ *     bound) above it is accepted;
+ *   - below it (a lagging backend) the on-chain nonce is used;
+ *   - further ahead is a stuck backend: re-read on a fresh connection (a new
+ *     backend pick), up to `reads` times, then sign from the on-chain nonce.
+ * If the on-chain read itself fails, the nextIndex read is used unbounded, as
+ * before #1641: correctness never rests on the nonce, every chunk is accepted
+ * only on chain evidence, so the worst case is timeouts, not a false success.
+ */
+export async function readBoundedChunkNonce(deps: {
+  readOnchainNonce: () => Promise<number>;
+  /** `attempt` is 1-based. */
+  readNextIndex: (attempt: number) => Promise<number>;
+  bound?: number;
+  reads?: number;
+  log?: (msg: string) => void;
+}): Promise<number> {
+  const bound = deps.bound ?? STUCK_NONCE_GAP_THRESHOLD;
+  const reads = deps.reads ?? 3;
+  const log = deps.log ?? ((m: string) => console.log(m));
+  // The on-chain read and the first nextIndex read are independent: run them together.
+  const [onchainRes, firstRes] = await Promise.allSettled([
+    Promise.resolve().then(deps.readOnchainNonce).then((v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n)) throw new Error(`not a number: ${v}`);
+      return n;
+    }),
+    Promise.resolve().then(() => deps.readNextIndex(1)),
+  ]);
+  if (onchainRes.status === "rejected") {
+    const e = onchainRes.reason;
+    log(`   Could not read the on-chain nonce at best (${String(e?.message ?? e).slice(0, 80)}); using system_accountNextIndex unbounded`);
+    if (firstRes.status === "rejected") throw firstRes.reason;
+    return Number(firstRes.value);
+  }
+  const onchain = onchainRes.value;
+  const read = (i: number): Promise<number> => i > 1 ? deps.readNextIndex(i)
+    : firstRes.status === "fulfilled" ? Promise.resolve(firstRes.value) : Promise.reject(firstRes.reason);
+  for (let i = 1; i <= reads; i++) {
+    let n: number;
+    try {
+      n = Number(await read(i));
+    } catch (e: any) {
+      log(`   system_accountNextIndex read failed (${String(e?.message ?? e).slice(0, 80)}) (${i}/${reads})`);
+      continue;
+    }
+    if (n <= onchain) return onchain;
+    if (n - onchain <= bound) return n;
+    log(`   system_accountNextIndex ${n} is ${n - onchain} above the on-chain nonce ${onchain} at best (bound ${bound}): stuck backend, re-reading (${i}/${reads})`);
+  }
+  log(`   No in-bound system_accountNextIndex read; signing from the on-chain nonce ${onchain} at best`);
+  return onchain;
+}
+
+/**
+ * readBoundedChunkNonce bound to a live Bulletin connection. Getters, because
+ * the client, api and account change on reconnect and pool rotation. The
+ * first nextIndex read goes over the deploy's own connection (the backend its
+ * txs are submitted to); re-reads open fresh connections via `fetchNonceFn`.
+ * Both reads carry their own ceiling: a stalled-but-open socket would
+ * otherwise wait out the 300 s heartbeat.
+ */
+function boundedNonceReader(p: {
+  client: () => any; unsafeApi: () => any; ss58: () => string;
+  fetchNonceFn: (rpc: string | string[], ss58: string) => Promise<number>;
+}): () => Promise<number> {
+  return () => readBoundedChunkNonce({
+    readOnchainNonce: async () => Number((await withTimeout<any>(() => p.unsafeApi().query.System.Account.getValue(p.ss58(), { at: "best" }), 10_000, "on-chain nonce read")).nonce),
+    readNextIndex: async (attempt: number) => {
+      if (attempt === 1) {
+        try {
+          const n = await withTimeout(() => p.client()._request("system_accountNextIndex", [p.ss58()]), 8_000, "system_accountNextIndex");
+          if (typeof n === "number") return n;
+        } catch { /* fall back to a fresh connection */ }
+      }
+      return p.fetchNonceFn(BULLETIN_ENDPOINTS, p.ss58());
+    },
+  });
+}
+
+/** Re-probes the present:null results once and merges the answers by CID. */
+async function reprobeUnanswered(results: ChunkProbeResult[], client: any): Promise<ChunkProbeResult[]> {
+  const unknown = results.filter(r => r.present === null).map(r => r.cid);
+  if (unknown.length === 0) return results;
+  const again = new Map((await probeChunks(unknown, { client })).map(r => [r.cid, r]));
+  return results.map(r => (r.present === null ? (again.get(r.cid) ?? r) : r));
+}
+
+/** #1656/#1657: a chunk's on-chain presence could not be established at the best block. */
+export class ChunkInclusionUnverifiedError extends Error {
+  constructor(message: string) { super(message); this.name = "ChunkInclusionUnverifiedError"; }
+}
+
+/** Best-block presence of one CID, as a watch fallback: true only on a positive probe. */
+async function cidPresentAtBest(client: any, cid: string): Promise<boolean> {
+  const [probe] = await probeChunks([cid], { client });
+  return probe?.present === true;
 }
 
 /**
@@ -886,14 +1256,15 @@ async function waitForChainLiveness(client: any, lastHeight: number | null, time
 /** Test-only alias — exported for unit tests that inject a short timeout/poll. */
 export const __waitForChainLivenessForTest = waitForChainLiveness;
 
-async function storeChunk(unsafeApi: any, signer: PolkadotSigner, chunkBytes: Uint8Array, nonce: number, ss58: string, opts: { fetchNonce?: WatchTransactionOptions["fetchNonce"] } = {}): Promise<StoredChunk> {
+// `opts.client` is a getter: the caller's client is reassigned on reconnect and destroyed on a WS halt.
+async function storeChunk(unsafeApi: any, signer: PolkadotSigner, chunkBytes: Uint8Array, nonce: number, opts: { client?: () => any } = {}): Promise<StoredChunk> {
   const cid = createCID(chunkBytes, CID_CONFIG.codec, CID_CONFIG.hashCode);
   const tx = unsafeApi.tx.TransactionStorage.store_with_cid_config({ cid: { codec: BigInt(CID_CONFIG.codec), hashing: toHashingEnum(CID_CONFIG.hashCode) }, data: chunkBytes });
   const txOpts = { mortality: { mortal: true, period: CHUNK_MORTALITY_PERIOD }, nonce };
   const { value, viaFallback, receipt } = await watchTransaction(tx, signer, txOpts, () => {
     console.log(`      CID: ${cid.toString()}`);
     return { cid, len: chunkBytes.length };
-  }, { label: `chunk(nonce:${nonce})`, rpc: BULLETIN_ENDPOINTS, senderSS58: ss58, expectedNonce: nonce, timeoutMs: CHUNK_TIMEOUT_MS, fetchNonce: opts.fetchNonce });
+  }, { label: `chunk(nonce:${nonce})`, timeoutMs: CHUNK_TIMEOUT_MS, confirmIncluded: opts.client ? () => cidPresentAtBest(opts.client!(), cid.toString()) : undefined });
   return { ...value, viaFallback, receipt };
 }
 
@@ -969,7 +1340,7 @@ function assignDenseNonces(stored: (StoredChunk | null)[], startNonce: number): 
 
 export const __assignDenseNoncesForTest = assignDenseNonces;
 
-export async function storeChunkedContent(chunks: Uint8Array[], { client: existingClient, unsafeApi: existingApi, signer: existingSigner, ss58: existingSS58, reconnect, fetchNonce: fetchNonceOverride, skipCids, probeFailedCids, gateway: providerGateway, trustedCids, skipRootStore }: ExistingProvider = {}): Promise<{ storageCid: string; tier2Verified: number; tier2Inconclusive: number; tier2Fallback: number; liveProvider: ExistingProvider; skipProbeResults: Map<string, true | false | null>; rootSkipped: boolean }> {
+export async function storeChunkedContent(chunks: Uint8Array[], { client: existingClient, unsafeApi: existingApi, signer: existingSigner, ss58: existingSS58, reconnect, fetchNonce: fetchNonceOverride, skipCids, probeFailedCids, gateway: providerGateway, trustedCids, skipRootStore, handOffLiveClient }: ExistingProvider = {}): Promise<{ storageCid: string; tier2Verified: number; tier2Inconclusive: number; tier2Fallback: number; liveProvider: ExistingProvider; skipProbeResults: Map<string, true | false | null>; rootSkipped: boolean }> {
   const _fetchNonce = fetchNonceOverride ?? fetchNonce;
   console.log(`\n   Data chunks: ${chunks.length}`);
   const totalBytes = chunks.reduce((s: number, c: Uint8Array) => s + c.length, 0);
@@ -1014,8 +1385,9 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
   // existence + non-expiry ONLY — we do NOT gate on the txs/bytes allowance
   // counters. The Bulletin `store` extrinsic uses soft limits, so an authorized,
   // unexpired account stores fine even with exhausted/zeroed quota counters
-  // (the allowance fields are no longer the gate). Deploy no longer
-  // self-authorizes (#745); fail fast if there is no active authorization —
+  // (the allowance fields are no longer the gate; an exhausted-but-unexpired
+  // account is warned about below — bulletin #1547 — not blocked). Deploy no
+  // longer self-authorizes (#745); fail fast if there is no active authorization —
   // it must be granted out-of-band (testnet faucet / personhood / pool bootstrap).
   //
   // Arm order matters: the raw papi read can throw *synchronously* on a destroyed
@@ -1040,6 +1412,26 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
   const sufficient = isAuthorizationSufficient(uploadAuth, currentBlockNum);
   if (!sufficient) {
     throw new NonRetryableError(`Account ${ss58} has no active Bulletin authorization (missing or expired). Request authorization on-chain (testnet faucet / personhood / pool bootstrap), then retry.`);
+  }
+
+  // bulletin #1547 (check/warn half only): existence+expiry alone doesn't mean full
+  // priority — an unexpired account can still be out of transaction/byte quota, which
+  // drops it behind accounts that have headroom (never a store failure, only a priority
+  // loss; see quotaHeadroomDimensions' comment in pool.ts). Now that chunks are known,
+  // size the real need (one tx per chunk; total bytes as an upper bound) and warn.
+  // polkadot-app-deploy never self-authorizes Bulletin storage, so unlike bulletin-deploy
+  // this never re-grants — reuses uploadAuth/currentBlockNum read just above instead of a
+  // second RPC round trip.
+  const authResult = await ensureAuthorized(unsafeApi, ss58 as string, "storage account", {
+    needs: { transactions: chunks.length, bytes: BigInt(totalBytes) },
+    precheckedAuth: { auth: uploadAuth, currentBlock: currentBlockNum },
+    network: bulletinNetwork,
+  });
+  if (authResult.quotaExhausted) {
+    console.warn(
+      `   Warning: Bulletin storage account ${ss58}'s allowance is exhausted (${authResult.dimensions.join("/")}). ` +
+      `polkadot-app-deploy does not auto-reauthorize, so uploads are BEST EFFORT — queued behind accounts that still have quota.`,
+    );
   }
 
   let reconnectionsUsed = 0;
@@ -1103,9 +1495,16 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     try { client.destroy(); } catch { /* already destroyed; safe */ }
   });
 
+  // Every nonce a chunk/root tx is signed with is bounded by the on-chain
+  // nonce at best (#1641). Reads the CURRENT client/account: both change on
+  // reconnect and pool rotation.
+  const readChunkNonce = boundedNonceReader({ client: () => client, unsafeApi: () => unsafeApi, ss58: () => ss58 as string, fetchNonceFn: _fetchNonce });
+  // storeChunk's best-block probe must follow `client` across reconnects.
+  const chunkOpts = { client: () => client };
+
   try {
 
-    let startNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
+    let startNonce = await readChunkNonce();
     console.log(`   Starting nonce: ${startNonce}`);
     // Two-mode batching (#216 d): start with 2 in flight to amortise round-
     // trip latency, but drop to 1 once we've burned a reconnect — halves
@@ -1131,6 +1530,45 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     // callers (e.g. storeDirectoryV2) that need per-chunk results for manifest
     // construction without running a separate external probe round.
     const skipProbeResults = new Map<string, true | false | null>();
+    // Every chunk stored on anything but a watch event: probe-confirmed
+    // (viaFallback) or provisional. The post-batch verify loop is the only
+    // way out of this set, and the only way storeChunkedContent can return.
+    const nonceAdvanceIndices = new Set<number>();
+    const markProvisional = (idx: number): void => {
+      stored[idx] = { cid: createCID(chunks[idx], CID_CONFIG.codec, 0x12), len: chunks[idx].length, viaFallback: true };
+      nonceAdvanceIndices.add(idx);
+    };
+    // Best-block probe that never lets present:null pass (#1657). A null after
+    // a WS halt is a dead socket, not an unknown chunk: reconnect (whose own
+    // exhaustion message is what S8's storm accepts) and ask again. Returns
+    // the absent results; throws ChunkInclusionUnverifiedError when a chunk
+    // stays unanswered after MAX_REPROBE_RETRIES re-probes.
+    const probeAtBestUntilAnswered = async (cids: string[]): Promise<{ cid: string }[]> => {
+      let results = await probeChunks(cids, { client });
+      for (let attempt = 1; results.some(r => r.present === null); attempt++) {
+        const unknown = results.filter(r => r.present === null);
+        const reason = (unknown[0] as { failureReason?: string }).failureReason ?? "unknown";
+        if (attempt > MAX_REPROBE_RETRIES) {
+          const unknownCids = new Set(unknown.map(r => r.cid));
+          const idxs = chunkCidsComputed.flatMap((c, i) => (unknownCids.has(c.toString()) ? [i + 1] : []));
+          throw new ChunkInclusionUnverifiedError(
+            `Could not verify that chunk ${idxs.join(", ")} is stored on-chain: the TransactionByContentHash probe at the best ` +
+            `block gave no answer ${MAX_REPROBE_RETRIES + 1} times (${reason}). Not treating it as stored. Check the Bulletin RPC ` +
+            `(${BULLETIN_ENDPOINTS[0]}) and re-run the deploy; chunks already on-chain are skipped.`,
+          );
+        }
+        if (wsHaltDetected && reconnect) {
+          // Throws the existing "max reconnections exhausted" error once the budget is spent.
+          wsHaltDetected = false;
+          await doReconnect();
+        } else {
+          await new Promise(r => setTimeout(r, RETRY_BASE_DELAY_MS));
+        }
+        console.log(`   ${unknown.length} chunk probe(s) unanswered (${reason}), re-probing (${attempt}/${MAX_REPROBE_RETRIES})`);
+        results = await reprobeUnanswered(results, client);
+      }
+      return results.filter(r => r.present === false);
+    };
 
     // Single pass to compute CIDs and handle both trustedCids (no-reprobe skip)
     // and skipCids (reprobe before skip) in one chunk iteration.
@@ -1148,7 +1586,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       if (trustedCids?.has(cidStr)) {
         stored[i] = { cid, len: chunks[i].length, viaFallback: true };
         trustedCount++;
-        trustedIndices.push(i);
+        trustedIndices.push(i + 1);
       } else if (skipCids?.has(cidStr)) {
         skipCidsCandidates.push({ index: i, cid });
       }
@@ -1162,7 +1600,9 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
 
     if (skipCidsCandidates.length > 0) {
       const cidStrings = skipCidsCandidates.map(c => c.cid.toString());
-      const probeResults = await probeChunks(cidStrings, { client });
+      // One re-probe for unanswered CIDs (as probeFinalityGap does) before
+      // falling back to uploading them.
+      const probeResults = await reprobeUnanswered(await probeChunks(cidStrings, { client }), client);
       const probeResultMap = new Map(probeResults.map(r => [r.cid, r.present]));
       for (const r of probeResults) skipProbeResults.set(r.cid, r.present);
 
@@ -1170,19 +1610,20 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       for (const { index: i, cid } of skipCidsCandidates) {
         const cidStr = cid.toString();
         const present = probeResultMap.get(cidStr) ?? null;
-        if (present !== false) {
+        if (present === true) {
+          // Only a positive answer skips the upload (#1657). An unanswered
+          // probe is not evidence, so that chunk is uploaded like an absent
+          // one: a duplicate store is harmless, a missing chunk is not.
           stored[i] = { cid, len: chunks[i].length, viaFallback: true };
           confirmedCount++;
-          if (present === true) {
-            tier2Verified++;
-          } else {
-            tier2Inconclusive++;
-          }
+          tier2Verified++;
+        } else if (present === null) {
+          tier2Inconclusive++;
         } else {
           tier2Fallback++;
         }
       }
-      console.log(`   Cache check: ${confirmedCount} confirmed, ${tier2Fallback} missing${tier2Fallback > 0 ? " (will upload)" : ""}`);
+      console.log(`   Cache check: ${confirmedCount} confirmed, ${tier2Fallback} missing${tier2Inconclusive > 0 ? `, ${tier2Inconclusive} unanswered` : ""}${tier2Fallback + tier2Inconclusive > 0 ? " (will upload)" : ""}`);
     }
 
     // Pre-compute dense nonces: skipped chunks consume zero nonce slots, so the
@@ -1205,7 +1646,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     const doReconnectAndRebase = async (): Promise<{ changed: boolean; currentNonce: number }> => {
       const prevSS58 = ss58;
       await doReconnect();
-      const currentNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
+      const currentNonce = await readChunkNonce();
       const changed = ss58 !== prevSS58;
       if (changed) {
         assignedNonces = assignDenseNonces(stored, currentNonce);
@@ -1224,7 +1665,10 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     // exceed uploadTotal (e.g. [3/2], [4/2] …) (#932).
     const uploadEmittedIndices = new Set<number>();
     let uploadEmitted = 0;
-    const nonceAdvanceIndices = new Set<number>();
+
+    // E2E-only (#1672): hold here, seed read and nothing submitted yet, until the
+    // sibling deploy has seeded too. A no-op unless its env var is set.
+    if (uploadTotal > 0) await e2eNonceSeedBarrier(startNonce);
 
     let b = 0;
     while (b < chunks.length) {
@@ -1258,8 +1702,8 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
         const nonce = assignedNonces.get(i)!;
         const isRetry = uploadEmittedIndices.has(i);
         if (!isRetry) { uploadEmittedIndices.add(i); uploadEmitted++; }
-        console.log(`   [${uploadEmitted}/${uploadTotal}] chunk ${i} — ${(chunkData.length / 1024 / 1024).toFixed(2)} MB (nonce: ${nonce})${isRetry ? " (retry)" : ""}`);
-        return storeChunk(unsafeApi, signer as PolkadotSigner, chunkData, nonce, ss58 as string, { fetchNonce: fetchNonceOverride });
+        console.log(`   [${uploadEmitted}/${uploadTotal}] chunk ${i + 1} — ${(chunkData.length / 1024 / 1024).toFixed(2)} MB (nonce: ${nonce})${isRetry ? " (retry)" : ""}`);
+        return storeChunk(unsafeApi, signer as PolkadotSigner, chunkData, nonce, chunkOpts);
       });
 
       const results = await Promise.allSettled(batchPromises);
@@ -1287,19 +1731,17 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       const needsReconnect = failures.some(f => isConnectionError(f.error));
       if (needsReconnect && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
         const { changed, currentNonce } = await doReconnectAndRebase();
-        // "nonce consumed → included" heuristic: only valid when the account did
-        // NOT change. On rotation the old assignedNonce baseline belongs to a
-        // different account — currentNonce (new account) is always higher and
-        // would produce a false "included" for chunks never submitted anywhere
-        // (#951). Skip the heuristic; the downstream re-probe backstop in
-        // nonceAdvanceIndices handles genuinely-missing chunks.
+        // "nonce consumed" routing: only valid when the account did NOT change.
+        // On rotation the old assignedNonce baseline belongs to a different
+        // account (#951). A consumed nonce is NOT inclusion (the pool view
+        // counts pending txs, #1656): the chunk goes provisional and the
+        // post-batch verify loop probes it, re-uploading it if absent.
         if (!changed) {
           for (const idx of batchIndices) {
             const chunkNonce = assignedNonces.get(idx);
             if (chunkNonce !== undefined && chunkNonce < currentNonce && stored[idx] === null) {
-              console.log(`   Chunk ${idx}: nonce ${chunkNonce} consumed (current=${currentNonce}), treating as included`);
-              stored[idx] = { cid: createCID(chunks[idx], CID_CONFIG.codec, 0x12), len: chunks[idx].length, viaFallback: true };
-              nonceAdvanceIndices.add(idx);
+              console.log(`   Chunk ${idx + 1}: nonce ${chunkNonce} consumed (current=${currentNonce}), pending on-chain verification`);
+              markProvisional(idx);
               assignedNonces.delete(idx);
             }
           }
@@ -1318,30 +1760,31 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           continue;
         }
         // isValid:false backstop: if the initial failure was a pool rejection AND
-        // the chunk's CID was probe-failed (present:null), the chunk is already on
-        // chain — the probe was a false-negative. Treat as success immediately,
-        // before burning retries on a tx the chain will keep rejecting.
+        // the chunk's CID was probe-failed (present:null), the chunk is probably
+        // already on chain. Stop burning retries on a tx the chain will keep
+        // rejecting, but "probably" is not evidence: it goes provisional and the
+        // post-batch verify loop must find it at best (or re-upload it).
         const failCid = createCID(fail.chunkData, CID_CONFIG.codec, 0x12);
         if (
           probeFailedCids &&
           probeFailedCids.has(failCid.toString()) &&
           fail.error?.message?.includes("isValid:false")
         ) {
-          console.log(`   Chunk ${fail.index}: isValid:false but CID was probe-failed — treating as already on chain`);
-          captureWarning("isValid:false treated as success (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString() });
-          stored[fail.index] = { cid: failCid, len: fail.chunkData.length, viaFallback: true };
+          console.log(`   Chunk ${fail.index + 1}: isValid:false but CID was probe-failed — pending on-chain verification`);
+          captureWarning("isValid:false deferred to verification (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString() });
+          markProvisional(fail.index);
           continue;
         }
         captureWarning("Chunk upload failed, retrying", { chunkIndex: fail.index + 1, maxRetries: MAX_CHUNK_RETRIES, error: fail.error?.message?.slice(0, 200) });
         const isExpiryFailure = fail.error?.message?.includes("isValid:false");
         if (isExpiryFailure) {
-          console.log(`   Chunk ${fail.index}: tx rejected (isValid:false), likely mortal era expiry — reissuing with fresh nonce`);
+          console.log(`   Chunk ${fail.index + 1}: tx rejected (isValid:false), likely mortal era expiry — reissuing with fresh nonce`);
         }
         let retried = false;
         for (let attempt = 1; attempt <= MAX_CHUNK_RETRIES; attempt++) {
           recordRecoveryAndCheckBudget("chunk_retry");
           const retryDelay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), RETRY_MAX_DELAY_MS);
-          console.log(`   Retrying chunk ${fail.index} (attempt ${attempt}/${MAX_CHUNK_RETRIES}) in ${(retryDelay / 1000).toFixed(0)}s...`);
+          console.log(`   Retrying chunk ${fail.index + 1} (attempt ${attempt}/${MAX_CHUNK_RETRIES}) in ${(retryDelay / 1000).toFixed(0)}s...`);
           await new Promise(r => setTimeout(r, retryDelay));
           // If this was a connection error, reconnect before retrying.
           // Use doReconnectAndRebase so that a pool account rotation (new ss58)
@@ -1357,7 +1800,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
             }
           }
           try {
-            const currentNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
+            const currentNonce = await readChunkNonce();
             const originalNonce = assignedNonces.get(fail.index);
             // Reconcile before resubmit (#1051): probe the chunk's own CID at
             // best-block in addition to the nonce heuristic below. Probe
@@ -1372,10 +1815,16 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
             // On rotation, originalNonce is the new account's rebased value and
             // the comparison is not meaningful until the new account actually
             // advances its nonce (#951).
-            if (reconcileTimedOutChunk({ originalNonce, currentNonce, nonceHeuristicValid: !perRetryChanged, cidPresentAtBest })) {
-              console.log(`   Chunk ${fail.index}: reconcile found it already included (nonce ${originalNonce}→${currentNonce}${cidPresentAtBest ? ", CID present at best-block" : ""}) — skipping resubmit`);
-              stored[fail.index] = { cid: createCID(fail.chunkData, CID_CONFIG.codec, 0x12), len: fail.chunkData.length, viaFallback: true };
-              nonceAdvanceIndices.add(fail.index);
+            const decision = reconcileTimedOutChunk({ originalNonce, currentNonce, nonceHeuristicValid: !perRetryChanged, cidPresentAtBest });
+            if (decision !== "resubmit") {
+              if (decision === "included") {
+                console.log(`   Chunk ${fail.index + 1}: reconcile found its CID at the best block — skipping resubmit`);
+                stored[fail.index] = { cid: failCid, len: fail.chunkData.length, viaFallback: true };
+                nonceAdvanceIndices.add(fail.index);
+              } else {
+                console.log(`   Chunk ${fail.index + 1}: nonce ${originalNonce} consumed (current=${currentNonce}) but its CID is not at the best block — pending on-chain verification`);
+                markProvisional(fail.index);
+              }
               assignedNonces.delete(fail.index);
               // progress resets the recovery budget — a landed chunk means recovery is
               // healthy, not thrashing (the budget guards no-progress thrashing only). #864
@@ -1391,11 +1840,12 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
             const heightBefore = await getBestBlockNumber(client);
             const heightAfter = await waitForChainLiveness(client, heightBefore, CHUNK_LIVENESS_MAX_WAIT_MS);
             if (heightBefore != null && heightAfter != null && heightAfter <= heightBefore) {
-              console.log(`   Chunk ${fail.index}: chain still frozen at block ${heightBefore} after ${(CHUNK_LIVENESS_MAX_WAIT_MS / 1000).toFixed(0)}s wait — resubmitting anyway`);
+              console.log(`   Chunk ${fail.index + 1}: chain still frozen at block ${heightBefore} after ${(CHUNK_LIVENESS_MAX_WAIT_MS / 1000).toFixed(0)}s wait — resubmitting anyway`);
             }
             const retryNonce = originalNonce ?? currentNonce;
-            const result = await storeChunk(unsafeApi, signer as PolkadotSigner, fail.chunkData, retryNonce, ss58 as string, { fetchNonce: fetchNonceOverride });
+            const result = await storeChunk(unsafeApi, signer as PolkadotSigner, fail.chunkData, retryNonce, chunkOpts);
             stored[fail.index] = result;
+            if (result.viaFallback) nonceAdvanceIndices.add(fail.index);
             assignedNonces.delete(fail.index);
             // progress resets the recovery budget — a landed chunk means recovery is
             // healthy, not thrashing (the budget guards no-progress thrashing only). #864
@@ -1409,9 +1859,9 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
               probeFailedCids.has(failCid.toString()) &&
               e?.message?.includes("isValid:false")
             ) {
-              console.log(`   Chunk ${fail.index}: retry isValid:false but CID was probe-failed — treating as already on chain`);
-              captureWarning("isValid:false retry treated as success (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString(), attempt });
-              stored[fail.index] = { cid: failCid, len: fail.chunkData.length, viaFallback: true };
+              console.log(`   Chunk ${fail.index + 1}: retry isValid:false but CID was probe-failed — pending on-chain verification`);
+              captureWarning("isValid:false retry deferred to verification (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString(), attempt });
+              markProvisional(fail.index);
               assignedNonces.delete(fail.index);
               retried = true;
               break;
@@ -1431,55 +1881,84 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           if (isConnectionError(fail.error) && reconnectionsUsed >= MAX_RECONNECTIONS) {
             throw new Error(`Connection lost and max reconnections (${MAX_RECONNECTIONS}) exhausted`);
           }
-          throw new Error(`Chunk ${fail.index} failed after ${MAX_CHUNK_RETRIES} retries: ${fail.error?.message?.slice(0, 100)}`);
+          throw new Error(`Chunk ${fail.index + 1} failed after ${MAX_CHUNK_RETRIES} retries: ${fail.error?.message?.slice(0, 100)}`);
         }
       }
       b += batchSize;
     }
 
+    // Post-batch verify loop (#1656, #1657): the one gate between a chunk
+    // that was not confirmed by a watch event and a successful return. Probes
+    // at the BEST block (never finalized: a lagging GRANDPA head is not
+    // absence, #1049). present:true is the only accept; present:false is
+    // re-uploaded at a fresh bounded nonce and probed again next round;
+    // present:null is retried, then fails by name. Bounded: at most
+    // MAX_REPROBE_RETRIES re-upload rounds, then one last probe round.
     if (nonceAdvanceIndices.size > 0) {
-      const cidToIndex = new Map([...nonceAdvanceIndices].map(i => [(stored[i] as StoredChunk).cid.toString(), i]));
       setDeployAttribute("deploy.pool.nonce_collision_count", nonceAdvanceIndices.size);
-
-      const probeResults = await probeChunks([...cidToIndex.keys()], { client });
-      const missingResults = probeResults.filter(r => r.present === false);
-      setDeployAttribute("deploy.pool.nonce_collision_missing", missingResults.length);
-
-      if (missingResults.length > 0) {
+      const pending = new Set(nonceAdvanceIndices);
+      let reuploadCount = 0;
+      for (let round = 1; pending.size > 0; round++) {
+        const cidToIndex = new Map([...pending].map(i => [(stored[i] as StoredChunk).cid.toString(), i]));
+        const missingResults = await probeAtBestUntilAnswered([...cidToIndex.keys()]);
+        const missingCids = new Set(missingResults.map(m => m.cid));
+        for (const [cid, idx] of cidToIndex) if (!missingCids.has(cid)) pending.delete(idx);
+        // First round only: how many chunks the batch left absent at best.
+        if (round === 1) setDeployAttribute("deploy.pool.nonce_collision_missing", missingResults.length);
+        if (missingResults.length === 0) break;
+        if (round > MAX_REPROBE_RETRIES) {
+          throw new ChunkInclusionUnverifiedError(
+            `Chunk ${missingResults.map(m => cidToIndex.get(m.cid)! + 1).join(", ")} still absent at the best block after ` +
+            `${MAX_REPROBE_RETRIES} re-upload rounds; not treating it as stored. The Bulletin chain is accepting the account's ` +
+            `txs but not including this chunk: check the account's pending queue and re-run the deploy.`,
+          );
+        }
         captureWarning("nonce-advance collision: re-uploading missing chunks", {
           collision_count: missingResults.length,
         });
-      }
 
-      // A WS halt between the batch loop and here leaves the client destroyed
-      // with no chunk error to trigger doReconnect; rebuild before re-uploading
-      // (mirrors the proactive guard at the top of the batch loop, ~L932). #946
-      if (wsHaltDetected && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
-        wsHaltDetected = false;
-        await doReconnect();
-      }
+        // A WS halt between the batch loop and here leaves the client destroyed
+        // with no chunk error to trigger doReconnect; rebuild before re-uploading
+        // (mirrors the proactive guard at the top of the batch loop, ~L932). #946
+        if (wsHaltDetected && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
+          wsHaltDetected = false;
+          await doReconnect();
+        }
 
-      let reuploadCount = 0;
-      for (const m of missingResults) {
-        const idx = cidToIndex.get(m.cid)!;
-        for (let attempt = 1; attempt <= MAX_REPROBE_RETRIES; attempt++) {
-          console.log(`   Nonce-collision re-upload: chunk ${idx} (attempt ${attempt}/${MAX_REPROBE_RETRIES})`);
-          try {
-            const freshNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
-            const result = await storeChunk(unsafeApi, signer as PolkadotSigner, chunks[idx], freshNonce, ss58 as string, { fetchNonce: fetchNonceOverride });
-            stored[idx] = result;
-            reuploadCount++;
-            break;
-          } catch (e: any) {
-            // ChainHead disjointed / WS drop: rebuild the client (rebinds
-            // unsafeApi/signer/ss58) and retry the remaining attempts against
-            // it, instead of re-running every attempt on the dead client —
-            // matches the batch-retry and root-store loops. #946
-            if (isConnectionError(e) && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
-              try { await doReconnect(); } catch { /* fall through to retry / final-attempt throw */ }
-            }
-            if (attempt === MAX_REPROBE_RETRIES) {
-              throw new Error(`Nonce-collision re-upload of chunk ${idx} failed after ${MAX_REPROBE_RETRIES} attempts: ${e.message?.slice(0, 100)}`);
+        for (const m of missingResults) {
+          const idx = cidToIndex.get(m.cid)!;
+          for (let attempt = 1; attempt <= MAX_REPROBE_RETRIES; attempt++) {
+            console.log(`   Nonce-collision re-upload: chunk ${idx + 1} (attempt ${attempt}/${MAX_REPROBE_RETRIES})`);
+            let freshNonce: number | undefined;
+            try {
+              freshNonce = await readChunkNonce();
+              const result = await storeChunk(unsafeApi, signer as PolkadotSigner, chunks[idx], freshNonce, chunkOpts);
+              // A watch event in a best block is evidence; a probe-confirmed
+              // result is re-verified next round.
+              stored[idx] = result;
+              if (!result.viaFallback) pending.delete(idx);
+              reuploadCount++;
+              break;
+            } catch (e: any) {
+              // ChainHead disjointed / WS drop: rebuild the client (rebinds
+              // unsafeApi/signer/ss58) and retry the remaining attempts against
+              // it, instead of re-running every attempt on the dead client —
+              // matches the batch-retry and root-store loops. #946
+              if (isConnectionError(e) && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
+                try { await doReconnect(); } catch { /* fall through to retry / final-attempt throw */ }
+              } else if (isNonceCollisionError(e)) {
+                // The sibling deploy took the nonce again (#1672). Back off by a random
+                // offset; once this round's attempts are spent the chunk stays pending
+                // and the next verify round probes and re-uploads it (bounded by rounds).
+                const last = attempt === MAX_REPROBE_RETRIES;
+                console.log(`   Chunk ${idx + 1}: re-upload nonce ${freshNonce} collided${last ? `; left for the next verify round` : ", retrying"}`);
+                await new Promise(r => setTimeout(r, nonceCollisionBackoffMs()));
+                continue;
+              }
+              if (attempt === MAX_REPROBE_RETRIES) {
+                // twin: upstream throws chunkFailureError here (structural InvalidTransaction variant), which this repo has not taken.
+                throw new Error(`Nonce-collision re-upload of chunk ${idx + 1} failed after ${MAX_REPROBE_RETRIES} attempts: ${e.message?.slice(0, 100)}`);
+              }
             }
           }
         }
@@ -1489,10 +1968,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
 
     setDeployAttribute("deploy.pool.account", truncateAddress(ss58) as string);
 
-    const submittedCount = stored.filter((s): s is StoredChunk => !!s && !s.viaFallback).length;
-    console.log(submittedCount === 0
-      ? `\n   All ${chunks.length} chunks already on chain — nothing submitted`
-      : `\n   All ${chunks.length} chunks included in block`);
+    console.log("\n   " + formatUploadInclusionLine(chunks.length, uploadTotal));
 
     // Verify chunk integrity before building DAG
     console.log(`   Verifying chunk integrity...`);
@@ -1504,7 +1980,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     for (let i = 0; i < chunks.length; i++) {
       const expectedCid = createCID(chunks[i], CID_CONFIG.codec, 0x12);
       if (verifiedStored[i].cid.toString() !== expectedCid.toString()) {
-        throw new Error(`Chunk verification failed: chunk ${i} CID mismatch (expected ${expectedCid}, got ${verifiedStored[i].cid})`);
+        throw new Error(`Chunk verification failed: chunk ${i + 1} CID mismatch (expected ${expectedCid}, got ${verifiedStored[i].cid})`);
       }
     }
     console.log(`   All ${chunks.length} chunks verified ✓`);
@@ -1557,7 +2033,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     } else {
       const MAX_ROOT_RETRIES = 3;
       for (let rootAttempt = 1; rootAttempt <= MAX_ROOT_RETRIES; rootAttempt++) {
-        const rootNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
+        const rootNonce = await readChunkNonce();
         console.log(`   Storing root node (nonce: ${rootNonce})...`);
         const rootTx = unsafeApi.tx.TransactionStorage.store_with_cid_config({ cid: { codec: BigInt(0x70), hashing: toHashingEnum(hashCode) }, data: dagBytes });
         const rootTxOpts = { mortality: { mortal: true, period: 256 }, nonce: rootNonce };
@@ -1565,22 +2041,28 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           const watchResult = await watchTransaction(rootTx, signer!, rootTxOpts, () => {
             console.log(`   Root CID: ${rootCid.toString()}\n`);
             return rootCid.toString();
-          }, { label: "root-node", rpc: BULLETIN_ENDPOINTS, senderSS58: ss58, expectedNonce: rootNonce, timeoutMs: CHUNK_TIMEOUT_MS, fetchNonce: fetchNonceOverride });
+          }, { label: "root-node", timeoutMs: CHUNK_TIMEOUT_MS, confirmIncluded: () => cidPresentAtBest(client, rootCid.toString()) });
           result = watchResult.value;
           // Root tx is the canonical upload receipt — it finalises the DAG.
           uploadReceipt = watchResult.receipt;
           break;
         } catch (e: any) {
+          // The last attempt rethrows: a retry it would schedule never runs, and the
+          // loop used to exit with no root stored and no error (#1672).
+          if (rootAttempt === MAX_ROOT_RETRIES) throw e;
+          if (classifyRootSubmitError(e, wsHaltDetected) === "nonce-collision") {
+            // Not a connection loss (#1672): re-read the nonce and resubmit on the same client.
+            console.log(`   Root node: nonce ${rootNonce} collided (${e.message?.replace(/\s+/g, " ").slice(0, 80)}), resubmitting at a fresh nonce (attempt ${rootAttempt}/${MAX_ROOT_RETRIES})`);
+            captureWarning("root-node nonce collision: resubmitting", { nonce: rootNonce, attempt: rootAttempt });
+            await new Promise(r => setTimeout(r, nonceCollisionBackoffMs()));
+            continue;
+          }
           if (reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
             await doReconnect();
             continue;
           }
-          if (rootAttempt < MAX_ROOT_RETRIES) {
-            console.log(`   Root node attempt ${rootAttempt} failed: ${e.message?.slice(0, 80)}`);
-            await new Promise(r => setTimeout(r, 6000));
-            continue;
-          }
-          throw e;
+          console.log(`   Root node attempt ${rootAttempt} failed: ${e.message?.slice(0, 80)}`);
+          await new Promise(r => setTimeout(r, 6000));
         }
       }
     }
@@ -1606,7 +2088,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       ownsClient = false;
     }
 
-    if (ownsClient) client.destroy();
+    if (ownsClient && !handOffLiveClient) client.destroy();
     return { storageCid: result as string, tier2Verified, tier2Inconclusive, tier2Fallback, liveProvider: { client, unsafeApi, signer, ss58 }, skipProbeResults, rootSkipped };
   } catch (e) {
     if (ownsClient) client.destroy();
@@ -1661,6 +2143,30 @@ export function computeStorageCid(chunks: Uint8Array[]): string {
   const dagNode = dagPB.prepare({ Data: fileData.marshal(), Links: chunkInfo.map(c => ({ Name: "", Tsize: c.len, Hash: c.cid })) });
   const dagBytes = dagPB.encode(dagNode);
   return createCID(dagBytes, 0x70, hashCode).toString();
+}
+
+/**
+ * Should a storeDirectoryV2 call use the incremental (chunk-dedup) upload
+ * path and embed a .bulletin-deploy/manifest.json cache manifest?
+ *
+ * False for encrypted deploys (existing behavior: encryption breaks
+ * chunk-level dedup) and for mainnet deploys: retention makes a cache stale
+ * on arrival at mainnet's low deploy cadence, and a production name should
+ * not carry build-cache artifacts. Exact `=== "mainnet"` check on purpose —
+ * an env-less deploy (`network: undefined`, bare --rpc) or one whose
+ * resolved env declares no network keeps the historical incremental
+ * behavior; only an env that explicitly declares itself mainnet loses the
+ * cache.
+ *
+ * Not yet wired into storeDirectoryV2 or deploy() — the twin has no mainnet
+ * env configured today, so there is nothing to gate on yet. Ported as a
+ * standalone pure predicate so the shape stays in sync with upstream for
+ * when a mainnet env lands; the wiring (StoreDirectoryOptions.network, the
+ * storeDirectoryV2 early-return gate, and the deploy() call-site restructure)
+ * is deferred.
+ */
+export function usesIncrementalCache(opts: { network?: string; password?: string }): boolean {
+  return opts.network !== "mainnet" && !opts.password;
 }
 
 export interface StoreDirectoryOptions {
@@ -1854,7 +2360,7 @@ export async function readPreviousContenthashSafe(dotns: DotNS, bareLabel: strin
 // CID defaults to "" and the walk behaviour is unchanged.
 //
 // Exported for unit tests.
-export function buildFilesMap(buildDir: string, fileCids: Map<string, string> = new Map()): Record<string, ManifestFileEntry> {
+export function buildFilesMap(buildDir: string, fileCids: Map<string, string> = new Map(), framework: string | null = null): Record<string, ManifestFileEntry> {
   const map: Record<string, ManifestFileEntry> = {};
   function walk(dir: string, prefix = ""): void {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -1868,7 +2374,7 @@ export function buildFilesMap(buildDir: string, fileCids: Map<string, string> = 
         const fileCid = fileCids.get(rel) ?? "";
         let size = 0;
         try { size = fs.statSync(abs).size; } catch { /* manifest path-only */ }
-        const type = classifyFile(rel, { fileCid: fileCid || undefined });
+        const type = classifyFile(rel, { fileCid: fileCid || undefined, framework });
         map[rel] = { cid: fileCid, type, size };
       }
     }
@@ -1889,11 +2395,55 @@ async function readRetentionPeriodBlocks(unsafeApi: any): Promise<number> {
   }
 }
 
-// Cheap heuristic: detect the frontend framework used to generate the build dir.
+// Detect the frontend framework used to generate the build dir, by build
+// markers evaluated against the deployed directory only (C1 — never any
+// history/manifest). Order is presentation only: two markers are ambiguous
+// no matter which matched first, so reordering these checks changes nothing
+// unless the collision rule below changes too. Returns null on ambiguity
+// (more than one marker) or on no marker at all, rather than guessing (C3): a
+// misdetection would apply a real per-framework rule set to the wrong tree,
+// which is worse than falling back to the unchanged global heuristic.
+//
+// Intentionally the same regex object as the classification fallback, not an
+// independent vite pattern: "does this look like a bundler hash" is one
+// question asked in two places. Tightening CONTENT_HASH_RE therefore also
+// retunes vite DETECTION here — check both when you touch it.
+const VITE_ASSET_HASH_RE = CONTENT_HASH_RE;
+
 export function detectFramework(directoryPath: string): string | null {
-  if (fs.existsSync(path.join(directoryPath, "_next"))) return "next";
-  if (fs.existsSync(path.join(directoryPath, "assets"))) return "vite";
-  return null;
+  const markers: string[] = [];
+
+  // Most specific: a parsed manifest field, not a directory name.
+  try {
+    const manifestPath = path.join(directoryPath, "manifest.json");
+    const polkavmBinPath = path.join(directoryPath, "app.polkavm");
+    if (fs.existsSync(manifestPath) && fs.existsSync(polkavmBinPath)) {
+      const obj = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+      if (obj && typeof obj === "object" && obj.runtime && obj.runtime.kind === "polkavm") {
+        markers.push("polkavm-app");
+      }
+    }
+  } catch { /* missing/malformed manifest.json: not a marker */ }
+
+  if (fs.existsSync(path.join(directoryPath, "_next", "static"))) markers.push("next");
+  if (fs.existsSync(path.join(directoryPath, "_nuxt"))) markers.push("nuxt");
+
+  // Vite requires evidence, not just a folder name: an assets/ dir whose
+  // vite-plugin-singlefile output inlines everything comes and goes between
+  // deploys, so a bare directory-presence check flips between UNKNOWN and
+  // "vite" for the same repo. Requiring a hash-shaped entry makes an inlined
+  // single-file build report UNKNOWN consistently — correct, since it has
+  // nothing left to classify.
+  const assetsDir = path.join(directoryPath, "assets");
+  if (fs.existsSync(assetsDir)) {
+    try {
+      const entries = fs.readdirSync(assetsDir);
+      if (entries.some((name) => VITE_ASSET_HASH_RE.test(name))) markers.push("vite");
+    } catch { /* unreadable assets dir: not a marker */ }
+  }
+
+  if (markers.length !== 1) return null;
+  return markers[0];
 }
 
 // ── Deploy size guardrails ─────────────────────────────────────────────────
@@ -1965,6 +2515,52 @@ export function applyManifestFetchAttributes(fetched: { source: string; attempts
   setDeployAttribute("deploy.manifest.bytes_downloaded", String(fetched.bytesDownloaded ?? 0));
 }
 
+// #1011: given the section-1 CIDs Phase A is considering and the set of CIDs the
+// previous manifest vouches for, report how many are new (toCheck), how many are
+// trusted (deduped — a trusted CID repeated in section 1 counts once), and how
+// many are plain duplicates (repeat occurrences of ANY CID, trusted or not),
+// reported separately rather than folded into "trusted".
+//
+// Deduping before counting trusted/toCheck is deliberate: the naive formula
+// `toCheck = uniqueCount - phaseAUploadCids.filter(c => trustedCids.has(c)).length`
+// (counting trusted occurrences over the RAW, non-deduped list) goes negative
+// whenever a trusted CID repeats, and — the bug this replaces — the previous
+// `phaseAUploadCids.length - new Set(phaseAUploadCids).size` formula counted
+// PLAIN DUPLICATES (of any CID, trusted or not) as "trusted from prev manifest",
+// which is how a first deploy (no previous manifest at all) could print a
+// nonzero trusted count purely from a repeated CID in section 1.
+//
+// Exported for unit tests.
+export function computePhaseACounts(
+  uploadCids: string[],
+  trustedCids: Set<string>,
+): { toCheck: number; trusted: number; duplicates: number } {
+  const uniqueCids = [...new Set(uploadCids)];
+  const trusted = uniqueCids.filter((c) => trustedCids.has(c)).length;
+  const toCheck = uniqueCids.length - trusted;
+  const duplicates = uploadCids.length - uniqueCids.length;
+  return { toCheck, trusted, duplicates };
+}
+
+// #1011: `submittedCount` (stored entries where !viaFallback) undercounts real
+// submissions — viaFallback is ALSO set for chunks that genuinely were submitted
+// this run via the nonce-advance heuristic, the timed-out-reconcile path, and the
+// isValid:false probe-failed backstop (none of those are "already on chain from
+// before this call"). `uploadTotal` is captured once, before the submission loop
+// starts, as the count of chunks NOT already resolved by the incremental-cache
+// pre-pass (trustedCids/skipCids) — i.e. the chunks this call actually drove
+// through submission-or-confirmation, whichever path they took. That is the
+// correct "submitted and included" count; `totalChunks - uploadTotal` is the
+// correct "already on chain [before this call]" count.
+//
+// Exported for unit tests.
+export function formatUploadInclusionLine(totalChunks: number, uploadTotal: number): string {
+  if (uploadTotal === 0) {
+    return `All ${totalChunks} chunks already on chain — nothing submitted`;
+  }
+  return `${uploadTotal} submitted and included, ${totalChunks - uploadTotal} already on chain`;
+}
+
 // Incremental upload v2 flow. Wraps the existing storeDirectory pipeline with:
 //  - previous-manifest fetch via the Bulletin gateway
 //  - placeholder/finalise embedded-manifest dance around the merkleize
@@ -1977,6 +2573,22 @@ export function applyManifestFetchAttributes(fetched: { source: string; attempts
 //
 // Spec: docs-internal/superpowers/specs/2026-05-07-incremental-upload-v2-design.md
 // Plan: docs-internal/superpowers/plans/2026-05-07-incremental-upload-v2.md (Task 12)
+
+/**
+ * `present === null` is "could not measure", not "absent". Re-upload is the
+ * remedy for a chunk that is gone, not one we could not read (bulletin #1445).
+ */
+export function partitionFinalityProbe(
+  results: { cid: string; present: boolean | null; failureReason?: string }[],
+): { absent: string[]; indeterminate: string[]; reason?: string } {
+  const indeterminate = results.filter(r => r.present === null);
+  return {
+    absent: results.filter(r => r.present === false).map(r => r.cid),
+    indeterminate: indeterminate.map(r => r.cid),
+    reason: indeterminate[0]?.failureReason,
+  };
+}
+
 export async function storeDirectoryV2(
   directoryPath: string,
   opts: StoreDirectoryOptions = {}
@@ -2006,6 +2618,22 @@ export async function storeDirectoryV2(
   applyManifestFetchAttributes(fetched);
 
   // 2. Phase A — placeholder before first merkleize.
+  //
+  // Framework detection happens exactly once here, before
+  // writeEmbeddedManifestPlaceholder — the first thing that mutates the
+  // deployed tree (it creates .bulletin-deploy/manifest.json inside
+  // directoryPath). detectFramework reads only the directory being deployed
+  // (C1), so it must never observe a file this deploy created; computing it
+  // any later would risk that even though isVolatilePath already excludes
+  // .bulletin-deploy/ from every marker's own path space. The single value
+  // computed here is reused at every other call site below instead of
+  // re-invoking detectFramework.
+  const framework = detectFramework(directoryPath);
+  // Hoisted once: buildOrderedCar's classifyFn runs per file, per merkleize
+  // pass (Phase A and Phase B) — reusing one context object instead of a
+  // fresh `{ framework }` literal per call avoids an allocation on every file
+  // of every deploy for a value that never changes within a deploy.
+  const classifyCtx = { framework };
   const deployedAt = opts.reproducibleSource
     ? resolveReproducibleTimestamp(opts.reproducibleSource)
     : new Date().toISOString();
@@ -2020,7 +2648,7 @@ export async function storeDirectoryV2(
   // old positions). Backend chosen by jsMerkle option, matching the legacy
   // storeDirectory's behaviour:
   //   - jsMerkle: true       → JS importer (works everywhere, no daemon)
-  //   - jsMerkle: false      → Kubo, hard-required (throws if ipfs not on PATH)
+  //   - jsMerkle: false      → Kubo (throws if ipfs not on PATH; a failed ipfs call falls back to JS)
   //   - jsMerkle: undefined  → smart default: Kubo if available, JS otherwise
   // The same buildOrderedCar runs over both backends' output, so the resulting
   // CAR is byte-identical regardless of merkleizer choice for identical content.
@@ -2036,7 +2664,7 @@ export async function storeDirectoryV2(
     useKubo = hasIPFS();
   }
   const phaseA = await withSpan("deploy.merkleize", `1a. merkleize (${useKubo ? "kubo" : "js"}, stable)`, { "deploy.directory": dirBasename, "deploy.merkle": useKubo ? "kubo" : "js" }, async () => {
-    const r = await merkleizeWithStableOrder(directoryPath, prevManifest?.stableBlockOrder, { useKubo, phase: "Phase A" });
+    const r = await merkleizeWithStableOrder(directoryPath, prevManifest?.stableBlockOrder, { useKubo, phase: "Phase A", classifyFn: (p) => classifyFile(p, classifyCtx) });
     sampleMemory("merkleize_end");
     return r;
   });
@@ -2056,6 +2684,15 @@ export async function storeDirectoryV2(
   // on chain at prev-deploy finalisation; trust them without re-probing.
   // Safety: end-of-Phase-B GRANDPA probe re-verifies all chunks at finalised head,
   // so a "trusted but evicted" chunk gets caught and re-uploaded there.
+  //
+  // #1011 invariant (cross-referenced with src/incremental-stats.ts's Manifest
+  // line): trustedCidsA stays empty whenever prevManifest is absent, which is
+  // exactly when computeStats/renderSummary reports manifestSource === "none"
+  // ("first deploy (no previous manifest)" or another none-reason). That keeps
+  // computePhaseACounts(phaseAUploadCids, trustedCidsA).trusted === 0 on every
+  // such deploy — the "first deploy" line and a nonzero Phase A trusted count
+  // can never both print. If you change how trustedCidsA is populated, or add
+  // a new manifestSource variant, re-check that this stays true.
   const trustedCidsA = new Set<string>();
   if (prevManifest?.chunks) {
     for (const cid of Object.keys(prevManifest.chunks)) {
@@ -2068,6 +2705,13 @@ export async function storeDirectoryV2(
   const skipCidsA = new Set<string>(phaseAUploadCids);
   const probeFailedCidsA = new Set<string>();
   const hasNewChunks = phaseAUploadCids.some(c => !trustedCidsA.has(c));
+  // #1011: computePhaseACounts scopes trusted/toCheck/duplicates to
+  // phaseAUploadCids specifically (deduped before counting), fixing the bug
+  // where a first deploy (no previous manifest) could print a nonzero
+  // "trusted from prev manifest" count purely from a duplicate CID in
+  // section 1 — see the console.log lines below and computePhaseACounts'
+  // own doc comment.
+  const phaseACounts = computePhaseACounts(phaseAUploadCids, trustedCidsA);
   setDeployAttribute("deploy.phase_a.chunks_trusted", trustedCidsA.size);
 
   // 5. Phase A upload — submits absent chunks; skips present ones via internal probe.
@@ -2084,15 +2728,21 @@ export async function storeDirectoryV2(
   const carMbA = String(Math.round((phaseA.carBytes.length / 1024 / 1024) * 100) / 100);
   let phaseALiveProvider: ExistingProvider = provider;
   let phaseASkipProbeResults = new Map<string, true | false | null>();
+  console.log("\n   Phase A (stable section):");
+  // Printed once regardless of branch below — duplicate CIDs in section 1 are
+  // a property of phaseAUploadCids itself, not of whether any chunk needs
+  // uploading (#1011 /simplify: was copy-pasted into both branches).
+  if (phaseACounts.duplicates > 0) {
+    console.log(`   Phase A: ${phaseACounts.duplicates} duplicate chunk CID(s) in section 1 (deduped, not double-counted)`);
+  }
   if (!hasNewChunks) {
     // All section-1 chunks trusted from prev manifest — skip storeChunkedContent entirely.
-    console.log(`   Phase A: nothing to upload (all ${phaseAUploadCids.length} section-1 chunks trusted from prev manifest)`);
+    console.log(`   Phase A: nothing to upload (all ${phaseACounts.trusted} section-1 chunks trusted from prev manifest)`);
     phaseASkipProbeResults = new Map(phaseAUploadCids.map(c => [c, true as true]));
     // phaseALiveProvider stays as provider (no extrinsics submitted yet; Phase B will populate its own)
   } else {
-    const trustedCount = phaseAUploadCids.length - skipCidsA.size;
-    if (trustedCount > 0) {
-      console.log(`   Phase A: ${skipCidsA.size} new chunks to upload, ${trustedCount} trusted from prev manifest`);
+    if (phaseACounts.trusted > 0) {
+      console.log(`   Phase A: ${phaseACounts.toCheck} chunks to check/upload, ${phaseACounts.trusted} trusted from prev manifest`);
     }
     await withSpan("deploy.chunk-upload", "1b. chunk-upload (phase A)", {
       "deploy.chunks.total": phaseAUploadChunks.length,
@@ -2100,7 +2750,7 @@ export async function storeDirectoryV2(
       "deploy.car.mb": carMbA,
     }, async () => {
       sampleMemory("chunk_upload_start");
-      const phaseAUpload = await storeChunkedContent(phaseAUploadChunks, { ...provider, gateway, skipCids: skipCidsA, trustedCids: trustedCidsA, skipRootStore: true }); // phase A: single internal probe, no root store (Phase B's root supersedes), Tier 2 counts discarded (intermediate CAR)
+      const phaseAUpload = await storeChunkedContent(phaseAUploadChunks, { ...provider, gateway, skipCids: skipCidsA, trustedCids: trustedCidsA, skipRootStore: true, handOffLiveClient: true }); // phase A: single internal probe, no root store (Phase B's root supersedes), Tier 2 counts discarded (intermediate CAR)
       phaseALiveProvider = { ...provider, ...phaseAUpload.liveProvider };
       phaseASkipProbeResults = phaseAUpload.skipProbeResults;
       setDeployAttribute("deploy.storage.phase_a.root_already_onchain", String(phaseAUpload.rootSkipped));
@@ -2156,7 +2806,7 @@ export async function storeDirectoryV2(
   const phaseAKnownPresent = new Set<string>(phaseAUploadCids);
 
   // 6. Phase B — finalise manifest with v3 fields.
-  const filesMap = buildFilesMap(directoryPath, phaseA.fileCids);
+  const filesMap = buildFilesMap(directoryPath, phaseA.fileCids, framework);
   const blocksList = [...phaseA.blocks.keys()];
   const chunksMap: Record<string, ManifestChunkEntry> = {};
   for (let i = 0; i < phaseA.section1ChunkCids.length; i++) {
@@ -2184,7 +2834,7 @@ export async function storeDirectoryV2(
     version: MANIFEST_VERSION,
     previousContenthash: prevContenthash,
     deployedAt,
-    framework: detectFramework(directoryPath),
+    framework,
     files: filesMap,
     stableBlockOrder: phaseA.stableOrder,
     blocks: blocksList,
@@ -2200,7 +2850,7 @@ export async function storeDirectoryV2(
   // 7. Re-merkleize with the same blockOrder. Only the manifest-bearing
   // block(s) change; everything else is byte-identical.
   const phaseB = await withSpan("deploy.merkleize", "1c. merkleize (js, finalise)", { "deploy.directory": dirBasename }, async () => {
-    const r = await merkleizeWithStableOrder(directoryPath, phaseA.stableOrder, { useKubo, phase: "Phase B" });
+    const r = await merkleizeWithStableOrder(directoryPath, phaseA.stableOrder, { useKubo, phase: "Phase B", classifyFn: (p) => classifyFile(p, classifyCtx) });
     sampleMemory("merkleize_finalise_end");
     return r;
   });
@@ -2252,6 +2902,7 @@ export async function storeDirectoryV2(
 
   // 9. Phase B upload — submits only the chunks that actually changed
   // (typically just the chunk(s) covering the manifest file).
+  console.log("\n   Phase B (full CAR):");
   const carMbB = String(Math.round((phaseB.carBytes.length / 1024 / 1024) * 100) / 100);
   const newPhaseBChunks = carChunkCidsB.filter((c) => !trustedCidsB.has(c)).length;
   const phaseBResult = await withSpan("deploy.chunk-upload", "1d. chunk-upload (phase B)", {
@@ -2261,7 +2912,7 @@ export async function storeDirectoryV2(
     "deploy.car.mb": carMbB,
   }, async () => {
     sampleMemory("chunk_upload_b_start");
-    const r = await storeChunkedContent(carChunksB, { ...phaseALiveProvider, gateway, trustedCids: trustedCidsB, probeFailedCids: probeFailedCidsA });
+    const r = await storeChunkedContent(carChunksB, { ...phaseALiveProvider, gateway, trustedCids: trustedCidsB, probeFailedCids: probeFailedCidsA, handOffLiveClient: true });
     sampleMemory("chunk_upload_b_end");
     return r;
   });
@@ -2287,13 +2938,20 @@ export async function storeDirectoryV2(
     const grandpaCids = [...phaseB.chunkCids, storageCid];
     console.log(`   Finality check: probing ${grandpaCids.length} chunks at chain-finalised state (aka GRANDPA)...`);
     const finalityResults = await probeChunks(grandpaCids, { client: phaseALiveProvider.client!, atFinalized: true });
-    let missingCids = new Set(finalityResults.filter(r => r.present === false).map(r => r.cid));
+    const { absent, indeterminate, reason } = partitionFinalityProbe(finalityResults);
+    let missingCids = new Set(absent);
     setDeployAttribute("deploy.probe.finality_miss_count", missingCids.size);
+    setDeployAttribute("deploy.probe.finality_indeterminate_count", indeterminate.length);
+    if (indeterminate.length > 0) {
+      console.log(`   ${indeterminate.length} of ${grandpaCids.length} chunks could not be probed (${reason}); finality unverified for those`);
+    }
 
     let reuploadCount = 0;
     let laggingFinalityCount = 0;
     if (missingCids.size === 0) {
-      console.log(`   ✓ All ${grandpaCids.length} chunks finalised`);
+      console.log(indeterminate.length === 0
+        ? `   ✓ All ${grandpaCids.length} chunks finalised`
+        : `   ${grandpaCids.length - indeterminate.length} of ${grandpaCids.length} chunks finalised, ${indeterminate.length} unverified`);
     } else {
       // Step 2: wait for natural finalisation. Phase B's just-landed chunks
       // (and especially the root, which was the LAST extrinsic submitted)
@@ -2342,7 +3000,11 @@ export async function storeDirectoryV2(
         for (let i = 0; i < phaseB.chunkCids.length; i++) {
           phaseBChunkByCid.set(phaseB.chunkCids[i], phaseB.chunks[i]);
         }
-        const fetchNonceFn = phaseALiveProvider.fetchNonce ?? fetchNonce;
+        // Bounded like every chunk nonce (#1641); getters follow the provider across reconnects.
+        const readReuploadNonce = boundedNonceReader({
+          client: () => phaseALiveProvider.client, unsafeApi: () => phaseALiveProvider.unsafeApi,
+          ss58: () => phaseALiveProvider.ss58 as string, fetchNonceFn: phaseALiveProvider.fetchNonce ?? fetchNonce,
+        });
 
         for (let round = 1; round <= GRANDPA_REUPLOAD_MAX_ROUNDS && missingCids.size > 0; round++) {
           const roundSuffix = round > 1 ? ` (round ${round}/${GRANDPA_REUPLOAD_MAX_ROUNDS}, retry after fork)` : '';
@@ -2355,7 +3017,7 @@ export async function storeDirectoryV2(
           try {
             for (let i = 0; i < reuploadList.length; i++) {
               const cid = reuploadList[i];
-              const freshNonce = await fetchNonceFn(BULLETIN_ENDPOINTS, phaseALiveProvider.ss58 as string);
+              const freshNonce = await readReuploadNonce();
               if (cid === storageCid) {
                 // Root re-upload: store_with_cid_config with DAG-PB codec.
                 const rootTx = phaseALiveProvider.unsafeApi.tx.TransactionStorage.store_with_cid_config({
@@ -2364,11 +3026,8 @@ export async function storeDirectoryV2(
                 });
                 await watchTransaction(rootTx, phaseALiveProvider.signer as PolkadotSigner, { mortality: { mortal: true, period: 256 }, nonce: freshNonce }, () => storageCid, {
                   label: "root-reupload",
-                  rpc: BULLETIN_ENDPOINTS,
-                  senderSS58: phaseALiveProvider.ss58 as string,
-                  expectedNonce: freshNonce,
                   timeoutMs: CHUNK_TIMEOUT_MS,
-                  fetchNonce: phaseALiveProvider.fetchNonce,
+                  confirmIncluded: () => cidPresentAtBest(phaseALiveProvider.client, storageCid),
                 });
               } else {
                 const chunkBytes = phaseBChunkByCid.get(cid);
@@ -2378,7 +3037,7 @@ export async function storeDirectoryV2(
                     `its bytes are not in phaseB.chunks (cannot re-upload). This indicates an internal state issue.`
                   );
                 }
-                await storeChunk(phaseALiveProvider.unsafeApi, phaseALiveProvider.signer as PolkadotSigner, chunkBytes, freshNonce, phaseALiveProvider.ss58 as string, { fetchNonce: phaseALiveProvider.fetchNonce });
+                await storeChunk(phaseALiveProvider.unsafeApi, phaseALiveProvider.signer as PolkadotSigner, chunkBytes, freshNonce, { client: () => phaseALiveProvider.client });
               }
               reuploadCount++;
               console.log(`      [${i + 1}/${reuploadList.length}] re-uploaded ${cid.slice(0, 20)}… (nonce ${freshNonce})`);
@@ -2459,7 +3118,6 @@ export async function storeDirectoryV2(
 
   // 10. Stats + telemetry.
   const retentionPeriodBlocks = await readRetentionPeriodBlocks(provider.unsafeApi);
-  const framework = detectFramework(directoryPath);
   const filesStableCount = [...phaseA.fileCids.entries()].filter(([p, cid]) => {
     if (p === MANIFEST_PATH) return false;
     return classifyFile(p, { prevManifest, fileCid: cid, framework }) === "stable";
@@ -2558,7 +3216,7 @@ export async function storeDirectoryV2(
   } else if (rootProbe[0]?.present === true) {
     console.log(`   ✓ Root finalised on chain`);
   } else {
-    console.log(`   Root re-check inconclusive (RPC error) — GRANDPA probe above already verified; continuing.`);
+    console.log(`   Root finality unverified (probe returned no answer); content is in best-block, continuing.`);
   }
 
   return { storageCid, ipfsCid: phaseB.cid, carBytes: phaseB.carBytes };
@@ -2568,10 +3226,34 @@ export interface DeployOptions {
   mnemonic?: string;
   /** Optional derivation path applied to the mnemonic (e.g. "//deploy/3"). Defaults to "" (root key). */
   derivationPath?: string;
+  /**
+   * Deploy as this product's derived account (RFC-0022 host derivation,
+   * index 0) instead of the mnemonic's root account, so the deployed name is
+   * owned by the account a host hands the product at runtime. Needs a
+   * mnemonic; mutually exclusive with suri, derivationPath, and signer.
+   * CLI: --product-name <name>
+   */
+  productName?: string;
+  /**
+   * Internal: the injected signer signs locally in-process, so no phone
+   * ceremony gates its signatures. Set by the productName resolution;
+   * genuine QR/mobile injected signers leave it unset.
+   */
+  localSigner?: boolean;
   /** Pre-built signer — skips mnemonic derivation. Use for QR/mobile signing. */
   signer?: PolkadotSigner;
   /** SS58 address for the signer (required when signer is provided). */
   signerAddress?: string;
+  /**
+   * Internal: `signer`/`signerAddress` were resolved from a phone-backed login
+   * session (`resolveDeployActors`'s `actors.worker.source === "session"`), as
+   * opposed to a local `--suri`/mnemonic-derived worker or a caller-injected
+   * `PolkadotSigner` (programmatic callers, e.g. playground-cli). Set by
+   * `deployActorsToSignerOptions`. Storage routing must not silently sign
+   * Bulletin chunks with this signer when no allowance slot is available —
+   * a session signer with no slot must route to pool instead. See bulletin #1452.
+   */
+  sessionSigner?: boolean;
   /** Slot-account signer for Bulletin chunk uploads. When set, used instead of pool/mnemonic
    *  for storage. DotNS still uses signer/signerAddress. */
   storageSigner?: PolkadotSigner;
@@ -2639,18 +3321,6 @@ export interface DeployOptions {
    */
   dumpCar?: string | boolean;
   /**
-   * After a successful deploy, list the label in the on-chain Publisher
-   * registry. Silently skipped on envs that do not have a Publisher contract.
-   */
-  publish?: boolean;
-  /**
-   * When true, a publish failure after a successful deploy fails the run.
-   * Default (false): warning is logged, deploy still exits 0 — the bytes
-   * landed on Bulletin and the contenthash is on chain, the registry is a
-   * discovery courtesy.
-   */
-  failOnPublishError?: boolean;
-  /**
    * Override/supply DotNS contract addresses, shallow-merged OVER the chosen
    * env's `contracts` map (these win). The `custom` env ships no addresses, so
    * this is how they are provided. Keys are the DOTNS_* names used in
@@ -2682,6 +3352,38 @@ export interface DeployOptions {
    * case (undefined/"resign").
    */
   confirmPhoneReady?: (ctx: { label: string; attempt: number; total: number; approvalBudgetMs: number; reason?: "resign" | "silence" }) => Promise<void>;
+  /**
+   * #1164: when set, the post-deploy console banner prints "CONTENT DEPLOYED
+   * — publishing product manifest…" instead of "DEPLOYMENT COMPLETE!", and
+   * the "Check it out here" browser-URL block is suppressed. The caller
+   * (bin/polkadot-app-deploy) is then responsible for printing the real
+   * completion banner itself, via `printDeploymentCompleteBanner`, once its
+   * own subsequent `publishManifest()` call succeeds. Opt-in: every existing
+   * library caller (e.g. playground-cli) leaves this unset and keeps today's
+   * single-banner output.
+   */
+  manifestPending?: boolean;
+}
+
+// Shared by deploy() and publishManifest() so both derive the same key.
+export function resolveProductSigner(
+  options: Pick<DeployOptions, "productName" | "mnemonic" | "signer" | "signerAddress" | "suri" | "derivationPath">,
+): Pick<DeployOptions, "signer" | "signerAddress" | "mnemonic" | "localSigner"> | null {
+  if (!options.productName) return null;
+  if (options.signer || options.signerAddress || options.suri || options.derivationPath) {
+    throw new NonRetryableError("--product-name derives the signer itself; it cannot be combined with --suri, --derivation-path, or an external signer.");
+  }
+  const productMnemonic = resolveEffectiveMnemonic({
+    flagMnemonic: options.mnemonic,
+    envMnemonic: process.env.MNEMONIC,
+    envDotnsMnemonic: process.env.DOTNS_MNEMONIC,
+  });
+  if (!productMnemonic) {
+    throw new NonRetryableError("--product-name needs a mnemonic (--mnemonic or the MNEMONIC env var) to derive the product account from.");
+  }
+  const product = deriveProductSigner(productMnemonic, options.productName);
+  console.log(`   Product deployer: ${product.ss58} (product ${product.productName}, index 0)`);
+  return { signer: product.signer, signerAddress: product.ss58, mnemonic: undefined, localSigner: true };
 }
 
 // Resolve the DeployOptions that affect DotNS authentication into the shape
@@ -2703,6 +3405,13 @@ export function resolveDotnsConnectOptions(
   popSelfServe?: PopSelfServeConfig | null,
   registerStorageDeposit?: bigint,
   tld?: string,
+  contractSources?: Record<string, string>,
+  // bulletin #1362/#1095: appended AFTER contractSources (rather than
+  // inserted earlier in the positional list, as bulletin-deploy does) so
+  // this port doesn't have to renumber the manifest/publish.ts call site
+  // (a separate, non-deploy() publish flow, left untouched here — same
+  // scoping bulletin's own #1221 applied to that file).
+  network?: string,
 ): Pick<
   DotNSConnectOptions,
   | "signer"
@@ -2717,19 +3426,37 @@ export function resolveDotnsConnectOptions(
   | "popSelfServe"
   | "registerStorageDeposit"
   | "tld"
+  | "contractSources"
+  | "network"
 > {
   const tail = assetHubEndpoints && assetHubEndpoints.length > 0 ? { assetHubEndpoints } : {};
   const mappingTail = autoAccountMapping ? { autoAccountMapping } : {};
   const contractsTail = contracts && Object.keys(contracts).length > 0 ? { contracts } : {};
+  const sourcesTail = contractSources && Object.keys(contractSources).length > 0 ? { contractSources } : {};
   const ratioTail = nativeToEthRatio ? { nativeToEthRatio } : {};
   const envTail = environmentId ? { environmentId } : {};
   const popTail = popSelfServe !== undefined ? { popSelfServe } : {};
   const storageTail = registerStorageDeposit !== undefined ? { registerStorageDeposit } : {};
   const tldTail = tld !== undefined ? { tld } : {};
+  // bulletin #1362/#1095: only set when defined — omitting it (rather than
+  // sending an explicit undefined) preserves DotNS's own instance-field
+  // default and matches every other optional tail above.
+  const networkTail = network !== undefined ? { network } : {};
   if (options.signer && options.signerAddress) {
-    return { signer: options.signer, signerAddress: options.signerAddress, ...tail, ...mappingTail, ...contractsTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail };
+    return { signer: options.signer, signerAddress: options.signerAddress, ...tail, ...mappingTail, ...contractsTail, ...sourcesTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail, ...networkTail };
   }
-  return { mnemonic: options.mnemonic, derivationPath: options.derivationPath, ...tail, ...mappingTail, ...contractsTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail };
+  return { mnemonic: options.mnemonic, derivationPath: options.derivationPath, ...tail, ...mappingTail, ...contractsTail, ...sourcesTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail, ...networkTail };
+}
+
+// bulletin #1221: the planned action to size a post-preflight auto-map
+// top-up (topUpTargetFor's first arg). Once preflight has run, use its REAL
+// plannedAction rather than assuming "register", so an owned action's
+// (smaller) floor is requested instead. "abort" can't actually reach here
+// (deploy() throws on !dotnsPreflight.canProceed before either post-preflight
+// connect site), but the type is wider than DotnsSuccessAction, so fall back
+// to "register" defensively rather than assert past it.
+export function autoMapPlannedActionFor(dotnsPreflight: DotnsPreflightResult | null): DotnsSuccessAction {
+  return dotnsPreflight && dotnsPreflight.plannedAction !== "abort" ? dotnsPreflight.plannedAction : "register";
 }
 
 // Upper-bound estimate of how many bytes this deploy will push to Bulletin.
@@ -2789,97 +3516,93 @@ export function assertSubdomainOwnerMatchesSigner(
  * non-registrable per classifyRegistrability AND unowned, this additionally
  * teaches the dotns-cli whitelisted-registration route, via the SAME
  * formatUnregistrableReason preflight/register() use, so the texts cannot
- * drift. Owned-by-another-account keeps the original message unchanged —
- * that case is about ownership, not registrability, and must NOT suggest
- * registering a name someone else already holds.
+ * drift.
+ *
+ * bulletin-deploy #1380 (issue #1062): the two remaining branches used to
+ * name the problem but not the remedy — recurring on a consumer's
+ * per-branch preview deploys, each one only discovered after
+ * connect/build/upload had already run. Both branches now name a concrete
+ * next step:
+ *   - unregistered, registrable parent: deploying the parent directly IS the
+ *     registration path (this CLI has no separate register-only command),
+ *     so the remedy is that same command aimed at the parent.
+ *   - owned by another account: this signer cannot self-serve. The only
+ *     route is the current owner handing the name over. Verified against
+ *     src/commands/transfer.ts: `runTransfer` always signs as
+ *     `opts.mnemonic ?? DEFAULT_MNEMONIC` (Alice's dev key) — never from a
+ *     session — so the hint MUST include --mnemonic for the owner's own
+ *     key, or run verbatim it connects as Alice and fails with "it is owned
+ *     by ..., not the worker <alice-address>" (DotNS.transferName). Only
+ *     --to may default (to the signed-in session). selfAddress can be ""
+ *     (the call site passes `preflight.evmAddress ?? ""`), so the transfer
+ *     hint is only emitted when it's non-empty — a dangling `--to ` is worse
+ *     than no hint.
+ * Neither addition weakens the refusal: both still throw, they only add an
+ * actionable line after the unchanged "is owned by ..." sentence that
+ * telemetry's naming.subdomain_orphan classifier keys on (src/telemetry.ts).
+ *
+ * bulletin-deploy #1443 added two more fixes on top:
+ *   - `parentOwner` is now read via checkNodeAuthorization's isAuthorised-
+ *     backed owner(node), which can return the zero address for a node that
+ *     was never created — normalised to the unowned branch here, since the
+ *     burn sentinel is not an account anyone can be asked to transfer from.
+ *   - once nested subnames are allowed, `parentLabel` may itself be a
+ *     multi-label path ("app.supafaust"). Such a parent cannot be registered
+ *     directly, so an unowned nested parent names the immediate requirement
+ *     (whoever owns the grandparent must create and hand it over) instead of
+ *     emitting a register command that would fail for the same reason.
  */
 export function formatSubdomainParentError(
   fullName: string,
   parentLabel: string,
   parentOwner: string | null,
   selfAddress: string,
-  tld: string = DEFAULT_TLD,
+  // #1419: tld and profile were both stale implicit defaults (DEFAULT_TLD /
+  // the old poprules-startingPrice profile) — exactly the class of bug the
+  // comment below used to warn about, just one layer further out. Both are
+  // now required so a caller can't silently inherit a generation that
+  // describes no environment this repo talks to.
+  tld: string,
+  // Without this, a v0.6.0 environment would silently fall back to
+  // poprules-startingPrice's (stricter, digit-stripping) label semantics
+  // here — the exact class of bug the profile-aware classifier exists to
+  // close, just at a call site outside src/dotns.ts.
+  profile: DotnsAbiProfile,
 ): string {
-  if (parentOwner !== null) {
-    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by ${parentOwner}, not by this signer.`;
+  // bulletin-deploy #1443: a zero-address owner is the registry's "no owner"
+  // sentinel, not an account. Callers now read it straight off
+  // isAuthorised-backed owner(node) (checkNodeAuthorization), which returns
+  // 0x000...0 for a node that was never created — so without this the
+  // owned-by-someone-else branch below would fire and tell the caller to ask
+  // the burn address for its private key. Normalise it to the unowned
+  // branch, which already says the right thing.
+  const owner = parentOwner !== null && /^0x0{40}$/i.test(parentOwner) ? null : parentOwner;
+  // bulletin-deploy #1443: a nested parent ("app.supafaust") cannot be
+  // registered as a base name, so the "register the parent" remedy below
+  // would emit a command that fails for the same reason. Name the immediate
+  // requirement instead.
+  const parentIsNested = parentLabel.includes(".");
+  if (owner === null && parentIsNested) {
+    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} does not exist.\n\n` +
+      `It is itself a subname, so it cannot be registered directly — whoever owns ` +
+      `${parentLabel.slice(parentLabel.indexOf(".") + 1)}.${tld} has to create it first, then hand it to ` +
+      `this signer (${selfAddress || "this account"}).`;
   }
-  const registrability = classifyRegistrability(parentLabel);
+  if (owner !== null) {
+    const transferBullet = selfAddress
+      ? `  - ask the ${owner} account to hand the parent to this signer, run BY that account: ${CLI_NAME} transfer ${parentLabel}.${tld} --to ${selfAddress} --mnemonic <the ${owner} account's key>\n`
+      : "";
+    const ownedParentBullet = `  - deploy the subdomain under a parent this signer already owns instead.`;
+    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by ${owner}, not by this signer.\n\n` +
+      (transferBullet ? `Either:\n${transferBullet}${ownedParentBullet}` : ownedParentBullet);
+  }
+  const registrability = classifyRegistrability(parentLabel, profile);
   if (registrability.registrable) {
-    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by no one, not by this signer.`;
+    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by no one, not by this signer.\n\n` +
+      `Register the parent with this signer first, then redeploy the subdomain unchanged:\n` +
+      `  ${CLI_NAME} <build-dir> ${parentLabel}.${tld}`;
   }
-  return `Cannot deploy ${fullName}: parent ${formatUnregistrableReason({ label: parentLabel, registrability, existingOwner: null, selfAddress, tld })}`;
-}
-
-// Publish step. Subdomains are not supported by the Publisher contract (it only
-// indexes top-level `.dot` labels) so we skip rather than publish the parent.
-async function publish(
-  dotns: DotNS,
-  parsed: ParsedDomainName,
-  failOnError: boolean | undefined,
-): Promise<void> {
-  console.log("\n" + "=".repeat(60));
-  console.log("Publish");
-  console.log("=".repeat(60));
-  if (parsed.isSubdomain) {
-    console.log(`   Subdomains are not supported by the Publisher registry — skipping.`);
-    return;
-  }
-  try {
-    const result = await dotns.publishLabel(parsed.label);
-    setDeployAttribute("deploy.publish.status", result.status);
-    if (result.txHash) setDeployAttribute("deploy.publish.tx", result.txHash);
-    console.log(`   Status: ${result.status}`);
-  } catch (e: any) {
-    if (e instanceof PublisherNotSupportedError) {
-      console.log(`   Skipped: ${e.message}`);
-      return;
-    }
-    setDeployAttribute("deploy.publish.status", "failed");
-    if (failOnError) throw e;
-    const msg = e?.message ?? String(e);
-    console.log(`   Publish failed: ${msg}`);
-  }
-}
-
-// Entrypoint for `bulletin-deploy --unpublish`. Opens a DotNS connection on
-// the chosen env, calls Publisher.unpublish, and exits. Does not touch
-// Bulletin, IPFS, or the build directory — there is nothing to deploy.
-export async function unpublish(
-  domainName: string,
-  options: { mnemonic?: string; derivationPath?: string; rpc?: string; env?: string } = {},
-): Promise<{ domainName: string; status: "unpublished" | "already-unpublished"; txHash?: string }> {
-  const envId = options.env ?? DEFAULT_ENV_ID;
-  const { doc } = await loadEnvironments();
-  const resolved = resolveEndpoints(doc, envId);
-  const popSelfServe = getPopSelfServeConfig(doc, envId);
-  const tld = resolved.tld ?? DEFAULT_TLD;
-  const parsed = parseDomainName(domainName, tld);
-  if (parsed.isSubdomain) {
-    throw new Error(`Subdomains are not supported by the Publisher registry. To unpublish ${parsed.parentLabel}.${tld} (which controls ${domainName}), pass that label directly.`);
-  }
-  const label = parsed.label;
-  const dotns = new DotNS();
-  try {
-    // Pass resolved.tld (undefined-preserving), NOT the defaulted `tld` above
-    // — otherwise connect()'s on-chain tld() read never fires for an env that
-    // genuinely configures none (see the envConfiguredTld comment in deploy()).
-    await dotns.connect(resolveDotnsConnectOptions(
-      { mnemonic: options.mnemonic, derivationPath: options.derivationPath },
-      resolved.assetHub,
-      resolved.autoAccountMapping,
-      resolved.contracts,
-      resolved.nativeToEthRatio,
-      envId,
-      popSelfServe,
-      resolved.registerStorageDeposit,
-      resolved.tld,
-    ));
-    const result = await dotns.unpublishLabel(label);
-    // Adopt the authoritative, chain-resolved TLD for the returned domain name.
-    return { domainName: `${label}.${dotns.tld}`, status: result.status, txHash: result.txHash };
-  } finally {
-    try { dotns.disconnect(); } catch {}
-  }
+  return `Cannot deploy ${fullName}: parent ${formatUnregistrableReason({ label: parentLabel, registrability, existingOwner: null, selfAddress, tld, profile })}`;
 }
 
 /**
@@ -2988,12 +3711,21 @@ export async function deploy(content: DeployContent, domainName: string | null =
   if (options.signer && options.signerAddress && options.mnemonic) {
     throw new NonRetryableError("Pass either a mnemonic or an external signer, not both — they identify the signing account and only one can win.");
   }
+  bulletinNetwork = undefined; // bulletin #1362/#1095: reset per-deploy; set from the resolved env below
+  // Product-name deploys resolve to an injected signer up front: the product
+  // account derived from the mnemonic per RFC-0022 signs storage and DotNS
+  // alike, so the deployed name is owned by the very account a host hands the
+  // product at runtime. Resolved here, before signer-choice, so the rest of
+  // the pipeline sees a plain injected signer and needs no product awareness.
+  options = { ...options, ...resolveProductSigner(options) };
   // Resolve the target environment. options.bulletinEndpoints / assetHubEndpoints
   // bypass the loader for tests and library callers.
   const envId = options.env ?? DEFAULT_ENV_ID;
   let envBulletin: string[] = [DEFAULT_BULLETIN_RPC];
   let envAssetHub: string[] | undefined;
   let envSource: string | undefined;
+  let envUserFilePath: string | undefined;
+  let envUserFileKeys: string[] | undefined;
   let envNetwork: string | undefined;
   let envName: string | undefined;
   let envIpfs: string | undefined;
@@ -3019,12 +3751,22 @@ export async function deploy(content: DeployContent, domainName: string | null =
     envAssetHub = options.assetHubEndpoints;
   } else {
     try {
-      const { doc, source } = await loadEnvironments();
+      const { doc, source, userFilePath, userFileContractKeys } = await loadEnvironments();
       const resolved = resolveEndpoints(doc, envId);
       envBulletin = resolved.bulletin;
       envAssetHub = options.assetHubEndpoints ?? resolved.assetHub;
       envSource = source;
-      envNetwork = resolved.network;
+      envUserFilePath = userFilePath;
+      envUserFileKeys = userFileContractKeys?.[envId];
+      // bulletin #1362/#1095: once an env WAS resolved (this try block
+      // succeeded), a missing `network` field is a config gap, not "no env
+      // context" — normalize to the "unknown" sentinel so
+      // detectTestnet()/isTestnet() fail CLOSED (not-testnet) instead of
+      // falling through to a live spec_name guess. envNetwork stays
+      // genuinely `undefined` only when this whole block is skipped
+      // (options.bulletinEndpoints) or throws — the one case where the
+      // spec_name fallback is still the intended behavior.
+      envNetwork = resolved.network ?? "unknown";
       envName = resolved.envName;
       envIpfs = resolved.ipfs;
       envWebGateway = resolved.webGateway;
@@ -3035,6 +3777,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       envTld = resolved.tld ?? DEFAULT_TLD;
       envConfiguredTld = resolved.tld;
       envPopSelfServe = getPopSelfServeConfig(doc, envId);
+      bulletinNetwork = envNetwork; // already normalized (resolved.network ?? "unknown") above
     } catch (e) {
       if (e instanceof NonRetryableError) throw e;
       if (options.env !== undefined) throw e;
@@ -3043,6 +3786,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   }
   // CLI/library-supplied contract addresses win over the env's map. The `custom`
   // env intentionally ships no addresses, so they must be provided this way.
+  const contractSources = describeContractSources(envContracts, options.contracts, envSource, envUserFilePath, envId, envUserFileKeys);
   if (options.contracts && Object.keys(options.contracts).length > 0) {
     envContracts = { ...envContracts, ...options.contracts };
   }
@@ -3069,6 +3813,16 @@ export async function deploy(content: DeployContent, domainName: string | null =
   // THIS parse, which on an env with no configured tld is still the
   // pre-connect DEFAULT_TLD guess, not necessarily the real one.
   let parsed: ParsedDomainName | null = domainName ? parseDomainName(domainName, envTld) : null;
+  // bulletin-deploy #1443/#1449: subname depth is observed, not gated —
+  // parseDomainName never refuses on depth grounds. Print a factual,
+  // no-advice notice when nesting goes past the ordinary case (a parent path
+  // containing a dot, i.e. more than 2 labels before the TLD), so a typo or a
+  // doubled suffix is obvious on sight. Nothing is being blocked here, so
+  // there's no remedy to offer.
+  if (parsed?.isSubdomain && parsed.parentLabel!.includes(".")) {
+    const levels = subnameNestingLevels(1 + parsed.parentLabel!.split(".").length);
+    console.log(`   NOTE: "${domainName}" parses as sublabel "${parsed.sublabel}" under parent path "${parsed.parentLabel}.${envTld}" (${levels} levels of subname nesting).`);
+  }
 
   let sessionCleanup: (() => void) | undefined;
   // Cheap session-file probe — does NOT load the SSO stack. A logged-in user has
@@ -3110,12 +3864,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
         isTestnet: isTestnetEnv,
         sessionPresent: hasSession,
       });
-      options = {
-        ...options,
-        signer: actors.worker.signer,
-        signerAddress: actors.worker.address,
-        ...(actors.recipientH160 ? { transferTo: actors.recipientH160 } : {}),
-      };
+      options = { ...options, ...deployActorsToSignerOptions(actors) };
       sessionCleanup = actors.worker.destroy.bind(actors.worker);
       if (actors.worker.source === "session") resolvedUserSession = actors.worker;
       if (actors.recipientH160) {
@@ -3128,13 +3877,16 @@ export async function deploy(content: DeployContent, domainName: string | null =
         console.log(`   Using ${actors.worker.source} signer: ${actors.worker.address}`);
       }
     } catch (e) {
-      if (options.suri) throw e;
       if ((e as { name?: string } | null)?.name === "SignerNotAvailableError") {
-        if (hasSession) console.error(STALE_SESSION_MESSAGE);
-        else console.log(`   Login session unavailable or expired — falling back to pool. Run \`${CLI_NAME} login\` to use your identity.`);
-      } else {
-        throw e; // includes MainnetDefaultWorkerError — surface it
+        // #234 (see src/deploy-actors.ts's resolveDeployActors for the full
+        // rationale): fail fast, before any chain write, instead of falling
+        // through to the default dev signer. hasSession is always true here —
+        // chooseSignerInput only returns "resolve" without an explicit --suri
+        // when hasSession is true, and resolveDeployActors only throws this
+        // class when sessionPresent is true.
+        throw new NonRetryableError(STALE_SESSION_DEPLOY_MESSAGE);
       }
+      throw e; // includes MainnetDefaultWorkerError — surface it
     }
   }
 
@@ -3161,11 +3913,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       // through to the authoritative read on a miss. See sss-allowance-cache.ts.
       const allowed = await preflightSssAllowance(statementAccount, () => getPeopleChainEndpoints(envId));
       if (allowed === false) {
-        throw new NonRetryableError(
-          "Session signing allowance has expired (~2-3 days after login). " +
-          `Run \`${CLI_NAME} logout\`, then \`${CLI_NAME} login\`, to renew ` +
-          "(login alone won't refresh a stale session).",
-        );
+        throw new NonRetryableError(SESSION_EXPIRED_MESSAGE);
       }
       // allowed === null → People chain unreachable; don't block the deploy.
     } catch (e) {
@@ -3242,6 +3990,15 @@ export async function deploy(content: DeployContent, domainName: string | null =
     setDeployAttribute("deploy.env", envId);
     setDeployAttribute("deploy.label", parsed?.label ?? name);
     setDeployAttribute("deploy.subdomain", String(parsed?.isSubdomain ?? false));
+    // bulletin-deploy #1443/#1449: recorded on every subname deploy (not only
+    // the unusually deep ones) so it has a baseline to compare against — a
+    // metric that only appears in the unusual case can't show whether nested
+    // names are rare or routine. 1 = the ordinary case (a single-label
+    // parent); numeric, not a String()-wrapped value, so it aggregates in
+    // Sentry.
+    if (parsed?.isSubdomain) {
+      setDeployAttribute("deploy.dotns.subname_levels", subnameNestingLevels(1 + parsed.parentLabel!.split(".").length));
+    }
     if (envNetwork) setDeployAttribute("deploy.network", envNetwork);
     if (envSource) setDeployAttribute("deploy.environments_source", envSource);
     setDeployAttribute("deploy.transfer.enabled", options.transferTo ? "true" : "false");
@@ -3267,7 +4024,15 @@ export async function deploy(content: DeployContent, domainName: string | null =
     if (options.password) console.log(`   Encrypted: yes`);
 
     let provider: ProviderResult | undefined;
-    const reconnect = selectStorageReconnect(options);
+    // Every Bulletin client this deploy opens, so the finally below can close the
+    // ones a mid-upload reconnect handed to storeDirectoryV2 (#1672).
+    const openedClients: any[] = [];
+    const openStorageProvider = selectStorageReconnect(options);
+    const reconnect = async (): Promise<ProviderResult> => {
+      const p = await openStorageProvider();
+      openedClients.push(p.client);
+      return p;
+    };
     // Hoisted so the DotNS phase below can reuse the pre-upload eligibility
     // result when deciding whether registration can continue.
     let dotnsPreflight: DotnsPreflightResult | null = null;
@@ -3276,10 +4041,6 @@ export async function deploy(content: DeployContent, domainName: string | null =
     // existing contenthash / read failed). Decoded from on-chain e3-prefixed
     // bytes to the IPFS CID string.
     let previousContenthashCid: string | null = null;
-    // Hoisted so the phone-signing banner and the publish skip below can both
-    // read the preflight-determined publish state. false = already published or
-    // publish not requested or not supported.
-    let preflightPublishNeeded = false;
     try {
       // Check domain ownership before uploading anything
       console.log("\n" + "=".repeat(60));
@@ -3288,7 +4049,12 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
 
       const preflight = new DotNS();
-      await preflight.connect(resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld));
+      await preflight.connect({
+        ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
+        // bulletin #1221: plannedAction isn't known until preflight() runs below, so
+        // assume "register" (see AUTO_MAP_RENT_HEADROOM's doc comment in dotns.ts for the cost).
+        autoMapTopUpTarget: topUpTargetFor("register", envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),
+      });
       // connect() now guarantees the account is mapped before returning — no
       // post-connect mapping wait needed here. See DotNS.connect() in dotns.ts.
       // Adopt the authoritative, chain-resolved TLD for everything downstream
@@ -3314,17 +4080,33 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
       // Subdomain deploys use a different on-chain path (setSubnodeOwner on
       // the Registry, no commit-reveal or PoP). Skip the TLD preflight and
-      // just verify the signer owns the parent; if the subname is already
-      // ours or unowned, the DotNS phase below will do the right thing.
+      // just verify the signer is authorised over the parent; if the subname
+      // is already ours or unowned, the DotNS phase below will do the right
+      // thing.
+      //
+      // bulletin-deploy #1443: authorisation is checked via the registry's own
+      // isAuthorised(parentNode, account) (DotNS.checkNodeAuthorization), NOT
+      // checkOwnership(parentLabel) — that reads the REGISTRAR's ERC-721
+      // ownerOf, which only resolves for a top-level, tokenised parent. Once
+      // nested subnames are allowed (parentLabel can itself be a multi-label
+      // path like "app.supafaust", a subnode with no ERC-721 tokenId at all),
+      // checkOwnership either reverts or reads back "owned by no one" for a
+      // parent the signer genuinely owns/is-approved-for, routing into
+      // formatSubdomainParentError's UNOWNED branch with a confidently wrong
+      // "register the parent" suggestion. checkNodeAuthorization is also
+      // correct at depth 1 (falls back to owner()-equality when isAuthorised
+      // is absent), so this replaces the old call outright rather than
+      // supplementing it.
       if (parsed?.isSubdomain) {
         try {
           const subResult = await preflight.checkSubdomainOwnership(parsed.sublabel!, parsed.parentLabel!);
           assertSubdomainOwnerMatchesSigner(subResult, preflight.evmAddress, parsed.sublabel!, parsed.parentLabel!, envTld);
           if (!subResult.owned) {
-            const { owned: parentOwned, owner: parentOwner } = await preflight.checkOwnership(parsed.parentLabel!);
-            if (!parentOwned) {
+            const parentNode = computeDomainNode(parsed.parentLabel!, envTld);
+            const { authorised: parentAuthorised, owner: parentOwner } = await preflight.checkNodeAuthorization(parentNode, preflight.evmAddress!);
+            if (!parentAuthorised) {
               throw new NonRetryableError(
-                formatSubdomainParentError(parsed.fullName, parsed.parentLabel!, parentOwner ?? null, preflight.evmAddress ?? "", envTld)
+                formatSubdomainParentError(parsed.fullName, parsed.parentLabel!, parentOwner ?? null, preflight.evmAddress ?? "", envTld, preflight.protocolVersion)
               );
             }
           }
@@ -3346,37 +4128,10 @@ export async function deploy(content: DeployContent, domainName: string | null =
         // (classification, ownership, reservation, PoP gate) BEFORE touching
         // Bulletin. Advisory; registerDomain keeps its own internal checks.
         // Issue #100.
-        preflightPublishNeeded = false;
         try {
           dotnsPreflight = await preflight.preflight(name, { transferRecipientH160: options.transferTo });
           previousContenthashCid = await readPreviousContenthashSafe(preflight, name);
           setDeployAttribute("deploy.incremental", previousContenthashCid ? "true" : "false");
-
-          // Check publish state during preflight so tap count is accurate upfront.
-          if (options.publish && parsed && !parsed.isSubdomain) {
-            const publisher = (preflight as any)._contracts?.PUBLISHER;
-            const zeroAddr = "0x0000000000000000000000000000000000000000";
-            if (!publisher || publisher === zeroAddr) {
-              console.log(`   Publish: not supported on this environment — will be skipped`);
-            } else {
-              const labelhash = keccak256(toBytes(name));
-              try {
-                const alreadyPublished = await preflight.contractCall(
-                  publisher,
-                  PUBLISHER_ABI,
-                  "isPublished",
-                  [labelhash],
-                );
-                preflightPublishNeeded = !alreadyPublished;
-                if (!preflightPublishNeeded) {
-                  console.log(`   Publish: already published — will be skipped`);
-                }
-              } catch {
-                // isPublished read failed — conservative: assume publish will be needed
-                preflightPublishNeeded = true;
-              }
-            }
-          }
         } finally {
           preflight.disconnect();
         }
@@ -3417,7 +4172,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       // The CLI bin uses this to print the "Have your phone ready" banner up front;
       // library consumers (playground-cli) ignore it or use their own UI.
       if (phoneSignerActive) {
-        const steps = computePhoneSigningSteps(dotnsPreflight, preflightPublishNeeded);
+        const steps = computePhoneSigningSteps(dotnsPreflight);
         options.onPhoneSignaturePlan?.(steps as PhoneSignatureStep[]);
       }
 
@@ -3427,7 +4182,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       provider = await reconnect();
       const providerWithReconnect: ExistingProvider = { ...provider, reconnect };
 
-      const isTestnet = await detectTestnet(provider.unsafeApi);
+      const isTestnet = await detectTestnet(provider.unsafeApi, envNetwork);
       setDeployAttribute("deploy.is_testnet", isTestnet ? "true" : "false");
 
       console.log("\n" + "=".repeat(60));
@@ -3612,32 +4367,35 @@ export async function deploy(content: DeployContent, domainName: string | null =
             try { owner.destroy(); } catch { /* best-effort */ }
           };
           await ownerDotns.connect({
-            ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld),
+            ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
+            // bulletin #1221: see autoMapPlannedActionFor's doc comment for why this uses the
+            // real plannedAction rather than a hardcoded "register".
+            autoMapTopUpTarget: topUpTargetFor(autoMapPlannedActionFor(dotnsPreflight), envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),
             confirmPhoneReady: options.confirmPhoneReady,
             phoneSigner: true, // owner path is always a real phone/session signer
           });
-          const willPublish = !!(options.publish && parsed && preflightPublishNeeded !== false);
           // Wire total so confirmPhoneReady gets the right count.
-          ownerDotns.setPhoneSignatureTotal(willPublish ? 2 : 1);
+          ownerDotns.setPhoneSignatureTotal(1);
           const contenthashHex = `0x${encodeContenthash(cid as string)}`;
           // #885: the owner is the PGAS-funded session account; elect PGAS for the
           // AH fee so a zero-native owner can update content faucet-free.
           await ownerDotns.setContenthash(name, contenthashHex, { feeAsset: "pgas" });
-          // Mirror the main path's publish step — the owner is authorised to publish too.
-          if (willPublish) await publish(ownerDotns, parsed!, options.failOnPublishError);
           return;
         }
 
         const dotns = new DotNS();
         await dotns.connect({
-          ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld),
+          ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
+          // bulletin #1221: see autoMapPlannedActionFor's doc comment for why this uses the
+          // real plannedAction rather than a hardcoded "register".
+          autoMapTopUpTarget: topUpTargetFor(autoMapPlannedActionFor(dotnsPreflight), envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),
           confirmPhoneReady: options.confirmPhoneReady,
           // Transfer mode: phoneSigner=false (local worker signs in-process, no phone gate).
           // Genuine phone/session signer: phoneSigner=true (gate enabled). Fixes #50.
           phoneSigner: phoneSignerActive,
         });
         if (phoneSignerActive) {
-          dotns.setPhoneSignatureTotal(computePhoneSigningSteps(dotnsPreflight, preflightPublishNeeded).length);
+          dotns.setPhoneSignatureTotal(computePhoneSigningSteps(dotnsPreflight).length);
         }
 
         // Track whether THIS run freshly registered the name. The transfer-to-
@@ -3652,8 +4410,15 @@ export async function deploy(content: DeployContent, domainName: string | null =
           } else if (owner) {
             throw new Error(`Subdomain ${parsed.fullName} is owned by ${owner}, not ${dotns.evmAddress}`);
           } else {
-            const parentOwnership = await dotns.checkOwnership(parsed.parentLabel!);
-            if (!parentOwnership.owned) throw new Error(`You must own ${parsed.parentLabel}.${envTld} to register subdomains under it`);
+            // bulletin-deploy #1443: checkNodeAuthorization (registry
+            // isAuthorised, owner()-equality fallback), not
+            // checkOwnership(parentLabel) — see the comment at the earlier
+            // preflight call site for why a registrar-based ownerOf read is
+            // wrong once parentLabel can itself be a multi-label nested-subname
+            // path.
+            const parentNode = computeDomainNode(parsed.parentLabel!, envTld);
+            const { authorised: parentAuthorised } = await dotns.checkNodeAuthorization(parentNode, dotns.evmAddress!);
+            if (!parentAuthorised) throw new Error(`You must own (or be approved for) ${parsed.parentLabel}.${envTld} to register subdomains under it`);
             console.log(`   Status: Registering subdomain...`);
             await dotns.registerSubdomain(parsed.sublabel!, parsed.parentLabel!);
             registeredFresh = true;
@@ -3672,17 +4437,6 @@ export async function deploy(content: DeployContent, domainName: string | null =
         const contenthashHex = `0x${encodeContenthash(cid as string)}`;
         await dotns.setContenthash(name, contenthashHex);
 
-        // Publish step. Runs after the durable on-chain state (contenthash)
-        // is in place so a publish revert can never roll back the CID write.
-        // Skipped silently on envs without a Publisher contract — the
-        // mirror-to-paseo-next-v2 run will pick it up when relevant.
-        if (options.publish && parsed) {
-          if (preflightPublishNeeded !== false) {
-            await publish(dotns, parsed, options.failOnPublishError);
-          }
-          // preflightPublishNeeded === false: preflight confirmed already-published — skip silently.
-        }
-
         // Zero-mobile-sig handover: the worker (Alice/--mnemonic) signed the whole
         // deploy above; now hand the finished name to the signed-in account. One
         // ERC-721 transferFrom moves ownership + resolver authorisation. Idempotent.
@@ -3694,7 +4448,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
           console.log(`   ${name}.${envTld} already existed — updated content only; ownership unchanged (not transferred to ${options.transferTo}).`);
           // Actionable, because this also fires when a retry re-ran the whole
           // deploy after attempt 1 freshly registered + then flaked on
-          // setContenthash/publish: attempt 2 sees "Already owned", so the
+          // setContenthash: attempt 2 sees "Already owned", so the
           // handover this run owed never happens. transferName is idempotent,
           // so the recovery command is always safe to run.
           console.log(`   If you meant to claim it, run: ${CLI_NAME} transfer ${name} --env ${envId}${options.suri ? ` --mnemonic "<your worker key>"` : ""}`);
@@ -3742,19 +4496,36 @@ export async function deploy(content: DeployContent, domainName: string | null =
         }
       });
 
-      console.log("\n" + "=".repeat(60));
-      console.log("DEPLOYMENT COMPLETE!");
-      console.log("=".repeat(60));
-      console.log("\nCheck it out here:");
-      console.log(`   ${browserUrlFor(name, envId, envWebGateway)}`);
-      console.log(`   ${name}.${envTld}  (in a Polkadot app: mobile or desktop)`);
-      console.log("\n" + "=".repeat(60) + "\n");
-      return { domainName: name, fullDomain: `${name}.${envTld}`, cid: cid as string, ipfsCid };
+      const browserUrl = browserUrlFor(name, envId, envWebGateway);
+      // #1164: a manifest publish immediately follows in bin/polkadot-app-deploy
+      // when manifestPending is set — defer the real completion banner (and
+      // its browser URL) until that phase actually succeeds, so a manifest
+      // failure never leaves a false "DEPLOYMENT COMPLETE!" on screen.
+      if (options.manifestPending) {
+        console.log("\n" + "=".repeat(60));
+        console.log(pickPostDeployBannerText(true));
+        console.log("=".repeat(60) + "\n");
+      } else {
+        printDeploymentCompleteBanner(`${name}.${envTld}`, browserUrl);
+      }
+      return {
+        domainName: name,
+        fullDomain: `${name}.${envTld}`,
+        cid: cid as string,
+        ipfsCid,
+        browserUrl,
+        // Read off `options`, not the slot resolution above: `options` is what
+        // selectStorageReconnect actually consulted, so this reports the identity that
+        // stored the bytes even when the caller supplied storageSigner itself.
+        storageSigner: options.storageSigner,
+        storageSignerAddress: options.storageSignerAddress,
+      };
     } finally {
       // Flush the module-level failover flag in case onStatusChanged fired after
       // the deploy span attribute was already written. Idempotent if already set.
       if (_deployRpcFailedOver) setDeployAttribute("deploy.rpc.failed_over", "true");
       provider?.client.destroy();
+      for (const c of openedClients) if (c !== provider?.client) try { c.destroy(); } catch { /* already closed */ }
     }
   });
   } finally {
@@ -3765,13 +4536,12 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
 /**
  * Compute the ordered list of step labels that will require a phone tap,
- * given the DotNS preflight result and whether publish is needed.
+ * given the DotNS preflight result.
  * Returns [] when deploy would abort or preflight is null.
  * Exported for unit testing.
  */
 export function computePhoneSigningSteps(
   dotnsPreflight: { plannedAction: string; needsPopUpgrade: boolean } | null,
-  publishNeeded: boolean,
 ): string[] {
   if (!dotnsPreflight || dotnsPreflight.plannedAction === "abort") return [];
   const steps: string[] = [];
@@ -3779,6 +4549,5 @@ export function computePhoneSigningSteps(
     steps.push("Commitment", "Register");
   }
   steps.push("Link content");
-  if (publishNeeded) steps.push("Publish to registry");
   return steps;
 }

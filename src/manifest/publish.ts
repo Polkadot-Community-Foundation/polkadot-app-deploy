@@ -3,27 +3,30 @@
  *
  * Wires [`storeFile`](../deploy.ts) and [`storeDirectory`](../deploy.ts) for
  * Bulletin uploads with [`DotNS`](../dotns.ts) for the on-chain text-record
- * writes. Phase 4/5 atomicity work (`Utility.batchAll`, snapshot/rollback,
- * Step 8 round-trip verify) is deliberately deferred. Sequential
- * best-effort writes keep this module small while the broader plan in
- * `docs-internal/superpowers/plans/2026-05-20-product-manifest-support.md`
- * tracks the follow-ups.
+ * writes. Each executable's contenthash and execution manifest are committed
+ * atomically with `Utility.batch_all`, because either record without its
+ * matching peer is not a valid launch contract. Root metadata and independent
+ * executable kinds remain separate transactions; snapshot/rollback and the
+ * Step 8 round-trip verification remain tracked follow-ups.
  */
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { PolkadotSigner } from "polkadot-api";
 import {
   BLAKE2B_256_MULTIHASH_CODE,
   encodeContenthash,
-  getDirectProvider,
   storeDirectory,
   storeFile,
   resolveDotnsConnectOptions,
+  resolveProductSigner,
   resolveBulletinEndpoints,
   setBulletinEndpoints,
+  setBulletinNetworkContext,
+  selectStorageReconnect,
   type DeployOptions,
 } from "../deploy.js";
-import { DotNS, DEFAULT_TLD, stripTldSuffix, type OwnershipResult } from "../dotns.js";
+import { DotNS, DEFAULT_TLD, stripTldSuffix, parseDomainName, type OwnershipResult } from "../dotns.js";
 import { NonRetryableError } from "../errors.js";
 import {
   loadEnvironments,
@@ -34,17 +37,9 @@ import {
   type PopSelfServeConfig,
 } from "../environments.js";
 import { pessimisticSizePreflight } from "./byte-budget.js";
+import { composeExecutable, composeRoot } from "./compose.js";
 import type { LoadedProductConfig } from "./config-load.js";
-import type {
-  AppManifest,
-  ExecutableConfig,
-  ExecutableManifest,
-  FundingManifest,
-  ProductConfig,
-  RootManifest,
-  WidgetManifest,
-  WorkerManifest,
-} from "./types.js";
+import { verifyEmbeddedAppManifests } from "./product-preflight.js";
 
 export interface PublishManifestOptions {
   /** Loaded + validated product config (call loadProductConfig first). */
@@ -69,6 +64,18 @@ export interface PublishManifestOptions {
   mnemonic?: string;
   /** Optional Substrate-style derivation path. */
   derivationPath?: string;
+  /** Sign as the RFC-0022 product account, the same key deploy() registers the name with. */
+  productName?: string;
+  /**
+   * The Bulletin allowance-slot signer deploy() resolved for the content upload, handed over
+   * in-process via DeployResult. Set when the deploy ran on a login session's own slot rather
+   * than a mnemonic: without it this step would store the manifest from the shared dev pool
+   * while the content it belongs to went to the user's slot, and on a chain whose pool holds
+   * no quota the manifest would be the only part that fails.
+   */
+  storageSigner?: PolkadotSigner;
+  /** SS58 address of the slot account. Required when storageSigner is set. */
+  storageSignerAddress?: string;
 }
 
 export interface PublishManifestResult {
@@ -87,13 +94,16 @@ export interface PublishManifestResult {
  */
 export async function publishManifest(opts: PublishManifestOptions): Promise<PublishManifestResult> {
   const { config, sourcePath } = opts.loaded;
-  if (config.domain !== opts.domain) {
+  // #1156/#1572: domain reconciliation happens below, once envTld is known —
+  // see reconcileManifestDomain. The check that used to live here compared
+  // opts.domain to a value the CLI itself derived from config.domain, so it
+  // always trivially passed; it caught nothing.
+  const embeddedErrors = await verifyEmbeddedAppManifests(config, path.dirname(sourcePath));
+  if (embeddedErrors.length > 0) {
     throw new NonRetryableError(
-      `Config domain '${config.domain}' (in ${sourcePath}) does not match deploy domain '${opts.domain}'. ` +
-        `Either update the config or pass the matching <domain> argument.`,
+      `App v2 embedded manifest verification failed:\n  - ${embeddedErrors.join("\n  - ")}`,
     );
   }
-
   const sizeReport = pessimisticSizePreflight(config);
   if (!sizeReport.ok) {
     const failing = sizeReport.checks.filter(c => !c.ok).map(c => `${c.key}: ${c.bytes}/${c.budget} B`).join(", ");
@@ -117,34 +127,61 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   const envId = opts.env ?? DEFAULT_ENV_ID;
   const { doc } = await loadEnvironments();
   const resolved = resolveEndpoints(doc, envId);
+  // DotNS helpers append `.<tld>` internally (this env's resolved TLD — see
+  // DotNS._tld / connectDotNS below), so callers of those helpers further
+  // down pass the bare label, not this full domain.
+  const envTld = resolved.tld ?? DEFAULT_TLD;
+
+  // #1156/#1572: reconcile config.domain against the ACTUAL deploy target
+  // (opts.domain) — not a config-derived copy of itself. Hoisted here, right
+  // after envTld is known and before any upload below: this makes
+  // publishManifest() itself block the icon/executable upload on a mismatch.
+  reconcileManifestDomain(config.domain, opts.domain, envTld, sourcePath);
   const popSelfServe = getPopSelfServeConfig(doc, envId);
   setBulletinEndpoints(resolveBulletinEndpoints(resolved.bulletin, opts.rpc));
+  // Same reasoning as the endpoints above, for the OTHER piece of env state
+  // selectStorageReconnect's mainnet pool-fallback gate reads: `bulletinNetwork` is
+  // module-level in deploy.ts and is set per-deploy inside deploy(). A library caller
+  // invoking publishManifest() on its own (no preceding in-process deploy()) would
+  // otherwise leave it undefined — the historical testnet-shaped fallback, not a hard
+  // failure on mainnet. Resolve it from the same env this function already resolved.
+  setBulletinNetworkContext(resolved.network);
 
   const iconAbs = path.resolve(configDir, config.icon.path);
   const iconBytes = await readFileOrThrow(iconAbs, "icon");
-  console.log(`\nManifest publish — ${config.domain}`);
+  // #1011: banner the manifest-publish phase like Storage/DotNS/Preflight, so
+  // it reads as a clearly delimited section instead of a single unbannered
+  // line. The "Manifest publish — <domain>" text itself is unchanged (still
+  // grepped by test/e2e.test.js's icon-CID hint, see below).
+  const banner = "=".repeat(60);
+  console.log("\n" + banner);
+  console.log(`Manifest publish — ${config.domain}`);
+  console.log(banner);
   console.log(`  Loaded config: ${sourcePath}`);
-  // Bulletin storage uploads (icon + executables) must sign with the SAME account
-  // the operator passed (`--mnemonic` → direct signer), not the dev-phrase pool that
-  // storeFile/storeDirectory fall back to when no provider is supplied. Pool accounts
-  // are derived at `//pool/i` paths and are never the (single) authorized deployer, so
-  // a one-authorized-account setup (Summit) gets `pool account N is not authorized`.
-  // Build one direct provider and reuse it for every upload.
-  const storageProvider = opts.mnemonic
-    ? await getDirectProvider(opts.mnemonic, opts.derivationPath ?? "")
-    : undefined;
-  // ss58 is load-bearing: storeChunkedContent's authorization preflight keys
-  // TransactionStorage.Authorizations by it — omitting it encodes an undefined
-  // AccountId and surfaces as "Incompatible runtime entry".
-  const storageOpts = storageProvider
-    ? { client: storageProvider.client, unsafeApi: storageProvider.unsafeApi, signer: storageProvider.signer, ss58: storageProvider.ss58 }
-    : {};
+  console.log(`  Uploading icon (${iconBytes.length} B)…`);
 
-  let iconCid: string;
+  // Bulletin storage for the icon and executables must use the SAME identity
+  // that signs the DotNS writes below — reuse selectStorageReconnect's
+  // storageSigner > signer > mnemonic > pool precedence (deploy() itself uses
+  // the same function) instead of an empty options object, which always fell
+  // back to the bare pool-mode provider. That fallback happened to look
+  // harmless on every existing manifest E2E scenario, because their pinned
+  // pool index was small enough to also be deploy()'s own default 10-account
+  // pool window — but a pool leg pinned outside that window
+  // (BULLETIN_POOL_ACCOUNT_INDEX >= 10) fails here even though the exact
+  // account is already authorized and just stored this deploy's own content,
+  // since pool mode never even derives it.
+  //
+  // Resolved ONCE and shared with connectDotNS below: resolveProductSigner
+  // logs "Product deployer: …", and resolving twice would print the line
+  // twice under --product-name.
+  const signerOpts = manifestSignerOptions(opts);
+  const reconnect = selectStorageReconnect(signerOpts);
+  const storage = await reconnect();
+  let iconCid!: string;
   const executableCids: Record<string, string> = {};
   try {
-    console.log(`  Uploading icon (${iconBytes.length} B)…`);
-    iconCid = await storeFile(iconBytes, { ...storageOpts, hashCode: BLAKE2B_256_MULTIHASH_CODE });
+    iconCid = await storeFile(iconBytes, { ...storage, hashCode: BLAKE2B_256_MULTIHASH_CODE });
     console.log(`  Icon CID: ${iconCid}`);
 
     for (const exec of config.executables) {
@@ -155,28 +192,28 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
         continue;
       }
       console.log(`  Uploading executable [${exec.kind}] from ${execAbs}…`);
-      const { storageCid } = await storeDirectory(execAbs, storageOpts, undefined, true);
+      const { storageCid } = await storeDirectory(execAbs, storage, undefined, true);
       console.log(`  Executable [${exec.kind}] CID: ${storageCid}`);
       executableCids[exec.kind] = storageCid;
     }
   } finally {
-    // storeFile/storeDirectory don't destroy a caller-supplied client, so close ours.
-    storageProvider?.client?.destroy?.();
+    // Best-effort: a reconnect inside storeDirectory may already have
+    // destroyed and replaced this client (same guard every other destroy
+    // call site in deploy.ts uses).
+    try { storage.client.destroy(); } catch { /* already destroyed */ }
   }
 
-  const dotns = await connectDotNS(opts, resolved, popSelfServe, envId);
+  const dotns = await connectDotNS(signerOpts, resolved, popSelfServe, envId);
 
   try {
-    // DotNS helpers append `.<tld>` internally (this env's resolved TLD — see
-    // DotNS._tld / connectDotNS above), so pass the bare label.
-    const baseLabel = stripDotSuffix(config.domain, resolved.tld ?? DEFAULT_TLD);
-
-    await dotns.ensureContentResolver(baseLabel);
+    const baseLabel = stripDotSuffix(config.domain, envTld);
 
     const rootManifest = composeRoot(config, iconCid);
     const rootJson = JSON.stringify(rootManifest);
-    console.log(`  Writing root manifest text record on ${config.domain} (${Buffer.byteLength(rootJson, "utf8")} B)…`);
-    await dotns.setTextRecord(baseLabel, "manifest", rootJson);
+    console.log(
+      `  Ensuring resolver + writing root manifest text record on ${config.domain} (${Buffer.byteLength(rootJson, "utf8")} B)…`,
+    );
+    await dotns.ensureResolverAndSetTextRecord(baseLabel, "manifest", rootJson);
 
     let textRecordsWritten = 1;
     for (const exec of config.executables) {
@@ -187,13 +224,10 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
       await registerOrEnsureResolver(dotns, ownership, exec.kind, baseLabel, config.domain);
 
       const subContenthash = `0x${encodeContenthash(cid)}`;
-      console.log(`  Setting contenthash on ${exec.kind}.${config.domain} → ${cid}…`);
-      await dotns.setContenthash(`${exec.kind}.${baseLabel}`, subContenthash);
-
       const execManifest = composeExecutable(exec);
       const execJson = JSON.stringify(execManifest);
-      console.log(`  Writing executable manifest on ${exec.kind}.${config.domain} (${Buffer.byteLength(execJson, "utf8")} B)…`);
-      await dotns.setTextRecord(`${exec.kind}.${baseLabel}`, "executable", execJson);
+      console.log(`  Atomically writing contenthash and executable manifest on ${exec.kind}.${config.domain} → ${cid} (${Buffer.byteLength(execJson, "utf8")} B)…`);
+      await dotns.setContenthashAndTextRecord(`${exec.kind}.${baseLabel}`, subContenthash, "executable", execJson);
       textRecordsWritten++;
     }
 
@@ -252,16 +286,43 @@ async function readFileOrThrow(p: string, label: string): Promise<Uint8Array> {
   }
 }
 
+/**
+ * The identity this step signs DotNS with AND stores its Bulletin bytes from — one resolution,
+ * deliberately, because the two must never diverge: the icon and executables are paid for out of
+ * the storage account's quota, and the manifest records are written by the name's owner.
+ *
+ * Mirrors what deploy() feeds selectStorageReconnect / resolveDotnsConnectOptions, so both
+ * halves of a deploy resolve the same account:
+ *   - `productName` -> the RFC-0022 product account (see resolveProductSigner), which is what
+ *     deploy() stores content from too, since it swaps the signer before selecting storage.
+ *   - `storageSigner` -> the login session's Bulletin allowance slot, carried over from the
+ *     deploy that just ran. Kept alongside the signer fields rather than replacing them,
+ *     exactly as deploy() holds both, so selectStorageReconnect applies its own precedence.
+ *   - otherwise the mnemonic passthrough, unchanged.
+ *
+ * Call this ONCE per publish: resolveProductSigner logs "Product deployer: …" on every call.
+ */
+export function manifestSignerOptions(
+  opts: Pick<PublishManifestOptions, "mnemonic" | "derivationPath" | "productName" | "storageSigner" | "storageSignerAddress">,
+): Pick<DeployOptions, "mnemonic" | "derivationPath" | "signer" | "signerAddress" | "localSigner" | "storageSigner" | "storageSignerAddress"> {
+  const product = resolveProductSigner({ productName: opts.productName, mnemonic: opts.mnemonic, derivationPath: opts.derivationPath });
+  const base = product ?? { mnemonic: opts.mnemonic, derivationPath: opts.derivationPath };
+  // Added only when actually set: an always-present `storageSigner: undefined` would make this
+  // object no longer deep-equal the plain mnemonic passthrough callers and tests compare against.
+  return opts.storageSigner && opts.storageSignerAddress
+    ? { ...base, storageSigner: opts.storageSigner, storageSignerAddress: opts.storageSignerAddress }
+    : base;
+}
+
+// Takes the ALREADY-RESOLVED signer options rather than the raw PublishManifestOptions: the
+// storage selection above needs the same resolution, and resolveProductSigner logs a line per
+// call, so the single caller resolves once and passes the result to both.
 async function connectDotNS(
-  opts: PublishManifestOptions,
+  deployOptsShim: ReturnType<typeof manifestSignerOptions>,
   resolved: ResolvedEndpoints,
   popSelfServe: PopSelfServeConfig | null,
   envId: string,
 ): Promise<DotNS> {
-  const deployOptsShim: Pick<DeployOptions, "mnemonic" | "derivationPath" | "signer" | "signerAddress"> = {
-    mnemonic: opts.mnemonic,
-    derivationPath: opts.derivationPath,
-  };
   const connectOpts = resolveDotnsConnectOptions(
     deployOptsShim,
     resolved.assetHub,
@@ -279,43 +340,80 @@ async function connectDotNS(
   return dotns;
 }
 
-function composeRoot(config: ProductConfig, iconCid: string): RootManifest {
-  return {
-    $v: 1,
-    displayName: config.displayName,
-    description: config.description,
-    icon: { cid: iconCid, format: config.icon.format },
-  };
-}
-
-function composeExecutable(exec: ExecutableConfig): ExecutableManifest {
-  if (exec.kind === "app") {
-    return { $v: 1, kind: "app", appVersion: exec.appVersion } as AppManifest;
-  }
-  if (exec.kind === "widget") {
-    return {
-      $v: 1,
-      kind: "widget",
-      appVersion: exec.appVersion,
-      dimensions: exec.dimensions,
-      ...(exec.description !== undefined ? { description: exec.description } : {}),
-    } as WidgetManifest;
-  }
-  if (exec.kind === "funding") {
-    return { $v: 1, kind: "funding", appVersion: exec.appVersion, modes: exec.modes } as FundingManifest;
-  }
-  return {
-    $v: 1,
-    kind: "worker",
-    appVersion: exec.appVersion,
-    entrypoint: exec.entrypoint,
-    includes: exec.includes,
-  } as WorkerManifest;
-}
-
 // tld is a required param: this function's single caller (below) always
 // passes a resolved value (`resolved.tld ?? DEFAULT_TLD`), so a default here
 // was dead code.
 function stripDotSuffix(domain: string, tld: string): string {
   return stripTldSuffix(domain, tld);
+}
+
+// Does `domain` end in `.<tld>`? Exported so the wrong-env-TLD guard above is
+// testable without a live DotNS connection. Case-insensitive to match
+// stripTldSuffix and DOMAIN_RE, which both use the `i` flag; a domain equal
+// to the bare TLD ("paseo" against "paseo") is a mismatch, since it carries
+// no label.
+export function domainMatchesEnvTld(domain: string, tld: string): boolean {
+  return domain.toLowerCase().endsWith(`.${tld.toLowerCase()}`);
+}
+
+/**
+ * Reconcile a product config's `domain` against the domain the deploy is
+ * actually targeting, before any chain or storage work runs.
+ *
+ * The only prior guard (`config.domain !== opts.domain`, a byte compare) was
+ * toothless — the CLI derived `opts.domain` FROM the config, so the
+ * comparison was against a copy of itself. A config whose `domain` field
+ * doesn't match the CLI's actual deploy target (e.g. a hardcoded
+ * polkadot-app-deploy.config.* left over from a different PR/env) slipped
+ * through untouched and only surfaced later, mid-manifest-publish, as an
+ * opaque `NotAuthorised()` revert from `ensureContentResolver` — the signer
+ * doesn't own the OTHER name the config still names.
+ *
+ * `deployDomainArg` is documented as a BARE label (no TLD), while
+ * `configDomain` always carries a TLD (schema requires it), so the two
+ * cannot be compared as raw strings even when they name the same target.
+ * Both sides are normalized the same way, through `parseDomainName(x,
+ * envTld).fullName`, which accepts either a bare label or a `.<tld>`-suffixed
+ * one and independently rejects a DIFFERENT known TLD. `domainMatchesEnvTld`
+ * (above) still runs first, against `configDomain` only, so a config
+ * carrying the wrong environment's own suffix (e.g. "myapp.dot" against a
+ * ".paseo" env) still fails — this does not weaken that check.
+ *
+ * Lowercased BEFORE normalizing, not after: `parseDomainName` delegates to
+ * `validateDomainLabel`, whose charset is strictly lowercase-only (unlike the
+ * config schema's case-insensitive domain pattern), so a case-insensitive
+ * compare means folding case first — comparing post-throw is not an option.
+ */
+export function reconcileManifestDomain(
+  configDomain: string,
+  deployDomainArg: string,
+  envTld: string,
+  sourcePath: string,
+): void {
+  if (!domainMatchesEnvTld(configDomain, envTld)) {
+    throw new NonRetryableError(
+      `Domain "${configDomain}" (in ${sourcePath}) does not end in this environment's DotNS TLD ".${envTld}". ` +
+        `Set "domain" in your product config to "<name>.${envTld}", or deploy against the environment whose TLD matches.`,
+    );
+  }
+
+  const normalize = (raw: string, what: string): string => {
+    try {
+      return parseDomainName(raw.toLowerCase(), envTld).fullName;
+    } catch (err) {
+      throw new NonRetryableError(
+        `${what} "${raw}" is not a valid dotNS name: ${(err as Error).message}`,
+      );
+    }
+  };
+  const configFull = normalize(configDomain, "Config domain");
+  const deployFull = normalize(deployDomainArg, "Deploy domain");
+
+  if (configFull !== deployFull) {
+    throw new NonRetryableError(
+      `Config domain '${configDomain}' (in ${sourcePath}) resolves to '${configFull}', which does not match ` +
+        `the deploy target '${deployDomainArg}' (resolves to '${deployFull}'). ` +
+        `Either update the config's "domain" or pass the matching <domain> argument.`,
+    );
+  }
 }

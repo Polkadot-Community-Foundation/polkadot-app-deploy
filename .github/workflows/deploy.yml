@@ -12,6 +12,11 @@ on:
         description: 'Name of the build artifact to download'
         required: true
         type: string
+      build-dir:
+        description: 'Directory the build artifact is downloaded into, relative to the caller repo root (default: build). With a polkadot-app-deploy.config.*, set it to the path the app executable names (e.g. dist) so the manifest publish reuses the deployed CID.'
+        required: false
+        type: string
+        default: 'build'
       skip-cache:
         description: 'Skip deployment cache and force redeploy'
         type: boolean
@@ -73,25 +78,25 @@ on:
         type: string
         default: ''
       gateway:
-        description: 'Gateway host used to construct browser URLs in the deployment summary and PR comment (e.g. "dev-dot.li" for the devnet default env, "dot.li", "paseo.li"). Does not affect the deploy itself — only the URL displayed.'
+        description: 'FALLBACK ONLY (issue #1157): gateway host used to construct the browser URL in the deployment summary and PR comment (e.g. "dev-dot.li" for the devnet default env, "dot.li", "paseo.li") when polkadot-app-deploy could not supply one itself — a cache-hit run (deploy step skipped) or a polkadot-app-deploy version older than the browserUrl output. On a normal run this is ignored in favor of the env-resolved URL polkadot-app-deploy already computed (correct gateway + previewnet query suffix). Does not affect the deploy itself — only the URL displayed.'
         type: string
         default: 'dev-dot.li'
       gateway-path-style:
-        description: 'If true, build URLs as https://{gateway}/{domain}.dot (e.g. paseo.li/my-app.dot). If false (default), use subdomain form https://{domain}.{gateway} (e.g. my-app.paseo.li).'
+        description: 'Applies only to the FALLBACK URL (see `gateway`). If true, build it as https://{gateway}/{domain}.dot (e.g. paseo.li/my-app.dot). If false (default), use subdomain form https://{domain}.{gateway} (e.g. my-app.paseo.li).'
         type: boolean
         default: false
       comment-header:
         description: 'Sticky-comment header used to identify this workflow''s prior PR comment so it can be replaced on re-runs (marocchino/sticky-pull-request-comment). Override when multiple deploy workflows in the same repo each post their own comment.'
         type: string
         default: 'polkadot-app-deploy'
-      publish:
-        description: 'After a successful deploy, list <dotns-domain> in the on-chain Publisher registry (Publisher.publish / --publish). Takes effect on any env whose environments.json config has a non-zero PUBLISHER contract (currently devnet); a non-fatal skip on envs without one (e.g. paseo-next-v2, whose Publisher was not redeployed with the 2026-08-12 DotNS contracts). The DotNS owner mnemonic (secrets.mnemonic) signs it — no direct-signer required. Subdomains are skipped by the registry.'
-        type: boolean
-        default: false
-      fail-on-publish-error:
-        description: 'If true, a publish failure after a successful content deploy fails the run (--fail-on-publish-error). Default false: publish errors are logged as a non-fatal warning and the deploy still succeeds. Ignored unless publish is true.'
-        type: boolean
-        default: false
+      result-job-name:
+        description: 'polkadot-app-deploy E2E only (bulletin #1625): the CALLER job''s display name. When set, this workflow records the leg''s e2e-result.json and uploads it as an artifact; it requires the caller repository to carry .github/actions/e2e-result. Leave empty (the default) in consumer repos: every related step is skipped.'
+        type: string
+        default: ''
+      result-scenario:
+        description: 'polkadot-app-deploy E2E only (bulletin #1625): scenario id recorded in e2e-result.json. Used only with result-job-name.'
+        type: string
+        default: ''
     secrets:
       mnemonic:
         description: 'Mnemonic (DotNS domain owner)'
@@ -125,15 +130,49 @@ jobs:
         with:
           node-version: '22'
 
+      # The CLI finds polkadot-app-deploy.config.* by walking up from the build
+      # dir, so the caller's repo must be on disk. It must precede the artifact
+      # download: checkout defaults to clean: true and would remove the
+      # untracked build dir.
+      - name: Checkout caller repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # An empty string skips the default and would unpack the artifact over the checkout.
+      - name: Reject an empty build-dir
+        if: inputs.build-dir == ''
+        run: |
+          echo "::error::build-dir was passed as an empty string. Omit it to use the default, or give it a directory."
+          exit 1
+
       - name: Download build artifact
         uses: actions/download-artifact@v8
         with:
           name: ${{ inputs.artifact-name }}
-          path: build
+          path: ${{ inputs.build-dir }}
 
       - name: Compute build hash
         id: hash
-        run: echo "hash=$(find build -type f -exec sha256sum {} \; | sort | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        env:
+          BUILD_DIR: ${{ inputs.build-dir }}
+        run: |
+          # polkadot-app-deploy.config.* drives the manifest publish and the CLI
+          # finds it by walking up from BUILD_DIR, so it usually sits outside the
+          # build output. Without it in the key, editing only the config hits the
+          # cache, skips the deploy step, and the manifest is never republished.
+          configs=""
+          dir="$BUILD_DIR"
+          while :; do
+            for name in polkadot-app-deploy.config.ts polkadot-app-deploy.config.js polkadot-app-deploy.config.mjs; do
+              [ -f "$dir/$name" ] && configs="$configs $dir/$name"
+            done
+            [ "$dir" = "." ] && break
+            parent=$(dirname "$dir")
+            [ "$parent" = "$dir" ] && break
+            dir="$parent"
+          done
+          echo "hash=$( { find "$BUILD_DIR" -type f -exec sha256sum {} \; ; [ -n "$configs" ] && sha256sum $configs; } | sort | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Check deployment cache
         id: cache
@@ -150,34 +189,88 @@ jobs:
           echo "cid=$(cat .deploy-cache/cid)" >> "$GITHUB_OUTPUT"
           echo "::notice::Found cached CID: $(cat .deploy-cache/cid)"
 
-      - name: Setup IPFS Kubo
-        # Inline download with retry. `ipfs/download-ipfs-distribution-action@v1`
-        # wraps curl in a single composite action that can't be wrapped by
-        # `nick-fields/retry`, so occasional HTTP/2 INTERNAL_ERROR failures
-        # from dist.ipfs.tech fail a whole deploy (e.g. release run
-        # 24624209590's pool/kubo ubuntu-latest leg). 3 attempts × 30s
-        # backoff is sufficient in practice.
+      - name: Restore Kubo from cache
         if: steps.cache.outputs.cache-hit != 'true' && inputs.js-merkle != true
-        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/kubo
+          key: kubo-v0.33.0-linux-amd64
+
+      - name: Setup IPFS Kubo
+        # INLINE on purpose: this is a reusable workflow, so a
+        # repo-local script path would resolve against the CALLER's checkout.
+        # The marked blocks below mirror .github/scripts/install-kubo.sh and
+        # test/install-kubo.test.js fails if they drift apart.
+        # dist.ipfs.tech first, then the GitHub release asset; every source is
+        # verified against the sha512 pinned below, not a hash fetched from the
+        # same host (paritytech/polkadot-app-deploy#303). Per-source retries
+        # live in the curl flags, so no outer retry wrapper.
+        if: steps.cache.outputs.cache-hit != 'true' && inputs.js-merkle != true
         env:
           KUBO_VERSION: v0.33.0
-        with:
-          timeout_minutes: 5
-          max_attempts: 3
-          retry_wait_seconds: 30
-          command: |
-            set -euo pipefail
-            ARCH="linux-amd64"
-            TARBALL="kubo_${KUBO_VERSION}_${ARCH}.tar.gz"
-            URL="https://dist.ipfs.tech/kubo/${KUBO_VERSION}/${TARBALL}"
-            echo "Downloading ${URL}"
-            curl --fail --retry 5 --retry-all-errors --retry-delay 2 \
-                 --connect-timeout 30 --max-time 300 \
-                 --no-progress-meter --output "${TARBALL}" "${URL}"
-            tar -xzf "${TARBALL}"
-            sudo install -m 0755 kubo/ipfs /usr/local/bin/ipfs
-            rm -rf kubo "${TARBALL}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          KUBO_ARCH="linux-amd64"
+          CACHE_DIR="$HOME/.cache/kubo"
+          if [ -x "$CACHE_DIR/ipfs" ] && "$CACHE_DIR/ipfs" --version 2>/dev/null | grep -qF "${KUBO_VERSION#v}"; then
+            echo "::notice::Kubo ${KUBO_VERSION} restored from cache (no download)"
+            sudo install -m 0755 "$CACHE_DIR/ipfs" /usr/local/bin/ipfs
             ipfs --version
+            exit 0
+          fi
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$WORK"' EXIT
+          # BEGIN install-kubo-sources
+          TARBALL="kubo_${KUBO_VERSION}_${KUBO_ARCH}.tar.gz"
+          KUBO_SOURCES=(
+            "https://dist.ipfs.tech/kubo/${KUBO_VERSION}"
+            "https://github.com/ipfs/kubo/releases/download/${KUBO_VERSION}"
+          )
+          # END install-kubo-sources
+
+          # BEGIN install-kubo-pin
+          case "${KUBO_VERSION}/${KUBO_ARCH}" in
+            v0.33.0/linux-amd64) KUBO_SHA512="6551acf9be99f98bb4c853a0b22004f2703f0cb13f34111e863d77aa10032ead2c89eb9a8d6fccb4da11011e8d29a8cb251bd3e6651fdbaa3209e3b1bfb5e4f4" ;;
+            *)
+              echo "::error::No pinned sha512 for Kubo ${KUBO_VERSION} ${KUBO_ARCH}. Add it to the case table in .github/scripts/install-kubo.sh and in the inline step of .github/workflows/deploy.yml (hash from the release checksum file, cross-checked against the downloaded tarball)."
+              exit 1
+              ;;
+          esac
+          # END install-kubo-pin
+
+          # BEGIN install-kubo-fetch
+          sha512_of() {
+            if command -v sha512sum >/dev/null 2>&1; then sha512sum "$1" | cut -d' ' -f1; else shasum -a 512 "$1" | cut -d' ' -f1; fi
+          }
+          # --speed-limit/--speed-time abort a host that trickles bytes, so failover is not stalled by --max-time x retries.
+          KUBO_CURL=(curl --fail --silent --show-error --location --retry 2 --retry-all-errors --retry-delay 1 --connect-timeout 10 --max-time 120 --speed-limit 50000 --speed-time 15)
+          KUBO_USED=""
+          for src in "${KUBO_SOURCES[@]}"; do
+            rm -f "$WORK/$TARBALL"
+            if ! "${KUBO_CURL[@]}" -o "$WORK/$TARBALL" "$src/$TARBALL"; then
+              echo "::warning::Kubo source $src failed (download); trying next source"
+              continue
+            fi
+            actual="$(sha512_of "$WORK/$TARBALL")"
+            if [ "$actual" != "$KUBO_SHA512" ]; then
+              echo "::warning::Kubo source $src failed (sha512 mismatch: pinned $KUBO_SHA512, got $actual); trying next source"
+              continue
+            fi
+            KUBO_USED="$src"
+            break
+          done
+          if [ -z "$KUBO_USED" ]; then
+            echo "::error::Kubo ${KUBO_VERSION} could not be downloaded and verified: all sources failed (${KUBO_SOURCES[*]})"
+            exit 1
+          fi
+          echo "::notice::Kubo ${KUBO_VERSION} downloaded from $KUBO_USED (sha512 matches the pinned hash)"
+          # END install-kubo-fetch
+          tar -xzf "$WORK/$TARBALL" -C "$WORK"
+          mkdir -p "$CACHE_DIR"
+          install -m 0755 "$WORK/kubo/ipfs" "$CACHE_DIR/ipfs"
+          sudo install -m 0755 "$CACHE_DIR/ipfs" /usr/local/bin/ipfs
+          ipfs --version
 
       - name: Initialize IPFS
         if: steps.cache.outputs.cache-hit != 'true' && inputs.js-merkle != true
@@ -197,35 +290,64 @@ jobs:
 
       - name: Install polkadot-app-deploy
         if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          REF='${{ inputs.polkadot-app-deploy-ref }}'
-          VERSION='${{ inputs.polkadot-app-deploy-version }}'
-          PKG='${{ inputs.polkadot-app-deploy-package }}'
-          if [ -n "$REF" ]; then
-            echo "Building polkadot-app-deploy from source ref: $REF"
-            cd polkadot-app-deploy-src
-            # This installs polkadot-app-deploy's OWN npm 11 lockfile, not the
-            # caller's. Scoped to this source-build branch so a consumer that
-            # never source-builds keeps its own npm untouched.
-            npm install -g npm@11.17.0
-            npm ci
-            cd ..
-            BIN="$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy"
-            WRAPPER="$(pwd)/polkadot-app-deploy-src/tools/release-retry-wrapper.mjs"
-            echo "BULLETIN_DEPLOY_BIN=$BIN" >> "$GITHUB_ENV"
-            echo "RELEASE_RETRY_WRAPPER=$WRAPPER" >> "$GITHUB_ENV"
-            echo "::notice::Using source-built polkadot-app-deploy from ref $REF"
-          elif [ -n "$VERSION" ]; then
-            echo "Installing $PKG@$VERSION"
-            npm install -g "$PKG@$VERSION"
-            echo "BULLETIN_DEPLOY_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-            echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/$PKG/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
-          else
-            echo "Installing $PKG (latest stable)"
-            npm install -g "$PKG"
-            echo "BULLETIN_DEPLOY_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-            echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/$PKG/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
-          fi
+        # A direct retry action rather than a local composite action: this is
+        # a reusable workflow, consumed by other repos via
+        # `uses: paritytech/polkadot-app-deploy/.github/workflows/deploy.yml@...`.
+        # A "./" local-action reference resolves against the CALLER's
+        # checkout, which does not have this repo's own action directory, so
+        # a composite action defined here would fail to resolve there.
+        # nick-fields/retry is a regular (non-local) action, so it works the
+        # same for every caller.
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 30
+          # pipefail + tee so a failure inside the group surfaces as the
+          # pipeline's exit code (not tee's, which always succeeds), and the
+          # captured log is what on_retry_command below inspects (#214).
+          command: |
+            set -eo pipefail
+            {
+            REF='${{ inputs.polkadot-app-deploy-ref }}'
+            VERSION='${{ inputs.polkadot-app-deploy-version }}'
+            PKG='${{ inputs.polkadot-app-deploy-package }}'
+            if [ -n "$REF" ]; then
+              echo "Building polkadot-app-deploy from source ref: $REF"
+              cd polkadot-app-deploy-src
+              # This installs polkadot-app-deploy's OWN npm 11 lockfile, not the
+              # caller's. Scoped to this source-build branch so a consumer that
+              # never source-builds keeps its own npm untouched.
+              npm install -g npm@11.17.0
+              npm ci
+              cd ..
+              BIN="$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy"
+              WRAPPER="$(pwd)/polkadot-app-deploy-src/tools/release-retry-wrapper.mjs"
+              echo "BULLETIN_DEPLOY_BIN=$BIN" >> "$GITHUB_ENV"
+              echo "RELEASE_RETRY_WRAPPER=$WRAPPER" >> "$GITHUB_ENV"
+              echo "::notice::Using source-built polkadot-app-deploy from ref $REF"
+            elif [ -n "$VERSION" ]; then
+              echo "Installing $PKG@$VERSION"
+              npm install -g "$PKG@$VERSION"
+              echo "BULLETIN_DEPLOY_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+              echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/$PKG/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
+            else
+              echo "Installing $PKG (latest stable)"
+              npm install -g "$PKG"
+              echo "BULLETIN_DEPLOY_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+              echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/$PKG/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
+            fi
+            } 2>&1 | tee "${RUNNER_TEMP}/npm-retry-output.log"
+          # #214: same corrupted-cache-survives-a-hit exposure as the local
+          # npm-retry action — see that action.yml for the full rationale.
+          # Grep-gated so a non-corruption failure (e.g. a registry timeout)
+          # doesn't pay for an unnecessary cache clean.
+          on_retry_command: |
+            LOG="${RUNNER_TEMP}/npm-retry-output.log"
+            if [ -f "$LOG" ] && grep -Eiq 'EINTEGRITY|seems to be corrupted|_cacache|tarball data .* corrupted' "$LOG"; then
+              echo "::warning::npm cache looks corrupted; running npm cache clean --force before the next attempt"
+              npm cache clean --force || true
+            fi
 
       - name: Verify minimum polkadot-app-deploy version
         if: steps.cache.outputs.cache-hit != 'true' && inputs.polkadot-app-deploy-ref == ''
@@ -255,6 +377,10 @@ jobs:
         id: deploy
         if: steps.cache.outputs.cache-hit != 'true'
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
+        # build-dir reaches the script as an environment variable: interpolated into
+        # the script text, a quote in it would run as shell in this job.
+        env:
+          BUILD_DIR: ${{ inputs.build-dir }}
         with:
           timeout_minutes: 15
           max_attempts: ${{ inputs.max-retries }}
@@ -271,6 +397,11 @@ jobs:
           # classification side-effects for consumers who don't opt in to retry.
           retry_on_exit_code: 75
           command: |
+            # bulletin #1625: only for this repo's own E2E legs. Keep the attempt's
+            # output for the e2e-result step; the exit code is untouched.
+            if [ -n "${{ inputs.result-job-name }}" ]; then
+              exec > >(tee "$RUNNER_TEMP/e2e-leg.log") 2>&1
+            fi
             export MNEMONIC='${{ secrets.mnemonic }}'
             export IPFS_CID='${{ steps.cached-deploy.outputs.cid }}'
             export NODE_OPTIONS='--max-old-space-size=8192'
@@ -281,6 +412,17 @@ jobs:
             # single quotes inside the value become literal argv characters — that's
             # how `--tag '$val'` ended up producing deploy.tag="'e2e-ci-release'" in
             # Sentry. An array preserves argv boundaries and needs no quote escaping.
+            #
+            # A polkadot-app-deploy.config.ts with a per-PR or per-env domain (no
+            # static default works) has to read that domain from somewhere — the
+            # CLI aborts the manifest publish unless config.domain resolves to the
+            # same target as the positional <domain> argument below. There is no
+            # other channel from this workflow_call into the CLI's own process, so
+            # export the exact same value under one standardized name in the
+            # PAD_* namespace the CLI already owns (PAD_ENV, PAD_ENV_FILE). Unused
+            # unless a config.ts opts in — pure additive, no existing behavior
+            # changes.
+            export PAD_DOMAIN='${{ inputs.dotns-domain }}'
             FLAGS=()
             if [ -n "${{ inputs.tag }}" ]; then FLAGS+=(--tag "${{ inputs.tag }}"); fi
             if [ "${{ inputs.js-merkle }}" = "true" ]; then FLAGS+=(--js-merkle); fi
@@ -289,17 +431,13 @@ jobs:
             if [ -n "${{ inputs.rpc }}" ]; then FLAGS+=(--rpc "${{ inputs.rpc }}"); fi
             if [ -n "${{ inputs.env }}" ]; then FLAGS+=(--env "${{ inputs.env }}"); fi
             if [ "${{ inputs.pool-size }}" != "0" ]; then FLAGS+=(--pool-size "${{ inputs.pool-size }}"); fi
-            # --publish needs a mnemonic; the MNEMONIC env exported above satisfies
-            # the CLI's signer guard, so this works in pool mode without direct-signer.
-            if [ "${{ inputs.publish }}" = "true" ]; then FLAGS+=(--publish); fi
-            if [ "${{ inputs.fail-on-publish-error }}" = "true" ]; then FLAGS+=(--fail-on-publish-error); fi
             # Only use the wrapper when retry is actually configured (max-retries > 1).
             # Default callers (max-retries: 1) run the deploy directly so there
             # are no wrapper stderr-capture or exit-75 classification side-effects.
             if [ "${{ inputs.max-retries }}" -gt 1 ] && [ -n "$RELEASE_RETRY_WRAPPER" ]; then
-              node "$RELEASE_RETRY_WRAPPER" "$BULLETIN_DEPLOY_BIN" "${FLAGS[@]}" 'build' '${{ inputs.dotns-domain }}'
+              node "$RELEASE_RETRY_WRAPPER" "$BULLETIN_DEPLOY_BIN" "${FLAGS[@]}" "$BUILD_DIR" '${{ inputs.dotns-domain }}'
             else
-              "$BULLETIN_DEPLOY_BIN" "${FLAGS[@]}" 'build' '${{ inputs.dotns-domain }}'
+              "$BULLETIN_DEPLOY_BIN" "${FLAGS[@]}" "$BUILD_DIR" '${{ inputs.dotns-domain }}'
             fi
 
       - name: Validate deployment outputs
@@ -324,9 +462,17 @@ jobs:
             DOMAIN="${DOMAIN%.dot}"
             echo "cid=${{ steps.cached-deploy.outputs.cid }}" >> "$GITHUB_OUTPUT"
             echo "domain=${DOMAIN}" >> "$GITHUB_OUTPUT"
+            # Cache hit: the deploy step (and polkadot-app-deploy itself) never ran,
+            # so there's no env-resolved browser URL. Explicit empty value (not
+            # an omitted key) — see the "Compute browser URL" step for why.
+            echo "browserUrl=" >> "$GITHUB_OUTPUT"
           else
             echo "cid=${{ steps.deploy.outputs.cid }}" >> "$GITHUB_OUTPUT"
             echo "domain=${{ steps.deploy.outputs.domain }}" >> "$GITHUB_OUTPUT"
+            # #1157: env-resolved URL polkadot-app-deploy already computed — see
+            # the "Compute browser URL" step for how it's used and why it can
+            # be empty (older polkadot-app-deploy versions predate this output).
+            echo "browserUrl=${{ steps.deploy.outputs.browserUrl }}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Compute browser URL
@@ -334,10 +480,21 @@ jobs:
         if: steps.final.outputs.domain != ''
         env:
           DOMAIN: ${{ steps.final.outputs.domain }}
+          # #1157: polkadot-app-deploy already resolves the env's real webGateway
+          # (assets/environments.json) plus the previewnet query suffix — reuse
+          # that ONE resolution rather than recomputing a second, out-of-sync
+          # URL here. RESOLVED_URL is only empty on a cache-hit run (the
+          # deploy step, and polkadot-app-deploy itself, never ran) or with a
+          # polkadot-app-deploy version older than the browserUrl output; the
+          # gateway/gateway-path-style inputs are the fallback for that case
+          # only and do NOT get the previewnet suffix.
+          RESOLVED_URL: ${{ steps.final.outputs.browserUrl }}
           GATEWAY: ${{ inputs.gateway }}
           PATH_STYLE: ${{ inputs.gateway-path-style }}
         run: |
-          if [ "$PATH_STYLE" = "true" ]; then
+          if [ -n "$RESOLVED_URL" ]; then
+            URL="$RESOLVED_URL"
+          elif [ "$PATH_STYLE" = "true" ]; then
             URL="https://${GATEWAY}/${DOMAIN}.dot"
           else
             URL="https://${DOMAIN}.${GATEWAY}"
@@ -375,3 +532,18 @@ jobs:
             **${{ steps.final.outputs.domain }}.dot** · [logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
             ${{ steps.browser.outputs.url }}
+
+      # This repo's own E2E legs only (bulletin #1625). Skipped for every consumer:
+      # result-job-name defaults to empty, so the local action is never resolved.
+      - name: Write e2e-result.json
+        if: always() && inputs.result-job-name != ''
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: ${{ inputs.result-scenario }}
+          env: ${{ inputs.env }}
+          signer: ${{ inputs.direct-signer && 'direct' || 'pool' }}
+          merkle: ${{ inputs.js-merkle && 'js' || 'kubo' }}
+          job-name: ${{ inputs.result-job-name }}
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log

@@ -75,11 +75,12 @@ on:
         type: string
         default: ''
       test-suite:
-        description: 'E2E suite to run manually. "nightly" tests the reusable deploy workflow; "pr" runs the PR matrix against source.'
+        description: 'E2E suite to run manually. "nightly" tests the reusable deploy workflow; "pr" runs the PR matrix against source; "v060" runs S-V060-UNBLOCK from source against the selected env, gated hard-fail on DotNS ABI profile v0.6.0 (issue #1410).'
         type: choice
         options:
           - nightly
           - pr
+          - v060
         default: nightly
       runner:
         description: 'Runner label for E2E jobs (GitHub-hosted).'
@@ -257,6 +258,11 @@ jobs:
   # unified diff: GitHub omits `patch` for large files, and a lockfile is
   # exactly the file most likely to hit that ceiling as the dependency tree
   # grows. Comparing full content is correct regardless of file size.
+  #
+  # The classification logic itself lives in the shared
+  # .github/scripts/classify-version-bump.cjs, not inline here — tests.yml's
+  # own classify job (gating Unit Tests) uses the identical script, so the
+  # two workflows can never disagree on what counts as version-only.
   detect-deps-change:
     name: Classify package.json/lock diff (version bump vs dependency change)
     if: github.event_name == 'pull_request' || github.event_name == 'push'
@@ -267,6 +273,15 @@ jobs:
     outputs:
       is_version_only: ${{ steps.classify.outputs.is_version_only }}
     steps:
+      # This job deliberately does NOT check out the full repo (it fetches
+      # both sides of the diff via the contents API instead, so it works for
+      # a PR from any ref) — just the shared classifier script, via sparse
+      # checkout, plus Node to run it.
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
@@ -294,65 +309,7 @@ jobs:
           fetch "$HEAD_SHA" package.json head_pkg.json
           fetch "$BASE_SHA" package-lock.json base_lock.json
           fetch "$HEAD_SHA" package-lock.json head_lock.json
-          cat > classify-deps-change.cjs <<'JSEOF'
-          const fs = require("fs");
-
-          function loadJSON(path) {
-            try {
-              const raw = fs.readFileSync(path, "utf8");
-              if (!raw.trim()) return null;
-              return JSON.parse(raw);
-            } catch (e) {
-              return null;
-            }
-          }
-
-          function stripVersionFields(obj, isLockfile) {
-            if (!obj || typeof obj !== "object") return obj;
-            const clone = JSON.parse(JSON.stringify(obj));
-            delete clone.version;
-            if (isLockfile && clone.packages && typeof clone.packages === "object" &&
-                clone.packages[""] && typeof clone.packages[""] === "object") {
-              delete clone.packages[""].version;
-            }
-            return clone;
-          }
-
-          const basePkgRaw = loadJSON("base_pkg.json");
-          const headPkgRaw = loadJSON("head_pkg.json");
-          const baseLockRaw = loadJSON("base_lock.json");
-          const headLockRaw = loadJSON("head_lock.json");
-
-          // Did either file change at all (including a pure version bump)?
-          const anyPackageFileChanged =
-            JSON.stringify(basePkgRaw) !== JSON.stringify(headPkgRaw) ||
-            JSON.stringify(baseLockRaw) !== JSON.stringify(headLockRaw);
-
-          const basePkg = stripVersionFields(basePkgRaw, false);
-          const headPkg = stripVersionFields(headPkgRaw, false);
-          const baseLock = stripVersionFields(baseLockRaw, true);
-          const headLock = stripVersionFields(headLockRaw, true);
-
-          // Is there any diff left once version fields are stripped out?
-          const nonVersionDiff =
-            JSON.stringify(basePkg) !== JSON.stringify(headPkg) ||
-            JSON.stringify(baseLock) !== JSON.stringify(headLock);
-
-          // version-only iff something changed AND the only thing that
-          // changed was a version field. Neither-file-touched (ordinary
-          // source PR) must NOT count as version-only, or this job would
-          // gate off heavy E2E for every normal source change too.
-          const isVersionOnly = anyPackageFileChanged && !nonVersionDiff;
-
-          console.log(`anyPackageFileChanged=${anyPackageFileChanged}`);
-          console.log(`nonVersionDiff=${nonVersionDiff}`);
-          console.log(`is_version_only=${isVersionOnly}`);
-          console.log(`deps_changed=${!isVersionOnly}`); // trivial negation, logged only — not exposed as a job output (nothing reads it)
-
-          const out = process.env.GITHUB_OUTPUT;
-          fs.appendFileSync(out, `is_version_only=${isVersionOnly}\n`);
-          JSEOF
-          node classify-deps-change.cjs
+          node .github/scripts/classify-version-bump.cjs
 
   # ---- Env selector ----------------------------------------------------
   #
@@ -374,17 +331,30 @@ jobs:
       (needs.detect-deps-change.result == 'skipped' || needs.detect-deps-change.outputs.is_version_only != 'true') &&
       (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'release' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    # 6 min was sized for the probe alone; the readiness check (#1624) adds
+    # npm ci + build + one bounded check per live env on nightly-class events.
+    timeout-minutes: 20
     permissions:
       contents: read
     outputs:
       selected_env: ${{ steps.select.outputs.selected_env }}
-      # healthy_envs: JSON array of all e2eEligible envs that passed the probe.
-      # For schedule (cron) triggers this is the full set of healthy envs so
-      # the nightly matrix can fan out across all of them. For release and
-      # workflow_dispatch triggers it is a single-element array containing
+      # healthy_envs: JSON array of the envs the scenario matrices fan out over.
+      # Schedule (cron): every live env that is also READY (#1624). A live env
+      # whose readiness check says not-ready (DotNS ABI drift, signer below its
+      # floor, S3 fixture gone) is left out; it is in not_ready instead.
+      # Release and workflow_dispatch: a single-element array containing
       # selected_env so those runs stay fast (release gating must not fan out).
       healthy_envs: ${{ steps.select.outputs.healthy_envs }}
+      # ready_envs: JSON array of live envs that passed readiness (all live envs
+      # on events that do not run the readiness check).
+      ready_envs: ${{ steps.select.outputs.ready_envs }}
+      # not_ready: JSON object env -> [{check, reason}] for live envs that failed
+      # readiness. "{}" when none. Read by nightly-report (#1624).
+      not_ready: ${{ steps.select.outputs.not_ready }}
+      # canary_envs: every LIVE env on schedule (ready or not); [selected_env]
+      # otherwise. Used ONLY by nightly-s1-direct, so one S1 direct leg still
+      # runs on a not-ready env and a wrongly-red probe is visible.
+      canary_envs: ${{ steps.select.outputs.canary_envs }}
       primary_healthy: ${{ steps.select.outputs.primary_healthy }}
       fallback_used: ${{ steps.select.outputs.fallback_used }}
     steps:
@@ -394,11 +364,27 @@ jobs:
           node-version: "22"
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
+      # The readiness check (#1624) imports dist/ (DotNS profile detection, fee
+      # floors, balance readers), unlike probe-env-health.mjs which stays
+      # build-free. Only nightly-class events run it, so PR/push select-env
+      # keeps its probe-only cost.
+      - name: npm ci (readiness check)
+        if: github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
+      - name: npm run build (readiness check)
+        if: github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')
+        run: npm run build
       - id: select
         env:
           PRIMARY_ENV: ${{ inputs.primary-env || 'paseo-next-v2' }}
           EVENT_NAME: ${{ github.event_name }}
+          RUN_READINESS: ${{ (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && 'true' || 'false' }}
         shell: bash
         run: |
           set -uo pipefail
@@ -427,17 +413,71 @@ jobs:
             echo "❌ All E2E-eligible envs are unhealthy" >&2
             exit 1
           fi
-          # Build JSON array from the healthy list.
-          HEALTHY_JSON=$(printf '%s\n' "${HEALTHY[@]}" | jq -R . | jq -sc .)
-          # For schedule (cron) nightly: fan out across all healthy envs.
+          # Build JSON array from the healthy (live) list.
+          HEALTHY_JSON=$(jq -nc '$ARGS.positional' --args "${HEALTHY[@]}")
+          # Readiness (#1624): a live env can still be untestable (DotNS ABI
+          # drift, a signer below its floor, the S3 fixture gone), which turns
+          # every leg on it red at once. Check each live env; "unknown" (probe
+          # glitch, tool crash, no summary line) never marks an env not-ready.
+          READY=()
+          NOT_READY_JSON='{}'
+          # One node process per live env (startup + dist imports + DotNS connect
+          # each), so run them concurrently and read the results in probe order.
+          RDIR=$(mktemp -d)
+          if [[ "$RUN_READINESS" == "true" ]]; then
+            for env in "${HEALTHY[@]}"; do
+              node tools/check-env-readiness.mjs --env "$env" > "$RDIR/$env.out" 2>&1 &
+            done
+            wait
+          fi
+          for env in "${HEALTHY[@]}"; do
+            if [[ "$RUN_READINESS" == "true" ]]; then
+              OUT=$(cat "$RDIR/$env.out" 2>/dev/null || true)
+              echo "::group::Readiness: $env"
+              printf '%s\n' "$OUT"
+              echo "::endgroup::"
+              LINE=$(printf '%s\n' "$OUT" | grep '^ENV_READINESS ' | tail -n 1 | sed 's/^ENV_READINESS //')
+              if [[ -z "$LINE" ]]; then
+                echo "::warning::readiness for $env produced no summary line; treating as unknown (env stays ready)"
+              else
+                if echo "$LINE" | jq -e '(.unknown | length) > 0' >/dev/null 2>&1; then
+                  echo "::warning::readiness for $env has unknown checks (not gating): $(echo "$LINE" | jq -c '.unknown')"
+                fi
+                if echo "$LINE" | jq -e '.ready == false' >/dev/null 2>&1; then
+                  NOT_READY_JSON=$(jq -c --arg e "$env" --argjson l "$LINE" '. + {($e): $l.reasons}' <<<"$NOT_READY_JSON")
+                  echo "::warning::env $env is NOT READY: $(echo "$LINE" | jq -c '.reasons')"
+                  continue
+                fi
+              fi
+            fi
+            READY+=("$env")
+          done
+          # jq --args with an empty list prints nothing on some builds; spell out [].
+          if [[ ${#READY[@]} -eq 0 ]]; then READY_JSON='[]'; else READY_JSON=$(jq -nc '$ARGS.positional' --args "${READY[@]}"); fi
+          # Schedule: the selected (single-env) jobs move to the first READY env
+          # (falling back to the first live one when none is ready; the matrix
+          # is then skipped, see build-nightly). Release/dispatch keep SELECTED
+          # as is: the gate must not quietly move to a different env.
+          if [[ "$EVENT_NAME" == "schedule" && ${#READY[@]} -gt 0 ]]; then
+            SELECTED="${READY[0]}"
+          fi
+          # For schedule (cron) nightly: fan out across the READY envs, plus
+          # canary_envs = every live env for the one S1 direct canary job.
           # For release + workflow_dispatch: single-env to keep the gate fast.
           if [[ "$EVENT_NAME" == "schedule" ]]; then
-            FAN_OUT_ENVS="$HEALTHY_JSON"
+            FAN_OUT_ENVS="$READY_JSON"
+            CANARY_ENVS="$HEALTHY_JSON"
           else
             FAN_OUT_ENVS="[\"$SELECTED\"]"
+            CANARY_ENVS="$FAN_OUT_ENVS"
           fi
-          echo "selected_env=$SELECTED" >> "$GITHUB_OUTPUT"
-          echo "healthy_envs=$FAN_OUT_ENVS" >> "$GITHUB_OUTPUT"
+          {
+            echo "selected_env=$SELECTED"
+            echo "healthy_envs=$FAN_OUT_ENVS"
+            echo "ready_envs=$READY_JSON"
+            echo "not_ready=$NOT_READY_JSON"
+            echo "canary_envs=$CANARY_ENVS"
+          } >> "$GITHUB_OUTPUT"
           if [[ "$SELECTED" == "$PRIMARY_ENV" ]]; then
             echo "primary_healthy=true" >> "$GITHUB_OUTPUT"
             echo "fallback_used=false" >> "$GITHUB_OUTPUT"
@@ -448,6 +488,21 @@ jobs:
           echo "Healthy envs: ${HEALTHY[*]:-none}"
           echo "Fan-out envs (healthy_envs): $FAN_OUT_ENVS"
           echo "Selected (single-env fallback / release gate): $SELECTED"
+          echo "Ready envs: $READY_JSON  Not ready: $NOT_READY_JSON  Canary envs: $CANARY_ENVS"
+          # A release gate on the wrong env is worse than a red gate: when the
+          # env the gate would run on is not ready, fail with the reasons rather
+          # than fall back to a different env. (workflow_dispatch only warns:
+          # the caller asked for that env and is watching.)
+          if jq -e --arg e "$SELECTED" 'has($e)' <<<"$NOT_READY_JSON" >/dev/null; then
+            REASONS=$(jq -r --arg e "$SELECTED" '.[$e][] | "  - \(.check): \(.reason)"' <<<"$NOT_READY_JSON")
+            if [[ "$EVENT_NAME" == "release" ]]; then
+              echo "::error::Release gate env $SELECTED is not ready; refusing to run the gate there or on another env:"$'\n'"$REASONS"
+              echo "Release gate env $SELECTED is not ready:" >&2
+              printf '%s\n' "$REASONS" >&2
+              exit 1
+            fi
+            echo "::warning::selected env $SELECTED is not ready (running anyway on this $EVENT_NAME event):"$'\n'"$REASONS"
+          fi
 
   # ---- Per-PR smoke ---------------------------------------------------
   #
@@ -491,26 +546,17 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
-      - run: npm ci
-      - name: Restore Kubo from cache
-        if: matrix.merkle == 'kubo'
-        uses: actions/cache@v5
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
         with:
-          path: ~/.cache/kubo
-          key: kubo-v0.33.0-linux-amd64
+          run: npm install -g npm@11.17.0
+      - name: npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
       - name: Setup IPFS Kubo
         if: matrix.merkle == 'kubo'
-        run: |
-          if [ ! -f ~/.cache/kubo/ipfs ]; then
-            mkdir -p ~/.cache/kubo
-            curl -fsSL -o /tmp/kubo.tar.gz https://dist.ipfs.tech/kubo/v0.33.0/kubo_v0.33.0_linux-amd64.tar.gz
-            tar -xf /tmp/kubo.tar.gz -C /tmp
-            cp /tmp/kubo/ipfs ~/.cache/kubo/ipfs
-            rm -rf /tmp/kubo /tmp/kubo.tar.gz
-          fi
-          sudo cp ~/.cache/kubo/ipfs /usr/local/bin/ipfs
-          ipfs version
+        uses: ./.github/actions/setup-kubo
       - name: Initialize IPFS
         if: matrix.merkle == 'kubo'
         run: ipfs init
@@ -523,6 +569,9 @@ jobs:
         env:
           E2E: "1"
           E2E_SCENARIO: s1-smoke
+          # bulletin #1623: each PR deploys to its own label (registered on its first
+          # run). Empty on push/dispatch, which use the provisioned pr-tier label.
+          E2E_PR_NUMBER: ${{ github.event.pull_request.number }}
           E2E_SIGNER: ${{ matrix.signer }}
           E2E_MERKLE: ${{ matrix.merkle }}
           PAD_ENV: ${{ needs.select-env.outputs.selected_env }}
@@ -654,12 +703,87 @@ jobs:
               });
             }
 
+  # ---- Dispatch-only: v0.6.0 validation (bulletin #1423/#1410) ----------
+  #
+  # S-V060-UNBLOCK (test/e2e.test.js) exercises v0.6.0-only DotNS naming
+  # semantics (issue #1410) that do not exist on every env yet. This repo has
+  # no preview env to fall back to (unlike bulletin-deploy) — it targets
+  # whatever select-env resolves, which is why validating it stays a manual
+  # dispatch rather than automatic nightly/PR coverage. It therefore does NOT
+  # run on pull_request/push, and does NOT fold into the nightly fan-out (this
+  # job's `if:` only fires for `workflow_dispatch` + `inputs.test-suite ==
+  # 'v060'`, structurally distinct from the 'nightly' value every nightly-*
+  # job gates on below). `test/` is not published to npm (see package.json's
+  # `files` allowlist), so this scenario can only ever run from a SOURCE
+  # checkout — there is no npm-install path to fall back to; this job always
+  # builds from the checked-out ref.
+  #
+  # E2E_REQUIRE_PROFILE=v0.6.0 turns "chain not yet on v0.6.0" into a hard
+  # FAILURE rather than S-V060-UNBLOCK's own default soft-skip (see the
+  # scenario's own gateOnV060Profile) — appropriate here because dispatching
+  # this leg IS the explicit ask for v0.6.0 validation; a quiet skip would
+  # read as a false green.
+  dispatch-s-v060-unblock:
+    name: Dispatch · S-V060-UNBLOCK (gated hard-fail on DotNS ABI profile v0.6.0)
+    needs: [select-env]
+    if: always() && needs.select-env.result == 'success' && github.event_name == 'workflow_dispatch' && inputs.test-suite == 'v060'
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
+      - name: npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
+      - run: npm run build
+      - name: Run S-V060-UNBLOCK against the selected env, hard-failing if it is not yet on DotNS ABI profile v0.6.0
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
+        env:
+          E2E: "1"
+          E2E_SCENARIO: s-v060-unblock
+          E2E_REQUIRE_PROFILE: v0.6.0
+          E2E_SIGNER: pool
+          E2E_MERKLE: js
+          PAD_ENV: ${{ needs.select-env.outputs.selected_env }}
+          DEPLOY_TAG: e2e-ci-dispatch
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        with:
+          timeout_minutes: 15
+          max_attempts: 2
+          retry_wait_seconds: 30
+          retry_on: any
+          command: node --test test/e2e.test.js
+      - name: Upload polkadot-app-deploy forensic log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-log-s-v060-unblock
+          path: e2e-reports/
+          retention-days: 7
+          if-no-files-found: ignore
+
   # ---- Nightly ----------------------------------------------------
 
   build-nightly:
     name: Prepare fixture artifact (nightly)
     needs: select-env
-    if: always() && needs.select-env.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    # healthy_envs == '[]' means no live env passed readiness (#1624): there is
+    # nothing to test, and an empty matrix would error every scenario job. The
+    # env-not-ready issue filed by nightly-report is the signal that night.
+    if: always() && needs.select-env.result == 'success' && needs.select-env.outputs.healthy_envs != '[]' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     # Raised from 20 to 58 to accommodate the publish.yml human-approval wait
     # (up to ~45 min) on release triggers. The 60-min ceiling (safety-net test)
@@ -681,6 +805,11 @@ jobs:
       # so nightly exercises whatever just merged. Release + dispatch with an
       # explicit version → install from npm to test the actual published artifact.
       polkadot-app-deploy-ref: ${{ steps.version.outputs.polkadot-app-deploy-ref }}
+      # Tag whose test harness (test/, tools/, package.json) the published-version
+      # legs run (bulletin #1621): `v<test-version>`, EMPTY on the source-build path. Keyed
+      # off the resolved version, never the cron string. A harness from HEAD
+      # imports internals that an older published dist does not export.
+      harness-ref: ${{ steps.version.outputs.harness-ref }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -689,8 +818,14 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
-      - run: npm ci
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
+      - name: npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
       - name: Resolve test-version and deploy-tag from trigger
         id: version
         env:
@@ -728,10 +863,24 @@ jobs:
           else
             REF=""
           fi
+          # Published-version path: the scenario jobs run the test harness from
+          # the tag of the version under test (bulletin #1621), not from this run's HEAD.
+          # Fail here, once, if that tag is missing — otherwise every leg would
+          # die later with an opaque checkout error.
+          if [ -n "$V" ]; then
+            HARNESS_REF="v$V"
+            if ! git ls-remote --exit-code --tags origin "refs/tags/$HARNESS_REF" >/dev/null 2>&1; then
+              echo "::error::git tag $HARNESS_REF not found on origin — the published-version tier runs the test harness from the tag of the version under test (bulletin #1621), so @parity/polkadot-app-deploy@$V cannot be tested without it. Push the tag, or dispatch with a version that has one." >&2
+              exit 1
+            fi
+          else
+            HARNESS_REF=""
+          fi
           echo "test-version=$V" >> "$GITHUB_OUTPUT"
           echo "deploy-tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "polkadot-app-deploy-ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "Resolved: test-version='$V', deploy-tag='$TAG', polkadot-app-deploy-ref='$REF' (event=$EVENT)"
+          echo "harness-ref=$HARNESS_REF" >> "$GITHUB_OUTPUT"
+          echo "Resolved: test-version='$V', deploy-tag='$TAG', polkadot-app-deploy-ref='$REF', harness-ref='$HARNESS_REF' (event=$EVENT)"
       - name: Wait for publish.yml to complete
         # Only on release: publish.yml fires on `release: created` (the same event
         # that fired us) but it pauses behind a `environment: release` human-
@@ -868,13 +1017,79 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
-      - run: npm ci
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
+      - name: npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
       - run: npm run build
       - name: Ensure E2E signer accounts are authorized + funded
         env:
           PAD_ENV: ${{ needs.select-env.outputs.selected_env }}
         run: node scripts/e2e-ensure-authorized.mjs --env "$PAD_ENV"
+
+  # Policy (bulletin #1621): a published-version run exercises the scenarios AS OF that tag
+  # (harness + dist versioned together); scenarios added on main since are covered
+  # by the source-build tier, not this one.
+  # ---- Harness-import smoke: published-version tier only. The scenario
+  # jobs below run the test harness from the tag of the version under test
+  # against that version's installed dist. If the harness cannot even load
+  # against it (a missing export, a renamed module), every leg would die with the
+  # same SyntaxError; this job reds ONCE with that error and the jobs that
+  # `needs:` it skip. With E2E unset every scenario is skipped, but node still
+  # evaluates the harness's whole static import graph, which is the point.
+  nightly-harness-smoke:
+    name: Nightly harness-import smoke (${{ needs.build-nightly.outputs.test-version }})
+    needs: [build-nightly]
+    if: always() && needs.build-nightly.result == 'success' && needs.build-nightly.outputs.harness-ref != '' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      BULLETIN_DEPLOY_VERSION: ${{ needs.build-nightly.outputs.test-version }}
+      HARNESS_REF: ${{ needs.build-nightly.outputs.harness-ref }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
+      - name: Use the test harness from the tag under test (#1621)
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "refs/tags/$HARNESS_REF:refs/tags/$HARNESS_REF"
+          git checkout "$HARNESS_REF" -- . ':(exclude).github'
+          echo "Harness (test/, tools/, package.json) from $HARNESS_REF ($(git rev-parse "$HARNESS_REF^{commit}")); workflow + .github from $GITHUB_SHA"
+      - name: Install polkadot-app-deploy from npm
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            # Same setup as the scenario jobs: the harness resolves ../dist.
+            npm install --no-save "@parity/polkadot-app-deploy@${BULLETIN_DEPLOY_VERSION}" ws
+            ln -sfn node_modules/@parity/polkadot-app-deploy/dist dist
+      - name: Import the harness against the installed dist
+        run: |
+          unset E2E
+          set +e
+          node --test test/e2e.test.js > /tmp/harness-smoke.log 2>&1
+          RC=$?
+          set -e
+          cat /tmp/harness-smoke.log
+          if [ "$RC" != "0" ]; then
+            CAUSE="$(grep -aE 'SyntaxError|ERR_MODULE_NOT_FOUND|ERR_PACKAGE_PATH_NOT_EXPORTED' /tmp/harness-smoke.log | head -n 1 | tr -d '\r')"
+            echo ">> FAIL: harness-import smoke: $HARNESS_REF harness cannot load against @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION (exit $RC): ${CAUSE:-see log above}"
+            exit 1
+          fi
+          echo "harness from $HARNESS_REF imports cleanly against @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
 
   # ---- Nightly @ HEAD: coverage for the 11 scenarios that left the PR matrix
   #
@@ -883,7 +1098,11 @@ jobs:
   # docs-internal/superpowers/specs/2026-05-22-ci-restructure-design.md.
 
   nightly-pr-coverage:
-    name: Nightly @ HEAD · ${{ matrix.scenario }} ${{ matrix.signer }}/${{ matrix.merkle }}
+    # Reports the actual tested version instead of a blanket "@ HEAD" now that
+    # a release/pinned-dispatch run installs @parity/polkadot-app-deploy from
+    # npm below (issue #270) rather than always building the checkout.
+    # Mirrors bulletin-deploy's identical nightly-pr-coverage job name.
+    name: Nightly @ ${{ needs.build-nightly.outputs.test-version || 'HEAD' }} · ${{ matrix.scenario }} ${{ matrix.signer }}/${{ matrix.merkle }}
     # Waits for the full Alice-pool nonce chain (s1-pool→s5→s6→s-ext-signer).
     # E2E_POOL_LABEL (below) uses a dedicated domain (e2eprpool01) to avoid domain
     # contention with nightly-s1-pool on e2epoolns01.dot. But the pool accounts all
@@ -893,18 +1112,25 @@ jobs:
     # Per-leg pool account pinning (#863): each pool leg is pinned to a disjoint
     # //deploy/N account via BULLETIN_POOL_ACCOUNT_INDEX, eliminating intra-matrix
     # nonce collisions without requiring a separate mnemonic provisioning step.
-    needs: [build-nightly, select-env, nightly-s-ext-signer, ensure-e2e-authorized]
+    needs: [build-nightly, select-env, nightly-s-ext-signer, ensure-e2e-authorized, nightly-harness-smoke]
     if: |
       always() && needs.ensure-e2e-authorized.result == 'success' &&
       needs.build-nightly.result == 'success' &&
+      contains(fromJSON('["success","skipped"]'), needs.nightly-harness-smoke.result) &&
       (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      DEPLOY_TAG: ${{ needs.build-nightly.outputs.deploy-tag }}
+      BULLETIN_DEPLOY_VERSION: ${{ needs.build-nightly.outputs.test-version }}
+      BULLETIN_DEPLOY_REF: ${{ needs.build-nightly.outputs.polkadot-app-deploy-ref }}
     strategy:
       fail-fast: false
       matrix:
-        # No env fan-out here: nightly-pr-coverage tests HEAD source code rather
-        # than the deployed reusable-workflow artifact. Mixing a free env dimension
+        # No env fan-out here: nightly-pr-coverage tests bin/polkadot-app-deploy
+        # directly (source-built on schedule/unpinned dispatch, npm-installed on
+        # release/pinned dispatch — see BULLETIN_DEPLOY_REF below) rather than
+        # the deployed reusable-workflow artifact. Mixing a free env dimension
         # with the include list would produce additive (not cartesian) expansion —
         # GitHub appends include entries that share no keys with the free dimension
         # instead of merging them. Single-env (selected_env) is correct for this job.
@@ -927,8 +1153,16 @@ jobs:
           - { scenario: s-inc-portability,        signer: pool,   merkle: js,   poolIndex: 5 }
           - { scenario: s-inc-asset-rotation,     signer: pool,   merkle: js,   poolIndex: 6 }
           - { scenario: s-subdomain,              signer: pool,   merkle: js,   poolIndex: 7 }
-          - { scenario: s-content-only,           signer: pool,   merkle: js,   poolIndex: 8 }
+          # Pinned to 13, not 8 (bulletin #1637): //deploy/8's nonce is stuck behind
+          # immortal third-party txs in one RPC backend's pool. Any unused index would
+          # do — the pin only keeps this leg's nonces apart from the concurrent pinned legs.
+          - { scenario: s-content-only,           signer: pool,   merkle: js,   poolIndex: 13 }
           - { scenario: s-manifest-env,           signer: pool,   merkle: js,   poolIndex: 9 }
+          # No poolIndex: --product-name derives its own signer and refuses a
+          # derivation path, so this leg cannot be pinned to a //deploy/N account.
+          - { scenario: s-product-manifest,       signer: direct, merkle: js }
+          # App v2 PolkaVM manifest publish and executable read-back.
+          - { scenario: s-manifest-pvm,           signer: pool,   merkle: js,   poolIndex: 12 }
           # S-TRANSFER: register-as-worker then hand over via the `transfer`
           # command, plus idempotent re-run. Existed in test/e2e.test.js and
           # scripts/e2e-pass.sh since its introduction but was never wired
@@ -941,45 +1175,82 @@ jobs:
           # anywhere before this leg.
           - { scenario: s-transfer-subname,       signer: pool,   merkle: js,   poolIndex: 11 }
     steps:
+      # BULLETIN_DEPLOY_REF is only ever github.sha (schedule / unpinned
+      # dispatch) or empty (release / pinned dispatch — see build-nightly's
+      # version-resolution step). An empty `ref:` input is treated by
+      # actions/checkout the same as omitting it, i.e. the triggering commit —
+      # same as the bare checkout this replaces — so this is a no-op on the
+      # source-build path and only changes behavior on the npm-install path
+      # below, where the checkout is still needed for this repo's own test
+      # files and the local ./.github/actions/npm-retry composite action.
       - uses: actions/checkout@v6
+        with:
+          repository: paritytech/polkadot-app-deploy
+          ref: ${{ env.BULLETIN_DEPLOY_REF || '' }}
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
-      - name: Restore Kubo from cache
-        if: matrix.merkle == 'kubo'
-        uses: actions/cache@v5
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
         with:
-          path: ~/.cache/kubo
-          key: kubo-v0.33.0-linux-amd64
+          run: npm install -g npm@11.17.0
       - name: Setup IPFS Kubo
         if: matrix.merkle == 'kubo'
-        run: |
-          if [ ! -f ~/.cache/kubo/ipfs ]; then
-            mkdir -p ~/.cache/kubo
-            curl -fsSL -o /tmp/kubo.tar.gz https://dist.ipfs.tech/kubo/v0.33.0/kubo_v0.33.0_linux-amd64.tar.gz
-            tar -xf /tmp/kubo.tar.gz -C /tmp
-            cp /tmp/kubo/ipfs ~/.cache/kubo/ipfs
-            rm -rf /tmp/kubo /tmp/kubo.tar.gz
-          fi
-          sudo cp ~/.cache/kubo/ipfs /usr/local/bin/ipfs
-          ipfs version
+        uses: ./.github/actions/setup-kubo
       - name: Initialize IPFS
         if: matrix.merkle == 'kubo'
         run: ipfs init
-      - run: npm ci
+      - name: Build polkadot-app-deploy from source
+        if: env.BULLETIN_DEPLOY_REF != ''
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
+      - name: Use the test harness from the tag under test (#1621)
+        if: env.BULLETIN_DEPLOY_REF == ''
+        env:
+          HARNESS_REF: ${{ needs.build-nightly.outputs.harness-ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HARNESS_REF" ]; then
+            echo "::error::published-version path but build-nightly emitted no harness-ref" >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "refs/tags/$HARNESS_REF:refs/tags/$HARNESS_REF"
+          git checkout "$HARNESS_REF" -- . ':(exclude).github'
+          echo "Harness (test/, tools/, package.json) from $HARNESS_REF ($(git rev-parse "$HARNESS_REF^{commit}")); workflow + .github from $GITHUB_SHA"
+      # On release (and a pinned workflow_dispatch), build-nightly resolves
+      # test-version to the RC being gated and this leg must exercise the
+      # published tarball's bytes, not a source build of the tag (issue #270 —
+      # the gate was validating source, not what `npm install` actually gives
+      # consumers). Mirrors nightly-s8/nightly-s9's identical install step.
+      - name: Install polkadot-app-deploy from npm
+        if: env.BULLETIN_DEPLOY_REF == ''
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            # ws is a runtime dependency of the published package, but the
+            # npm-install path needs it resolvable at the top level for
+            # test/helpers/ws-fault-proxy.mjs's bare `import "ws"` — same
+            # precaution nightly-s8/nightly-s9 take.
+            npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
+            # test/e2e.test.js's helpers and bin/polkadot-app-deploy itself
+            # resolve relative imports from ../dist — symlink the installed
+            # package's dist so those imports run against the published
+            # tarball instead of a local build (there is none on this path).
+            ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
+          E2E_RESULT_PATH: ${{ github.workspace }}/e2e-result/e2e-result.json
           E2E_SCENARIO: ${{ matrix.scenario }}
           E2E_SIGNER: ${{ matrix.signer }}
           E2E_MERKLE: ${{ matrix.merkle }}
           PAD_ENV: ${{ needs.select-env.outputs.selected_env }}
-          DEPLOY_TAG: e2e-ci-nightly
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           # Dedicated pool fixture domain — avoids nonce contention with nightly-s1-pool
           # on e2epoolns01.dot. First run registers e2eprpool01.dot automatically.
@@ -992,7 +1263,9 @@ jobs:
           max_attempts: 2
           retry_wait_seconds: 30
           retry_on_exit_code: 75
-          command: node tools/release-retry-wrapper.mjs node --test test/e2e.test.js
+          command: |
+            set -o pipefail
+            node tools/release-retry-wrapper.mjs node --test test/e2e.test.js 2>&1 | tee "$RUNNER_TEMP/e2e-leg.log"
       - name: Upload polkadot-app-deploy forensic log
         if: always()
         continue-on-error: true
@@ -1002,6 +1275,18 @@ jobs:
           path: e2e-reports/
           retention-days: 7
           if-no-files-found: ignore
+      - name: Write e2e-result.json (#1625)
+        if: always()
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: ${{ matrix.scenario }}
+          env: ${{ needs.select-env.outputs.selected_env }}
+          signer: ${{ matrix.signer }}
+          merkle: ${{ matrix.merkle }}
+          job-name: Nightly @ ${{ needs.build-nightly.outputs.test-version || 'HEAD' }} · ${{ matrix.scenario }} ${{ matrix.signer }}/${{ matrix.merkle }}
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log
 
   nightly-s1-pool:
     name: Nightly S1 pool/${{ matrix.merkle }} on ${{ matrix.runner }} (${{ matrix.env }})
@@ -1027,6 +1312,8 @@ jobs:
         runner: ["${{ inputs.runner || 'ubuntu-latest' }}"]
     uses: ./.github/workflows/deploy.yml
     with:
+      result-scenario: s1
+      result-job-name: Nightly S1 pool/${{ matrix.merkle }} on ${{ matrix.runner }} (${{ matrix.env }})
       artifact-name: e2e-fixture-nightly
       dotns-domain: e2epoolns01
       skip-cache: true
@@ -1066,11 +1353,17 @@ jobs:
       fail-fast: false
       matrix:
         # env fans out on schedule, single-env on release/dispatch (see select-env).
-        env: ${{ fromJSON(needs.select-env.outputs.healthy_envs) }}
+        # canary_envs, not healthy_envs (#1624): every LIVE env runs this one S1
+        # direct shard, ready or not, so a wrongly-red readiness probe shows up
+        # as a green leg on an env the matrix skipped. nightly-report separates
+        # these legs from the real scenario failures.
+        env: ${{ fromJSON(needs.select-env.outputs.canary_envs) }}
         merkle: [js, kubo]
         runner: ["${{ inputs.runner || 'ubuntu-latest' }}"]
     uses: ./.github/workflows/deploy.yml
     with:
+      result-scenario: s1
+      result-job-name: Nightly S1 direct/${{ matrix.merkle }} on ${{ matrix.runner }} (${{ matrix.env }})
       artifact-name: e2e-fixture-nightly
       dotns-domain: e2edirectdp01
       derivation-path: //e2e-direct
@@ -1120,6 +1413,8 @@ jobs:
         signer: [pool, direct]
     uses: ./.github/workflows/deploy.yml
     with:
+      result-scenario: s2
+      result-job-name: Nightly S2 fresh / ${{ matrix.signer }} (${{ matrix.env }})
       artifact-name: e2e-fixture-nightly
       # Ends in the signer name plus 00 so the final label has base length
       # >= 9 and exactly two trailing digits, classifying as NoStatus on both envs.
@@ -1170,12 +1465,17 @@ jobs:
       PAD_ENV: ${{ matrix.env }}
       S3_LABEL: e2eownedns03
     steps:
+      # npm-retry is a local action, so this repo must be at the workspace root.
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1188,22 +1488,24 @@ jobs:
           ref: ${{ env.BULLETIN_DEPLOY_REF }}
           path: polkadot-app-deploy-src
       - name: Install polkadot-app-deploy
-        run: |
-          if [ -n "$BULLETIN_DEPLOY_REF" ]; then
-            echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
-            cd polkadot-app-deploy-src
-            npm ci
-            cd ..
-            echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
-          elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
-            echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          else
-            echo "Installing @parity/polkadot-app-deploy (latest stable)"
-            npm install -g @parity/polkadot-app-deploy
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          fi
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            if [ -n "$BULLETIN_DEPLOY_REF" ]; then
+              echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
+              cd polkadot-app-deploy-src
+              npm ci
+              cd ..
+              echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
+            elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
+              echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            else
+              echo "Installing @parity/polkadot-app-deploy (latest stable)"
+              npm install -g @parity/polkadot-app-deploy
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            fi
       - name: Deploy to Bob's domain — expect rejection
         timeout-minutes: 10
         env:
@@ -1211,12 +1513,14 @@ jobs:
           # memory-pressure behaviour. At job-level it leaks into npm ci's
           # prepare hook (see PR #408).
           NODE_OPTIONS: --max-old-space-size=512
+          # bulletin #1626: this deploy is asserted to fail; tag its spans deploy.expected_error.
+          PAD_E2E_EXPECT_FAIL: "1"
         run: |
           set +e
-          "$PAD_BIN" --js-merkle --tag "$DEPLOY_TAG" --env "$PAD_ENV" build "$S3_LABEL" > /tmp/s3.log 2>&1
+          "$PAD_BIN" --js-merkle --tag "$DEPLOY_TAG" --env "$PAD_ENV" build "$S3_LABEL" > "$RUNNER_TEMP/e2e-leg.log" 2>&1
           EXIT=$?
           set -e
-          cat /tmp/s3.log
+          cat "$RUNNER_TEMP/e2e-leg.log"
           echo "---"
           echo "polkadot-app-deploy exit code: $EXIT"
           # Exit 78 is EXIT_CODE_NO_RETRY, which polkadot-app-deploy uses for
@@ -1230,11 +1534,22 @@ jobs:
           # Bob's H160 from docs/e2e-bootstrap.md; pins the check to the
           # specific owner so a generic "already owned" from a different
           # account doesn't silently pass.
-          if ! grep -qi "is already owned by 0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01" /tmp/s3.log; then
+          if ! grep -qi "is already owned by 0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01" "$RUNNER_TEMP/e2e-leg.log"; then
             echo "::error::Expected 'is already owned by 0x41dccbd4...' (Bob's H160) in S3 output"
             exit 1
           fi
           echo "::notice::S3 correctly rejected the deploy with the expected error"
+      - name: Write e2e-result.json (#1625)
+        if: always()
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: s3
+          env: ${{ matrix.env }}
+          merkle: js
+          job-name: Nightly S3 owned-elsewhere (${{ matrix.env }})
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log
 
   nightly-s5:
     name: Nightly S5 commit-reveal race + retry (${{ matrix.env }})
@@ -1268,12 +1583,17 @@ jobs:
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
       PAD_ENV: ${{ matrix.env }}
     steps:
+      # npm-retry is a local action, so this repo must be at the workspace root.
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1286,22 +1606,24 @@ jobs:
           ref: ${{ env.BULLETIN_DEPLOY_REF }}
           path: polkadot-app-deploy-src
       - name: Install polkadot-app-deploy
-        run: |
-          if [ -n "$BULLETIN_DEPLOY_REF" ]; then
-            echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
-            cd polkadot-app-deploy-src
-            npm ci
-            cd ..
-            echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
-          elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
-            echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          else
-            echo "Installing @parity/polkadot-app-deploy (latest stable)"
-            npm install -g @parity/polkadot-app-deploy
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          fi
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            if [ -n "$BULLETIN_DEPLOY_REF" ]; then
+              echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
+              cd polkadot-app-deploy-src
+              npm ci
+              cd ..
+              echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
+            elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
+              echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            else
+              echo "Installing @parity/polkadot-app-deploy (latest stable)"
+              npm install -g @parity/polkadot-app-deploy
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            fi
       - name: Deploy with DOTNS_COMMITMENT_BUFFER=0 — expect retry escalation
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
@@ -1320,23 +1642,23 @@ jobs:
           retry_on_exit_code: 75
           command: |
             set +e
-            "$PAD_BIN" --js-merkle --tag "$DEPLOY_TAG" --env "$PAD_ENV" build "$LABEL" > /tmp/s5.log 2>&1
+            "$PAD_BIN" --js-merkle --tag "$DEPLOY_TAG" --env "$PAD_ENV" build "$LABEL" > "$RUNNER_TEMP/e2e-leg.log" 2>&1
             EXIT=$?
             set -e
-            cat /tmp/s5.log
+            cat "$RUNNER_TEMP/e2e-leg.log"
             echo "---"
             echo "polkadot-app-deploy exit code: $EXIT"
             if [ "$EXIT" != "0" ]; then
               # Verbatim from src/dotns.ts double-failure throw — a hard regression
               # if it appears (means both register attempts failed).
-              if grep -q "DotNS register failed after retry:" /tmp/s5.log; then
+              if grep -q "DotNS register failed after retry:" "$RUNNER_TEMP/e2e-leg.log"; then
                 echo "::error::S5: actionable-error text means BOTH attempts failed."
                 exit 1
               fi
               # Stale nonce (papi 1.x "Invalid: Stale" or papi 2.x JSON format) —
               # transient race on the shared signer account; exit 75 so
               # nick-fields/retry fires.
-              if grep -qE '"type": "Stale"|Invalid: Stale' /tmp/s5.log; then
+              if grep -qE '"type": "Stale"|Invalid: Stale' "$RUNNER_TEMP/e2e-leg.log"; then
                 echo "::warning::S5: nonce stale — exiting 75 for retry"
                 exit 75
               fi
@@ -1349,11 +1671,22 @@ jobs:
             # fast-producing chain, the reveal can land in time. Surface the
             # outcome as a notice for visibility, but don't fail when the race
             # didn't happen — the retry-path code itself is covered by unit tests.
-            if grep -q "with DOTNS_COMMITMENT_BUFFER=60s" /tmp/s5.log; then
+            if grep -q "with DOTNS_COMMITMENT_BUFFER=60s" "$RUNNER_TEMP/e2e-leg.log"; then
               echo "::notice::S5 retry path fired and recovered"
             else
               echo "::notice::S5 retry path did not fire — race did not manifest this run (timing-dependent)"
             fi
+      - name: Write e2e-result.json (#1625)
+        if: always()
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: s5
+          env: ${{ matrix.env }}
+          merkle: js
+          job-name: Nightly S5 commit-reveal race + retry (${{ matrix.env }})
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log
 
   nightly-s6:
     name: Nightly S6 RPC failover (${{ matrix.env }})
@@ -1385,12 +1718,17 @@ jobs:
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
       PAD_ENV: ${{ matrix.env }}
     steps:
+      # npm-retry is a local action, so this repo must be at the workspace root.
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1403,22 +1741,24 @@ jobs:
           ref: ${{ env.BULLETIN_DEPLOY_REF }}
           path: polkadot-app-deploy-src
       - name: Install polkadot-app-deploy
-        run: |
-          if [ -n "$BULLETIN_DEPLOY_REF" ]; then
-            echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
-            cd polkadot-app-deploy-src
-            npm ci
-            cd ..
-            echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
-          elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
-            echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          else
-            echo "Installing @parity/polkadot-app-deploy (latest stable)"
-            npm install -g @parity/polkadot-app-deploy
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          fi
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            if [ -n "$BULLETIN_DEPLOY_REF" ]; then
+              echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
+              cd polkadot-app-deploy-src
+              npm ci
+              cd ..
+              echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
+            elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
+              echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            else
+              echo "Installing @parity/polkadot-app-deploy (latest stable)"
+              npm install -g @parity/polkadot-app-deploy
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            fi
       - name: Deploy with unroutable primary RPC — expect failover to default
         timeout-minutes: 12
         env:
@@ -1430,7 +1770,7 @@ jobs:
         run: |
           set +e
           set -o pipefail
-          "$PAD_BIN" --js-merkle --tag "$DEPLOY_TAG" --env "$PAD_ENV" build e2epoolns01 2>&1 | tee /tmp/s6.log
+          "$PAD_BIN" --js-merkle --tag "$DEPLOY_TAG" --env "$PAD_ENV" build e2epoolns01 2>&1 | tee "$RUNNER_TEMP/e2e-leg.log"
           EXIT=${PIPESTATUS[0]}
           set -e
           echo "---"
@@ -1440,6 +1780,17 @@ jobs:
             exit 1
           fi
           echo "::notice::S6 deploy succeeded — papi rotated past the unroutable primary"
+      - name: Write e2e-result.json (#1625)
+        if: always()
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: s6
+          env: ${{ matrix.env }}
+          merkle: js
+          job-name: Nightly S6 RPC failover (${{ matrix.env }})
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log
 
   nightly-s7:
     name: Nightly S7 SIGINT crash-capture (${{ matrix.env }})
@@ -1481,7 +1832,10 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1494,22 +1848,24 @@ jobs:
           ref: ${{ env.BULLETIN_DEPLOY_REF }}
           path: polkadot-app-deploy-src
       - name: Install polkadot-app-deploy
-        run: |
-          if [ -n "$BULLETIN_DEPLOY_REF" ]; then
-            echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
-            cd polkadot-app-deploy-src
-            npm ci
-            cd ..
-            echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
-          elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
-            echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          else
-            echo "Installing @parity/polkadot-app-deploy (latest stable)"
-            npm install -g @parity/polkadot-app-deploy
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          fi
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            if [ -n "$BULLETIN_DEPLOY_REF" ]; then
+              echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
+              cd polkadot-app-deploy-src
+              npm ci
+              cd ..
+              echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
+            elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
+              echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            else
+              echo "Installing @parity/polkadot-app-deploy (latest stable)"
+              npm install -g @parity/polkadot-app-deploy
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            fi
       - name: Run S7 SIGINT scenario
         timeout-minutes: 10
         env:
@@ -1524,7 +1880,20 @@ jobs:
           FIXTURE_DIR: build
           LABEL: e2epoolns01
           OWNED_LABEL: e2eownedns02
-        run: node scripts/e2e-sigint-scenario.mjs
+        run: |
+          set -o pipefail
+          node scripts/e2e-sigint-scenario.mjs 2>&1 | tee "$RUNNER_TEMP/e2e-leg.log"
+      - name: Write e2e-result.json (#1625)
+        if: always()
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: s7
+          env: ${{ matrix.env }}
+          merkle: js
+          job-name: Nightly S7 SIGINT crash-capture (${{ matrix.env }})
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log
 
   nightly-s8:
     name: Nightly S8 WS fault injection (${{ matrix.env }})
@@ -1532,8 +1901,8 @@ jobs:
     # Uses the checked-out source so the WS fault proxy and test helpers are
     # available; polkadot-app-deploy binary is built from source (or from the RC
     # ref when BULLETIN_DEPLOY_REF is set).
-    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized]
-    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's8')))
+    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized, nightly-harness-smoke]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.nightly-harness-smoke.result) && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's8')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 25
     permissions:
@@ -1560,24 +1929,44 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
+        uses: ./.github/actions/npm-retry
+        with:
+          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+      - name: Use the test harness from the tag under test (#1621)
+        if: env.BULLETIN_DEPLOY_REF == ''
+        env:
+          HARNESS_REF: ${{ needs.build-nightly.outputs.harness-ref }}
         run: |
-          SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+          set -euo pipefail
+          if [ -z "$HARNESS_REF" ]; then
+            echo "::error::published-version path but build-nightly emitted no harness-ref" >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "refs/tags/$HARNESS_REF:refs/tags/$HARNESS_REF"
+          git checkout "$HARNESS_REF" -- . ':(exclude).github'
+          echo "Harness (test/, tools/, package.json) from $HARNESS_REF ($(git rev-parse "$HARNESS_REF^{commit}")); workflow + .github from $GITHUB_SHA"
       - name: Install polkadot-app-deploy from npm
         if: env.BULLETIN_DEPLOY_REF == ''
-        run: |
-          V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          # ws is a devDep needed by test/helpers/ws-fault-proxy.mjs; not in the published package
-          npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
-          # e2e.test.js resolves imports from ../dist — symlink the installed dist so
-          # relative imports work on the npm-install path (no local build on this path).
-          ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            # ws is a devDep needed by test/helpers/ws-fault-proxy.mjs; not in the published package
+            npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
+            # e2e.test.js resolves imports from ../dist — symlink the installed dist so
+            # relative imports work on the npm-install path (no local build on this path).
+            ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S8 WS fault-injection scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
+          E2E_RESULT_PATH: ${{ github.workspace }}/e2e-result/e2e-result.json
           E2E_SCENARIO: s8
           E2E_SIGNER: direct
           E2E_MERKLE: js
@@ -1595,15 +1984,29 @@ jobs:
           max_attempts: 2
           retry_wait_seconds: 30
           retry_on_exit_code: 75
-          command: node tools/release-retry-wrapper.mjs node --test test/e2e.test.js
+          command: |
+            set -o pipefail
+            node tools/release-retry-wrapper.mjs node --test test/e2e.test.js 2>&1 | tee "$RUNNER_TEMP/e2e-leg.log"
+      - name: Write e2e-result.json (#1625)
+        if: always()
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: s8
+          env: ${{ matrix.env }}
+          signer: direct
+          merkle: js
+          job-name: Nightly S8 WS fault injection (${{ matrix.env }})
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log
 
   nightly-s9:
     name: Nightly S9 parallel nonce-collision resilience (${{ matrix.env }})
     # Two parallel deploys from the same direct-signer key; proves nonce-advance
     # defense works under concurrent chunk-upload contention.
     # Runs after nightly-s1-direct to avoid nonce races on the direct signer label.
-    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized]
-    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's9')))
+    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized, nightly-harness-smoke]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.nightly-harness-smoke.result) && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's9')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 35
     permissions:
@@ -1630,21 +2033,41 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
+        uses: ./.github/actions/npm-retry
+        with:
+          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+      - name: Use the test harness from the tag under test (#1621)
+        if: env.BULLETIN_DEPLOY_REF == ''
+        env:
+          HARNESS_REF: ${{ needs.build-nightly.outputs.harness-ref }}
         run: |
-          SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+          set -euo pipefail
+          if [ -z "$HARNESS_REF" ]; then
+            echo "::error::published-version path but build-nightly emitted no harness-ref" >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "refs/tags/$HARNESS_REF:refs/tags/$HARNESS_REF"
+          git checkout "$HARNESS_REF" -- . ':(exclude).github'
+          echo "Harness (test/, tools/, package.json) from $HARNESS_REF ($(git rev-parse "$HARNESS_REF^{commit}")); workflow + .github from $GITHUB_SHA"
       - name: Install polkadot-app-deploy from npm
         if: env.BULLETIN_DEPLOY_REF == ''
-        run: |
-          V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
-          ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
+            ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S9 parallel nonce-collision scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
+          E2E_RESULT_PATH: ${{ github.workspace }}/e2e-result/e2e-result.json
           E2E_SCENARIO: s9
           E2E_SIGNER: direct
           E2E_MERKLE: js
@@ -1656,15 +2079,29 @@ jobs:
           max_attempts: 2
           retry_wait_seconds: 30
           retry_on_exit_code: 75
-          command: node tools/release-retry-wrapper.mjs node --test test/e2e.test.js
+          command: |
+            set -o pipefail
+            node tools/release-retry-wrapper.mjs node --test test/e2e.test.js 2>&1 | tee "$RUNNER_TEMP/e2e-leg.log"
+      - name: Write e2e-result.json (#1625)
+        if: always()
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: s9
+          env: ${{ matrix.env }}
+          signer: direct
+          merkle: js
+          job-name: Nightly S9 parallel nonce-collision resilience (${{ matrix.env }})
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log
 
   nightly-s-grandpa-reupload:
     name: Nightly S-GRANDPA-REUPLOAD stale finalized head forces re-upload (${{ matrix.env }})
     # Proxy holds stale chain_getFinalizedHead for 15s (> 10s natural wait),
     # forcing the missing-chunk re-upload path to fire and succeed.
     # Runs after nightly-s1-direct to avoid nonce races on the direct signer label.
-    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized]
-    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-grandpa-reupload')))
+    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized, nightly-harness-smoke]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.nightly-harness-smoke.result) && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-grandpa-reupload')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 25
     permissions:
@@ -1691,21 +2128,41 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
+        uses: ./.github/actions/npm-retry
+        with:
+          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+      - name: Use the test harness from the tag under test (#1621)
+        if: env.BULLETIN_DEPLOY_REF == ''
+        env:
+          HARNESS_REF: ${{ needs.build-nightly.outputs.harness-ref }}
         run: |
-          SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+          set -euo pipefail
+          if [ -z "$HARNESS_REF" ]; then
+            echo "::error::published-version path but build-nightly emitted no harness-ref" >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "refs/tags/$HARNESS_REF:refs/tags/$HARNESS_REF"
+          git checkout "$HARNESS_REF" -- . ':(exclude).github'
+          echo "Harness (test/, tools/, package.json) from $HARNESS_REF ($(git rev-parse "$HARNESS_REF^{commit}")); workflow + .github from $GITHUB_SHA"
       - name: Install polkadot-app-deploy from npm
         if: env.BULLETIN_DEPLOY_REF == ''
-        run: |
-          V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
-          ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
+            ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S-GRANDPA-REUPLOAD scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
+          E2E_RESULT_PATH: ${{ github.workspace }}/e2e-result/e2e-result.json
           E2E_SCENARIO: s-grandpa-reupload
           E2E_SIGNER: direct
           E2E_MERKLE: js
@@ -1717,7 +2174,21 @@ jobs:
           max_attempts: 2
           retry_wait_seconds: 30
           retry_on_exit_code: 75
-          command: node tools/release-retry-wrapper.mjs node --test test/e2e.test.js
+          command: |
+            set -o pipefail
+            node tools/release-retry-wrapper.mjs node --test test/e2e.test.js 2>&1 | tee "$RUNNER_TEMP/e2e-leg.log"
+      - name: Write e2e-result.json (#1625)
+        if: always()
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: s-grandpa-reupload
+          env: ${{ matrix.env }}
+          signer: direct
+          merkle: js
+          job-name: Nightly S-GRANDPA-REUPLOAD stale finalized head forces re-upload (${{ matrix.env }})
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log
 
   nightly-s-mortality:
     name: Nightly S-MORTALITY chunk tx mortal era expiry retry (${{ matrix.env }})
@@ -1725,8 +2196,8 @@ jobs:
     # to expire before inclusion on congested blocks, exercising the
     # isValid:false → expiry-retry path in storeChunkedContent.
     # Runs after nightly-s1-direct to avoid nonce races on the direct signer label.
-    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized]
-    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-mortality')))
+    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized, nightly-harness-smoke]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.nightly-harness-smoke.result) && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-mortality')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 35
     permissions:
@@ -1753,21 +2224,41 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
+        uses: ./.github/actions/npm-retry
+        with:
+          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+      - name: Use the test harness from the tag under test (#1621)
+        if: env.BULLETIN_DEPLOY_REF == ''
+        env:
+          HARNESS_REF: ${{ needs.build-nightly.outputs.harness-ref }}
         run: |
-          SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+          set -euo pipefail
+          if [ -z "$HARNESS_REF" ]; then
+            echo "::error::published-version path but build-nightly emitted no harness-ref" >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "refs/tags/$HARNESS_REF:refs/tags/$HARNESS_REF"
+          git checkout "$HARNESS_REF" -- . ':(exclude).github'
+          echo "Harness (test/, tools/, package.json) from $HARNESS_REF ($(git rev-parse "$HARNESS_REF^{commit}")); workflow + .github from $GITHUB_SHA"
       - name: Install polkadot-app-deploy from npm
         if: env.BULLETIN_DEPLOY_REF == ''
-        run: |
-          V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
-          ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
+            ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S-MORTALITY chunk expiry retry scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
+          E2E_RESULT_PATH: ${{ github.workspace }}/e2e-result/e2e-result.json
           E2E_SCENARIO: s-mortality
           E2E_SIGNER: direct
           E2E_MERKLE: js
@@ -1779,7 +2270,21 @@ jobs:
           max_attempts: 2
           retry_wait_seconds: 30
           retry_on_exit_code: 75
-          command: node tools/release-retry-wrapper.mjs node --test test/e2e.test.js
+          command: |
+            set -o pipefail
+            node tools/release-retry-wrapper.mjs node --test test/e2e.test.js 2>&1 | tee "$RUNNER_TEMP/e2e-leg.log"
+      - name: Write e2e-result.json (#1625)
+        if: always()
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: s-mortality
+          env: ${{ matrix.env }}
+          signer: direct
+          merkle: js
+          job-name: Nightly S-MORTALITY chunk tx mortal era expiry retry (${{ matrix.env }})
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log
 
   nightly-s-reprove:
     name: Nightly S-REPROVE auto-reprove stale alias (${{ matrix.env }})
@@ -1818,14 +2323,19 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
-        run: |
-          SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
       - name: Run S-REPROVE auto-reprove scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
+          E2E_RESULT_PATH: ${{ github.workspace }}/e2e-result/e2e-result.json
           PAD_ENV: ${{ matrix.env }}
           E2E_REPROVE_MNEMONIC: ${{ secrets.E2E_REPROVE_MNEMONIC }}
         with:
@@ -1833,16 +2343,28 @@ jobs:
           max_attempts: 2
           retry_wait_seconds: 30
           retry_on_exit_code: 75
-          command: node tools/release-retry-wrapper.mjs node --test test/e2e-reprove.test.js
+          command: |
+            set -o pipefail
+            node tools/release-retry-wrapper.mjs node --test test/e2e-reprove.test.js 2>&1 | tee "$RUNNER_TEMP/e2e-leg.log"
+      - name: Write e2e-result.json (#1625)
+        if: always()
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: s-reprove
+          env: ${{ matrix.env }}
+          job-name: Nightly S-REPROVE auto-reprove stale alias (${{ matrix.env }})
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log
 
   nightly-s-car:
     name: Nightly S-CAR --input-car deploy from pre-built CAR (${{ matrix.env }})
-    # Runs after nightly-s1-pool since it deploys a fresh per-run domain
-    # (no conflict with e2epoolns01.dot), but we still wait so the pool mnemonic
-    # isn't racing S1's Asset Hub transactions.
+    # Runs after nightly-s1-pool. It deploys its own per-tier fixed label
+    # (bulletin #1623; no conflict with e2epoolns01), but we still wait so the pool
+    # mnemonic isn't racing S1's Asset Hub transactions.
     needs: [build-nightly, nightly-s1-pool, select-env, ensure-e2e-authorized]
     if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-car')))
-    # Two consecutive deploys (normal + --input-car) to a fresh per-run label.
+    # Two consecutive deploys (normal + --input-car) to the tier's fixed label.
     # Runs on both paths: source-build uses node --test test/e2e.test.js;
     # npm-install path writes an inline script so test/ is not required.
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
@@ -1862,12 +2384,17 @@ jobs:
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
       NODE_OPTIONS: --max-old-space-size=8192
     steps:
+      # npm-retry is a local action, so this repo must be at the workspace root.
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
 
       # ---- source-build path (schedule / dispatch without version) ----------
       - name: Checkout polkadot-app-deploy source
@@ -1879,25 +2406,30 @@ jobs:
           path: polkadot-app-deploy-src
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
-        run: cd polkadot-app-deploy-src && npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: cd polkadot-app-deploy-src && npm ci
       - name: Run S-CAR --input-car scenario (source-build path, one retry on transient testnet failures)
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
+          E2E_RESULT_PATH: ${{ github.workspace }}/e2e-result/e2e-result.json
           E2E_SCENARIO: s-car
           E2E_SIGNER: pool
           E2E_MERKLE: js
           PAD_ENV: ${{ matrix.env }}
-          # x00 forces NoStatus classification on both e2eEligible envs without
-          # depending on POP_RULES self-attestation.
-          LABEL: e2escar${{ github.run_id }}a${{ github.run_attempt }}x00
+          # No LABEL: the test deploys to the tier's fixed label from
+          # tools/lib/e2e-fixtures.mjs (bulletin #1623), keyed on DEPLOY_TAG.
         with:
           timeout_minutes: 40
           max_attempts: 2
           retry_wait_seconds: 30
           retry_on_exit_code: 75
-          command: cd polkadot-app-deploy-src && node tools/release-retry-wrapper.mjs node --test test/e2e.test.js
+          command: |
+            set -o pipefail
+            cd polkadot-app-deploy-src
+            node tools/release-retry-wrapper.mjs node --test test/e2e.test.js 2>&1 | tee "$RUNNER_TEMP/e2e-leg.log"
 
       # ---- npm-install path (release / dispatch with explicit version) ------
       # Installs polkadot-app-deploy locally (not globally) so the CLI binary is
@@ -1905,12 +2437,14 @@ jobs:
       # placed in the same dir to resolve transitive deps.
       - name: Install polkadot-app-deploy from npm (S-CAR)
         if: env.BULLETIN_DEPLOY_REF == ''
-        run: |
-          V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          echo "Installing @parity/polkadot-app-deploy@$V into /tmp/bd-s-car"
-          mkdir -p /tmp/bd-s-car
-          echo '{"type":"module"}' > /tmp/bd-s-car/package.json
-          cd /tmp/bd-s-car && npm install "@parity/polkadot-app-deploy@${V}"
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            echo "Installing @parity/polkadot-app-deploy@$V into /tmp/bd-s-car"
+            mkdir -p /tmp/bd-s-car
+            echo '{"type":"module"}' > /tmp/bd-s-car/package.json
+            cd /tmp/bd-s-car && npm install "@parity/polkadot-app-deploy@${V}"
       - name: Write S-CAR inline test script
         if: env.BULLETIN_DEPLOY_REF == ''
         run: |
@@ -1922,13 +2456,16 @@ jobs:
           import path from "path";
           import fs from "fs";
           import { spawnSync } from "child_process";
-          import { fileURLToPath } from "url";
+          import { fileURLToPath, pathToFileURL } from "url";
 
           const __dirname = path.dirname(fileURLToPath(import.meta.url));
           const BIN = path.join(__dirname, "node_modules", ".bin", "polkadot-app-deploy");
 
           const PAD_ENV = process.env.PAD_ENV ?? process.env.DOTNS_ENV ?? "paseo-next-v2";
-          const LABEL = process.env.LABEL || "e2escar00default";
+          // bulletin #1623: the tier's fixed Alice-ROOT-owned label, from the same
+          // table the source-path test uses.
+          const { tieredFixtureLabel } = await import(pathToFileURL(path.join(process.env.GITHUB_WORKSPACE, "tools/lib/e2e-fixtures.mjs")).href);
+          const LABEL = process.env.LABEL || tieredFixtureLabel("s-car", process.env.DEPLOY_TAG);
           const MNEMONIC = process.env.MNEMONIC || "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
           const DEPLOY_TAG = process.env.DEPLOY_TAG || undefined;
           const SENTRY_DSN = process.env.SENTRY_DSN || undefined;
@@ -1999,22 +2536,43 @@ jobs:
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           PAD_ENV: ${{ matrix.env }}
-          # x00 forces NoStatus classification on both e2eEligible envs without
-          # depending on POP_RULES self-attestation.
-          LABEL: e2escar${{ github.run_id }}a${{ github.run_attempt }}x00
+          # No LABEL: the script reads the tier's fixed label from the
+          # checkout's tools/lib/e2e-fixtures.mjs (bulletin #1623), keyed on DEPLOY_TAG.
         with:
           timeout_minutes: 38
           max_attempts: 2
           retry_wait_seconds: 30
-          command: node /tmp/bd-s-car/run-s-car.mjs
+          command: |
+            set -o pipefail
+            node /tmp/bd-s-car/run-s-car.mjs 2>&1 | tee "$RUNNER_TEMP/e2e-leg.log"
+      - name: Write e2e-result.json (#1625)
+        if: always()
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: s-car
+          env: ${{ matrix.env }}
+          job-name: Nightly S-CAR --input-car deploy from pre-built CAR (${{ matrix.env }})
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log
 
   nightly-s-inc:
     name: Nightly S-INC ${{ matrix.scenario }} / ${{ matrix.merkle }}
     # Waits for nightly-s1-pool (shares Alice/pool mnemonic) and nightly-s-car
     # (further serializes Alice pool nonces in the third Alice-root deploy chain).
-    # max-parallel: 1 serializes the 5 matrix legs against each other since all
-    # legs deploy to the same stable pool labels (e2einc.dot / e2erot.dot or
-    # e2eincpool01.dot / e2erotpool01.dot) — concurrent legs would collide.
+    # Single-env: the s-inc/roundtrip/portability/asset-rotation legs share
+    # e2eincpool01/e2erotpool01, so a second env would not give them distinct
+    # names. s-inc-crosslabel (port of bulletin #1571/#1387) doesn't share that
+    # constraint — it builds its own fresh per-run labels via pickFreshRunLabel —
+    # but stays in this single-env job because it shares the job's pool signing
+    # account. Not also added to nightly-pr-coverage's multi-env matrix: bulletin
+    # #1387 asked only for nightly-s-inc coverage. Multi-env coverage for this
+    # scenario is a reasonable follow-up, not a gap introduced here.
+    # max-parallel: 1 serializes all matrix legs against each other: most legs
+    # deploy to the same stable pool labels (e2einc.dot / e2erot.dot or
+    # e2eincpool01.dot / e2erotpool01.dot) and would collide if concurrent;
+    # s-inc-crosslabel is serialized too so it doesn't race the others for the
+    # shared pool account's Asset Hub nonce.
     needs: [build-nightly, nightly-s1-pool, nightly-s-car, select-env, ensure-e2e-authorized]
     if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     # Only runs from source (BULLETIN_DEPLOY_REF path); npm-install path does
@@ -2036,6 +2594,8 @@ jobs:
         include:
           - { scenario: s-inc, merkle: js }
           - { scenario: s-inc, merkle: kubo }
+          - { scenario: s-inc-crosslabel, merkle: js }
+          - { scenario: s-inc-crosslabel, merkle: kubo }
           - { scenario: s-inc-roundtrip, merkle: js }
           - { scenario: s-inc-portability, merkle: js }
           - { scenario: s-inc-asset-rotation, merkle: js }
@@ -2047,12 +2607,17 @@ jobs:
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
       NODE_OPTIONS: --max-old-space-size=8192
     steps:
+      # npm-retry is a local action, so this repo must be at the workspace root.
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - name: Checkout polkadot-app-deploy source
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: actions/checkout@v6
@@ -2062,12 +2627,25 @@ jobs:
           path: polkadot-app-deploy-src
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
-        run: cd polkadot-app-deploy-src && npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: cd polkadot-app-deploy-src && npm ci
+      # Kubo legs need the ipfs binary on PATH, or the scenario's Kubo-merkleizer
+      # assertion fails the leg. Gated on the source-build ref: it is empty on
+      # release / stable-cron / test-version runs, which skip the scenario, so a
+      # failed download must not red those runs. Port of bulletin-deploy #1606.
+      - name: Setup IPFS Kubo
+        if: matrix.merkle == 'kubo' && env.BULLETIN_DEPLOY_REF != ''
+        uses: ./.github/actions/setup-kubo
+      - name: Initialize IPFS
+        if: matrix.merkle == 'kubo' && env.BULLETIN_DEPLOY_REF != ''
+        run: ipfs init
       - name: Run S-INC scenario (one retry on transient testnet failures)
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
+          E2E_RESULT_PATH: ${{ github.workspace }}/e2e-result/e2e-result.json
           E2E_SCENARIO: ${{ matrix.scenario }}
           E2E_SIGNER: pool
           E2E_MERKLE: ${{ matrix.merkle }}
@@ -2079,7 +2657,22 @@ jobs:
           max_attempts: 2
           retry_wait_seconds: 30
           retry_on_exit_code: 75
-          command: cd polkadot-app-deploy-src && node tools/release-retry-wrapper.mjs node --test test/e2e.test.js
+          command: |
+            set -o pipefail
+            cd polkadot-app-deploy-src
+            node tools/release-retry-wrapper.mjs node --test test/e2e.test.js 2>&1 | tee "$RUNNER_TEMP/e2e-leg.log"
+      - name: Write e2e-result.json (#1625)
+        if: always()
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: ${{ matrix.scenario }}
+          env: ${{ needs.select-env.outputs.selected_env }}
+          signer: pool
+          merkle: ${{ matrix.merkle }}
+          job-name: Nightly S-INC ${{ matrix.scenario }} / ${{ matrix.merkle }}
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log
 
   nightly-s-ext-signer:
     name: Nightly S-ext-signer external PolkadotSigner → in-process Revive (${{ matrix.env }})
@@ -2108,12 +2701,17 @@ jobs:
       BULLETIN_DEPLOY_REF: ${{ needs.build-nightly.outputs.polkadot-app-deploy-ref }}
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
     steps:
+      # npm-retry is a local action, so this repo must be at the workspace root.
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
 
       # ---- source-build path (schedule / dispatch without version) ----------
       - name: Checkout polkadot-app-deploy source
@@ -2125,7 +2723,9 @@ jobs:
           path: polkadot-app-deploy-src
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
-        run: cd polkadot-app-deploy-src && npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: cd polkadot-app-deploy-src && npm ci
       - name: Run external signer test (source build, one retry on transient testnet failures)
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
@@ -2135,6 +2735,7 @@ jobs:
           # prepare hook (see PR #408).
           NODE_OPTIONS: --max-old-space-size=512
           E2E: "1"
+          E2E_RESULT_PATH: ${{ github.workspace }}/e2e-result/e2e-result.json
           E2E_SCENARIO: s7
           E2E_MERKLE: js
           PAD_ENV: ${{ matrix.env }}
@@ -2143,7 +2744,10 @@ jobs:
           max_attempts: 2
           retry_wait_seconds: 30
           retry_on_exit_code: 75
-          command: cd polkadot-app-deploy-src && node tools/release-retry-wrapper.mjs node --test test/e2e.test.js
+          command: |
+            set -o pipefail
+            cd polkadot-app-deploy-src
+            node tools/release-retry-wrapper.mjs node --test test/e2e.test.js 2>&1 | tee "$RUNNER_TEMP/e2e-leg.log"
 
       # ---- npm-install path (release / dispatch with explicit version) ------
       # Installs polkadot-app-deploy locally (not globally) so all transitive deps
@@ -2151,24 +2755,26 @@ jobs:
       # where the test script can resolve them.
       - name: Install polkadot-app-deploy from npm with polkadot deps
         if: env.BULLETIN_DEPLOY_REF == ''
-        run: |
-          V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          echo "Installing @parity/polkadot-app-deploy@$V into /tmp/bd-s-ext"
-          mkdir -p /tmp/bd-s-ext
-          echo '{"type":"module"}' > /tmp/bd-s-ext/package.json
-          # Install the product FIRST, then pin polkadot-api to whatever version it
-          # actually resolved. A bare `polkadot-api` here takes the registry's latest,
-          # which drifted ahead of our dependency range the moment polkadot-api 3.0.0
-          # shipped (2026-08-18) and DROPPED the `./signer` subpath — so this scenario's
-          # `import { getPolkadotSigner } from "polkadot-api/signer"` dies with
-          # ERR_PACKAGE_PATH_NOT_EXPORTED against papi 3 while the product itself is fine
-          # on its nested 2.x. Pinning to the resolved version also makes the test honest:
-          # an "external PolkadotSigner" must come from the SAME papi instance the product
-          # uses, not a different major.
-          cd /tmp/bd-s-ext && npm install "@parity/polkadot-app-deploy@${V}" @polkadot/keyring
-          PAPI=$(node -p "require('/tmp/bd-s-ext/node_modules/polkadot-api/package.json').version")
-          echo "@parity/polkadot-app-deploy@${V} resolved polkadot-api ${PAPI} — pinning the scenario to it"
-          cd /tmp/bd-s-ext && npm install "polkadot-api@${PAPI}"
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            echo "Installing @parity/polkadot-app-deploy@$V into /tmp/bd-s-ext"
+            mkdir -p /tmp/bd-s-ext
+            echo '{"type":"module"}' > /tmp/bd-s-ext/package.json
+            # Install the product FIRST, then pin polkadot-api to whatever version it
+            # actually resolved. A bare `polkadot-api` here takes the registry's latest,
+            # which drifted ahead of our dependency range the moment polkadot-api 3.0.0
+            # shipped (2026-08-18) and DROPPED the `./signer` subpath — so this scenario's
+            # `import { getPolkadotSigner } from "polkadot-api/signer"` dies with
+            # ERR_PACKAGE_PATH_NOT_EXPORTED against papi 3 while the product itself is fine
+            # on its nested 2.x. Pinning to the resolved version also makes the test honest:
+            # an "external PolkadotSigner" must come from the SAME papi instance the product
+            # uses, not a different major.
+            cd /tmp/bd-s-ext && npm install "@parity/polkadot-app-deploy@${V}" @polkadot/keyring
+            PAPI=$(node -p "require('/tmp/bd-s-ext/node_modules/polkadot-api/package.json').version")
+            echo "@parity/polkadot-app-deploy@${V} resolved polkadot-api ${PAPI} — pinning the scenario to it"
+            cd /tmp/bd-s-ext && npm install "polkadot-api@${PAPI}"
       - name: Write external signer test script
         if: env.BULLETIN_DEPLOY_REF == ''
         run: |
@@ -2238,11 +2844,152 @@ jobs:
           # prepare hook (see PR #408).
           NODE_OPTIONS: --max-old-space-size=512
           PAD_ENV: ${{ matrix.env }}
-        run: node run-s-ext.mjs
+        run: |
+          set -o pipefail
+          node run-s-ext.mjs 2>&1 | tee "$RUNNER_TEMP/e2e-leg.log"
+      - name: Write e2e-result.json (#1625)
+        if: always()
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: s-ext-signer
+          env: ${{ matrix.env }}
+          job-name: Nightly S-ext-signer external PolkadotSigner → in-process Revive (${{ matrix.env }})
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log
+
+  nightly-s-reserved-invariant:
+    name: Nightly S-RESERVED-INVARIANT base names <=5 chars stay Reserved (${{ matrix.env }})
+    # Port of bulletin-deploy #1423/#1410. UNGATED (unlike S-V060-UNBLOCK,
+    # which is dispatch-only and gated on DotNS ABI profile v0.6.0): this
+    # scenario guards the OPPOSITE failure — that the v0.6.0 naming change
+    # did not accidentally make a governance-reserved name self-registrable
+    # — and that invariant holds on every profile, so it runs in normal
+    # nightly coverage on every env, every night. Deploys to a fixed,
+    # never-registrable label ("web3"): the DotNS preflight abort throws
+    # before any chunk upload or registration transaction is attempted, so
+    # it never contends for a nonce or a shared domain with any other leg —
+    # no scenario-ordering dependency needed (no `needs:` on another
+    # nightly-s* job). Port of bulletin-deploy #1588: BULLETIN_POOL_ACCOUNT_INDEX
+    # IS pinned below (to pool account 0) even though this scenario never
+    # writes — see that env var's own comment for why.
+    needs: [build-nightly, select-env, ensure-e2e-authorized, nightly-harness-smoke]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.nightly-harness-smoke.result) && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-reserved-invariant')))
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # env fans out on schedule, single-env on release/dispatch (see select-env).
+        env: ${{ fromJSON(needs.select-env.outputs.healthy_envs) }}
+    env:
+      DEPLOY_TAG: ${{ needs.build-nightly.outputs.deploy-tag }}
+      BULLETIN_DEPLOY_VERSION: ${{ needs.build-nightly.outputs.test-version }}
+      BULLETIN_DEPLOY_REF: ${{ needs.build-nightly.outputs.polkadot-app-deploy-ref }}
+      MNEMONIC: ${{ secrets.DOTNS_MNEMONIC || 'bottom drive obey lake curtain smoke basket hold race lonely fit walk' }}
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: paritytech/polkadot-app-deploy
+          ref: ${{ env.BULLETIN_DEPLOY_REF || '' }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
+      - name: Build polkadot-app-deploy from source
+        if: env.BULLETIN_DEPLOY_REF != ''
+        uses: ./.github/actions/npm-retry
+        with:
+          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+      - name: Use the test harness from the tag under test (#1621)
+        if: env.BULLETIN_DEPLOY_REF == ''
+        env:
+          HARNESS_REF: ${{ needs.build-nightly.outputs.harness-ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HARNESS_REF" ]; then
+            echo "::error::published-version path but build-nightly emitted no harness-ref" >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "refs/tags/$HARNESS_REF:refs/tags/$HARNESS_REF"
+          git checkout "$HARNESS_REF" -- . ':(exclude).github'
+          echo "Harness (test/, tools/, package.json) from $HARNESS_REF ($(git rev-parse "$HARNESS_REF^{commit}")); workflow + .github from $GITHUB_SHA"
+      - name: Install polkadot-app-deploy from npm
+        if: env.BULLETIN_DEPLOY_REF == ''
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
+            ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
+      - name: Run S-RESERVED-INVARIANT scenario (one retry on transient testnet failures)
+        # retry_on_exit_code: 75 matches every sibling nightly-s* leg's convention
+        # (release-retry-wrapper.mjs re-exits 75 for failures it classifies as
+        # transient). Deliberately NOT adding an explicit retry_on: any here,
+        # matching the source job's own note (bulletin #1410): retry_on_exit_code
+        # gates on the exact exit code regardless of retry_on's value, so a
+        # genuine timeout (the wrapped process never reports 75 when killed)
+        # still won't retry on ANY of these sibling legs, not just this one.
+        # Closing that gap repo-wide is a separate, out-of-scope follow-up.
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
+        env:
+          E2E: "1"
+          E2E_RESULT_PATH: ${{ github.workspace }}/e2e-result/e2e-result.json
+          E2E_SCENARIO: s-reserved-invariant
+          E2E_SIGNER: pool
+          E2E_MERKLE: js
+          PAD_ENV: ${{ matrix.env }}
+          # #1588 (port of bulletin-deploy): pin to pool account 0 (#863's
+          # BULLETIN_POOL_ACCOUNT_INDEX mechanism) instead of the unpinned
+          # default (bare Alice). This job must never write: connect()'s
+          # account-mapping check runs BEFORE the Reserved refusal, and an
+          # unmapped/underfunded signer would submit a real mapping/top-up
+          # tx there. Index 0 is deliberately picked from the STANDARD pool
+          # (0-9) that bin/polkadot-app-bootstrap provisions everywhere by
+          # default — no new provisioning needed on any env. Index 0 is
+          # also nightly-pr-coverage's s1-pool-js leg (a concurrent
+          # WRITER), but sharing it is safe here specifically BECAUSE this
+          # scenario is read-only by design: it never signs or submits
+          # anything (test/e2e.test.js asserts the absence of every
+          # mapping/top-up log marker), so it can't race s1-pool-js's
+          # nonce — a nonce assertion would have made this unsafe to
+          # share, which is why there isn't one.
+          BULLETIN_POOL_ACCOUNT_INDEX: "0"
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_SHA: ${{ github.sha }}
+        with:
+          timeout_minutes: 10
+          max_attempts: 2
+          retry_wait_seconds: 30
+          retry_on_exit_code: 75
+          command: |
+            set -o pipefail
+            node tools/release-retry-wrapper.mjs node --test test/e2e.test.js 2>&1 | tee "$RUNNER_TEMP/e2e-leg.log"
+      - name: Write e2e-result.json (#1625)
+        if: always()
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: s-reserved-invariant
+          env: ${{ matrix.env }}
+          signer: pool
+          merkle: js
+          job-name: Nightly S-RESERVED-INVARIANT base names <=5 chars stay Reserved (${{ matrix.env }})
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log
 
   nightly-report:
     name: Nightly E2E Report
-    needs: [build-nightly, select-env, ensure-e2e-authorized, nightly-s1-pool, nightly-s1-direct, nightly-s2-fresh, nightly-s3, nightly-s5, nightly-s6, nightly-s7, nightly-s8, nightly-s9, nightly-s-grandpa-reupload, nightly-s-mortality, nightly-s-reprove, nightly-s-car, nightly-s-inc, nightly-s-ext-signer, nightly-verify-telemetry, nightly-verify-pool-distribution, nightly-pr-coverage, nightly-code-path-coverage]
+    needs: [build-nightly, select-env, ensure-e2e-authorized, nightly-s1-pool, nightly-s1-direct, nightly-s2-fresh, nightly-s3, nightly-s5, nightly-s6, nightly-s7, nightly-s8, nightly-s9, nightly-s-grandpa-reupload, nightly-s-mortality, nightly-s-reprove, nightly-s-car, nightly-s-inc, nightly-s-ext-signer, nightly-s-reserved-invariant, nightly-harness-smoke, nightly-verify-telemetry, nightly-verify-pool-distribution, nightly-pr-coverage, nightly-code-path-coverage]
     if: always() && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -2251,7 +2998,46 @@ jobs:
       actions: read
       # issues:write — needed to open failure issues on schedule/release triggers
       issues: write
+      # checks:read — GET /check-runs/{id}/annotations for the runner-loss classifier (bulletin #1622)
+      checks: read
+      # contents:read — sparse checkout of .github/scripts for the runner-loss classifier (bulletin #1622)
+      contents: read
     steps:
+      # Checked out and set up FIRST: the Fetch step below runs
+      # .github/scripts/e2e-result.mjs (#1625), and the runner-loss classifier
+      # further down (#1622) uses the same checkout. package.json carries
+      # "type": "module", which the .js harness helper the script imports needs.
+      - name: Check out the report scripts
+        if: always()
+        continue-on-error: true
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            .github/scripts
+            package.json
+            test/helpers/e2e-failure.js
+            tools/release-retry-wrapper.mjs
+          sparse-checkout-cone-mode: false
+      - name: Set up Node for the report scripts
+        if: always()
+        continue-on-error: true
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          # package.json is in the sparse checkout, so setup-node would try to cache
+          # npm and annotate an error: there is no lockfile here.
+          package-manager-cache: false
+      # Per-leg result files (#1625). continue-on-error: no artifact at all
+      # (every leg lost its runner, or a pre-#1625 ref) must not kill the report;
+      # the Fetch step then falls back to the log grep for every red leg.
+      - name: Download per-leg result files
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: e2e-result-*
+          merge-multiple: true
+          path: e2e-results
       - name: Fetch per-leg job results
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -2292,7 +3078,7 @@ jobs:
             {
               name = $1; conclusion = $2
               meta = (index(name,"telemetry assertions")>0) || (index(name,"pool selection")>0) || \
-                     (index(name,"code-path")>0) || (index(name,"E2E Report")>0) || (index(name,"DotNS address drift")>0)
+                     (index(name,"code-path")>0) || (index(name,"harness-import smoke")>0) || (index(name,"E2E Report")>0) || (index(name,"DotNS address drift")>0)
               env_tag = "META"
               if (!meta) {
                 env_tag = selected
@@ -2309,30 +3095,77 @@ jobs:
               print name, conclusion, env_tag
             }' > /tmp/all-nightly-legs.tsv
 
-          # One-line failure signature per failing leg (issue #1055): fetch each
-          # failing job's raw log and grab the last `>> FAIL: …` / `Deployment
-          # failed: …` line — the convention test/CLAUDE.md requires assertions
-          # to end with. Lets triage read the cause from the issue body alone,
-          # without opening the Actions run. Capped at 20 jobs: a broad outage
-          # can fail/cancel most of the matrix at once, and this loop is
-          # sequential — 20 raw-log downloads is enough for any real triage
-          # without risking the job's own 10-minute timeout budget.
-          : > /tmp/fail-signatures.tsv
+          # One-line failure signature per failing leg (issue #1055).
+          #
+          # Primary source (bulletin #1625): the e2e-result-*.json each scenario leg
+          # uploaded (class, signature, run_attempt; see .github/scripts/e2e-result.mjs).
+          # Fallback, ONLY for a red leg with no result file or an empty
+          # signature (a lost runner, a pre-#1625 harness, a leg that died before
+          # the writer ran): fetch the job's raw log and grab the last
+          # `>> FAIL: …` / `Deployment failed: …` line. At most 20 log fetches,
+          # because that loop is sequential and a report that dies mid-fetch
+          # files nothing.
+          node .github/scripts/e2e-result.mjs index e2e-results > /tmp/result-index.tsv 2>/dev/null || : > /tmp/result-index.tsv
           jq -r '.jobs[] | select(.name | test("^Nightly ")) | select(.conclusion == "failure" or .conclusion == "cancelled") | "\(.id)\t\(.name)"' \
-            /tmp/jobs.json | head -n 20 |
+            /tmp/jobs.json > /tmp/red-jobs.tsv
+          : > /tmp/fail-signatures.tsv
+          : > /tmp/fail-causes.tsv
+          FROM_FILE=0; FROM_LOG=0; LOG_FETCHES=0
           while IFS=$'\t' read -r job_id job_name; do
-            SIG=$(curl -fsSL \
-              -H "Authorization: bearer $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "${{ github.api_url }}/repos/${{ github.repository }}/actions/jobs/${job_id}/logs" 2>/dev/null \
-              | grep -aE '>> FAIL:|Deployment failed:' \
-              | tail -n 1 \
-              | tr -d '\r' \
-              | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z[[:space:]]*//' \
-              || true)
+            # The reusable deploy workflow's jobs surface as "<caller> / Deploy on <env>".
+            NORM=$(printf '%s' "$job_name" | sed -E 's# / Deploy on [^ ]+$##')
+            ROW=$(awk -F'\t' -v n="$NORM" '$1==n{print; exit}' /tmp/result-index.tsv)
+            CLASS=$(printf '%s' "$ROW" | cut -f2)
+            SIG=$(printf '%s' "$ROW" | cut -f3)
+            if [ -n "$SIG" ]; then
+              FROM_FILE=$((FROM_FILE + 1))
+            else
+              FROM_LOG=$((FROM_LOG + 1))
+              if [ "$LOG_FETCHES" -lt 20 ]; then
+                LOG_FETCHES=$((LOG_FETCHES + 1))
+                SIG=$(curl -fsSL \
+                  -H "Authorization: bearer $GITHUB_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "${{ github.api_url }}/repos/${{ github.repository }}/actions/jobs/${job_id}/logs" 2>/dev/null \
+                  | grep -aE '>> FAIL:|Deployment failed' \
+                  | tail -n 1 \
+                  | tr -d '\r' \
+                  | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z[[:space:]]*//' \
+                  || true)
+              fi
+            fi
+            # Cause class: the result file's, refined from the signature text when
+            # that says nothing (so a fallback signature still buckets, and a
+            # runner-loss annotation maps to runner_loss).
+            if [ -z "$CLASS" ] || [ "$CLASS" = unknown ] || [ "$CLASS" = pass ]; then
+              CLASS=unknown
+              if [ -n "$SIG" ]; then
+                CLASS=$(node .github/scripts/e2e-result.mjs classify-text "$SIG" 2>/dev/null || echo unknown)
+              fi
+            fi
             SIG="${SIG:-(no failure signature found in logs — open the run)}"
             printf '%s\t%s\n' "$job_name" "$SIG" >> /tmp/fail-signatures.tsv
-          done
+            # Dominant cause (#1625) counts scenario legs only: META verdicts
+            # (telemetry/pool-distribution/code-path/...) are downstream symptoms.
+            ENV_TAG=$(awk -F'\t' -v n="$job_name" '$1==n{print $3; exit}' /tmp/all-nightly-legs.tsv)
+            if [ "$ENV_TAG" != META ]; then
+              printf '%s\t%s\n' "$job_name" "$CLASS" >> /tmp/fail-causes.tsv
+            fi
+          done < /tmp/red-jobs.tsv
+          {
+            echo "result files read: $(grep -c . /tmp/result-index.tsv || true) leg(s) (latest attempt each)"
+            echo "signatures: ${FROM_FILE} from result files, ${FROM_LOG} from log fallback"
+          } | tee /tmp/signature-sources.txt
+
+          : > /tmp/dominant-cause.md
+          : > /tmp/dominant-cause.label
+          DOM=$(node .github/scripts/e2e-result.mjs dominant /tmp/fail-causes.tsv 2>/dev/null || true)
+          if [ -n "$DOM" ]; then
+            IFS=$'\t' read -r D_CLASS D_N D_M D_LABEL <<< "$DOM"
+            echo "Dominant cause: ${D_CLASS} (${D_N} of ${D_M} red legs)" > /tmp/dominant-cause.md
+            echo "$D_LABEL" > /tmp/dominant-cause.label
+            cat /tmp/dominant-cause.md
+          fi
 
       - name: Render report body
         env:
@@ -2351,6 +3184,8 @@ jobs:
           NIGHTLY_S_CAR:          ${{ needs.nightly-s-car.result }}
           NIGHTLY_S_INC:          ${{ needs.nightly-s-inc.result }}
           NIGHTLY_S_EXT_SIGNER:   ${{ needs.nightly-s-ext-signer.result }}
+          NIGHTLY_S_RESERVED_INVARIANT: ${{ needs.nightly-s-reserved-invariant.result }}
+          NIGHTLY_HARNESS_SMOKE:  ${{ needs.nightly-harness-smoke.result }}
           NIGHTLY_TELEMETRY:      ${{ needs.nightly-verify-telemetry.result }}
           NIGHTLY_POOL_DIST:      ${{ needs.nightly-verify-pool-distribution.result }}
           NIGHTLY_PR_COVERAGE:    ${{ needs.nightly-pr-coverage.result }}
@@ -2360,6 +3195,7 @@ jobs:
           RUN_URL:                ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           SELECTED_ENV:           ${{ needs.select-env.outputs.selected_env }}
           HEALTHY_ENVS:           ${{ needs.select-env.outputs.healthy_envs }}
+          NOT_READY:              ${{ needs.select-env.outputs.not_ready }}
         run: |
           emoji() { case "$1" in
             success)   echo "✅ PASS";;
@@ -2375,6 +3211,27 @@ jobs:
             e2e-ci-dispatch) TITLE="Dispatched E2E Test Pass · \`$VERSION_LABEL\`";;
             *)               TITLE="Nightly E2E Test Pass · \`$VERSION_LABEL\`";;
           esac
+
+          # Environment readiness (#1624). Built once into a file: it goes into the
+          # report body below AND into the env-not-ready issue. Empty when every
+          # live env was ready (or the check did not run).
+          : > /tmp/readiness-section.md
+          if [ -n "${NOT_READY:-}" ] && [ "$NOT_READY" != "{}" ] && echo "$NOT_READY" | jq -e 'length > 0' >/dev/null 2>&1; then
+            {
+              echo "## Environment readiness"
+              echo ""
+              echo "These envs are live but failed the readiness check, so the scenario matrix was NOT run on them (the S1 direct canary still was; its result is the last column, and a green canary on a not-ready env means the probe may be wrong)."
+              echo ""
+              echo "| Env | Failed check | Values read | Canary (S1 direct legs) |"
+              echo "|-----|--------------|-------------|--------------------------|"
+              for nr_env in $(echo "$NOT_READY" | jq -r 'keys[]'); do
+                CANARY=$(awk -F'\t' -v e="$nr_env" '$1 ~ /^Nightly S1 direct/ && $3==e { c[$2]++ } END { for (k in c) print c[k] " " k }' /tmp/all-nightly-legs.tsv | sort -k2 | paste -sd ',' - | sed 's/,/, /g')
+                CANARY="${CANARY:-not run}"
+                echo "$NOT_READY" | jq -r --arg e "$nr_env" --arg canary "$CANARY" '.[$e][] | "| \($e) | \(.check) | \(.reason | gsub("\\|"; "/")) | \($canary) |"'
+              done
+              echo ""
+            } > /tmp/readiness-section.md
+          fi
 
           # Rendered once and reused for the step summary AND the failure-issue
           # body, so both surfaces show the same per-leg table.
@@ -2401,6 +3258,7 @@ jobs:
             # column). META failures get their own line so a global failure
             # there can never render as "all green".
             join_semi() { paste -sd '|' - | sed 's/|/; /g'; }
+            cat /tmp/readiness-section.md
             echo "Environment status:"
             while IFS= read -r env; do
               [ -z "$env" ] && continue
@@ -2440,6 +3298,8 @@ jobs:
             echo "| S-CAR --input-car deploy | $(emoji "$NIGHTLY_S_CAR") |"
             echo "| S-INC scenarios (5 legs: s-inc js/kubo, roundtrip, portability, asset-rotation) | $(emoji "$NIGHTLY_S_INC") |"
             echo "| S-ext-signer external PolkadotSigner | $(emoji "$NIGHTLY_S_EXT_SIGNER") |"
+            echo "| S-RESERVED-INVARIANT base names <=5 chars stay Reserved | $(emoji "$NIGHTLY_S_RESERVED_INVARIANT") |"
+            echo "| Harness-import smoke (published-version tier; skipped on source builds) | $(emoji "$NIGHTLY_HARNESS_SMOKE") |"
             echo "| Telemetry assertions | $(emoji "$NIGHTLY_TELEMETRY") |"
             echo "| Pool selection distribution | $(emoji "$NIGHTLY_POOL_DIST") |"
             echo "| Nightly @ HEAD PR-coverage (11 legs) | $(emoji "$NIGHTLY_PR_COVERAGE") |"
@@ -2498,81 +3358,221 @@ jobs:
             echo "**Sentry:** [E2E Health dashboard](https://paritytech.sentry.io/dashboard/1732713/?project=4511093597405264) · [raw traces](https://paritytech.sentry.io/explore/traces/?project=4511093597405264&query=deploy.tag%3A$TAG)"
           } > /tmp/report-body.md
 
-          cat /tmp/report-body.md >> "$GITHUB_STEP_SUMMARY"
+          {
+            if [ -s /tmp/dominant-cause.md ]; then cat /tmp/dominant-cause.md; echo ""; fi
+            cat /tmp/report-body.md
+            echo ""
+            cat /tmp/signature-sources.txt 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve the failure-issue title
+        # The title below is free text — decorative, for humans reading the
+        # issue list. It is NOT the dedup key. Open and Note both match the
+        # issue on DEDUP_LABEL, computed further down. Reword TITLE freely;
+        # do not let dedup logic creep back onto it. (port of bulletin #1512,
+        # #1523, #1536, adapted: the twin has only two tiers — release and
+        # nightly — not bulletin's release/stable/head three, because the
+        # twin's schedule trigger always source-builds main HEAD, never
+        # tests a published @latest on a cron.)
+        if: always() && (github.event_name == 'schedule' || github.event_name == 'release')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          VERSION: ${{ needs.build-nightly.outputs.test-version }}
+        run: |
+          # Key the title's date on the RUN's own created_at rather than wall
+          # clock at the moment this step executes (port of bulletin #1516).
+          # GitHub sets a run's created_at once, when the run is first
+          # created, and it does not change across run_attempts — unlike a
+          # bare `date -u`, which a re-run crossing 00:00 UTC after attempt 1
+          # would evaluate to a different day, missing the issue attempt 1
+          # filed and filing a duplicate instead. This is a separate call
+          # from the "Fetch per-leg job results" step's
+          # /actions/runs/{run_id}/jobs calls — that endpoint lists jobs, and
+          # a job's own created_at reflects when that job's latest attempt
+          # was queued, not the run's.
+          # Falls back to wall clock if the API cannot be reached. This step
+          # runs on every scheduled and release run, green or red, and the
+          # step after it refuses to file the failure issue without the
+          # title this one exports — so letting a transient 5xx kill the
+          # step would trade a duplicate issue for no issue at all on a
+          # night that had real failures.
+          RUN_CREATED_AT=$(curl -fsSL --max-time 30 \
+            -H "Authorization: bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL/repos/$REPO/actions/runs/$GITHUB_RUN_ID" | jq -r '.created_at' || true)
+          if [ -z "$RUN_CREATED_AT" ] || [ "$RUN_CREATED_AT" = "null" ]; then
+            echo "::warning::could not read the run's created_at — falling back to wall clock for the issue-title date"
+            TODAY=$(date -u +%Y-%m-%d)
+          else
+            TODAY=$(date -u -d "$RUN_CREATED_AT" +%Y-%m-%d)
+          fi
+
+          # Each branch also sets DEDUP_KEY — the identity that must stay
+          # constant across this run's own attempts/re-triggers, but change
+          # from one genuinely distinct occurrence to the next. For release
+          # that's the version, not the date: a UTC day can see multiple RC
+          # prereleases (successive rc.N bumps, each firing this workflow on
+          # `release: prereleased`), and keying on TODAY would wrongly
+          # collapse their distinct failures onto one issue. For nightly,
+          # one run per day is the natural unit, so TODAY is right. Do NOT
+          # key on run_id instead: a scheduled run that gets manually
+          # re-triggered becomes a new run with a new run_id, and it must
+          # still dedupe onto the same issue.
+          if [ "$EVENT" = release ]; then
+            TIER=release
+            VERSION_LABEL="${VERSION:-${RELEASE_TAG#v}}"
+            TITLE="Release E2E failure: $VERSION_LABEL"
+            DEDUP_KEY="$VERSION_LABEL"
+          else
+            TIER=nightly
+            VERSION_LABEL="${VERSION:-main@${GITHUB_SHA:0:7} (source build)}"
+            TITLE="Nightly E2E failure: ${TODAY}"
+            DEDUP_KEY="$TODAY"
+          fi
+
+          # GitHub label names cap at 50 chars, and the issues-list `labels=`
+          # query param below uses a comma to AND multiple labels together —
+          # strip commas so an unexpected one in DEDUP_KEY can't be misread
+          # as a label separator.
+          DEDUP_LABEL="nightly-dedup:${TIER}:${DEDUP_KEY//,/}"
+          DEDUP_LABEL="${DEDUP_LABEL:0:50}"
+
+          {
+            echo "ISSUE_TITLE=$TITLE"
+            echo "TIER=$TIER"
+            echo "TODAY=$TODAY"
+            echo "VERSION_LABEL=$VERSION_LABEL"
+            echo "DEDUP_LABEL=$DEDUP_LABEL"
+          } >> "$GITHUB_ENV"
+
+      # Runner-loss verdict (port of bulletin #1638 / #1622). Logs on every event.
+      # Classifies THIS attempt (RUN_ATTEMPT, #1645) and only the jobs in this
+      # job's `needs` (#1652): EXCLUDE_JOBS names every job outside them, so the
+      # verdict cannot change after this job has run. tests guard that list
+      # against the needs line above. Any classifier error or unfinished counted
+      # job prints verdict=error and fails this step: anything but
+      # all-runner-loss files the failure issue as before (#1651).
+      # continue-on-error: a classifier hiccup must never suppress an issue.
+      - name: Classify runner loss
+        id: runner-loss
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          EXCLUDE_JOBS: ^(Detect signature-only push|Classify package\.json/lock diff|PR · |PR E2E Report|Dispatch · |Chain-call arg encoding|Nightly · DotNS address drift|Nightly · Chain identity)
+        run: |
+          node .github/scripts/classify-runner-loss.cjs
+
+      # Canary-only red (#1624). nightly-s1-direct also runs on envs the readiness
+      # check marked not-ready, on purpose: those legs are EXPECTED to be red and
+      # must not file the normal failure issue on top of the env-not-ready one.
+      # canary_only=true only when select-env and build-nightly succeeded, at
+      # least one leg is red, and every red leg is an S1 direct leg on a
+      # not-ready env. Anything else (including this step failing) files as before.
+      - name: Classify canary-only red
+        id: canary
+        if: always()
+        continue-on-error: true
+        env:
+          NOT_READY: ${{ needs.select-env.outputs.not_ready }}
+          SELECT_RESULT: ${{ needs.select-env.result }}
+          BUILD_RESULT: ${{ needs.build-nightly.result }}
+        run: |
+          NR_ENVS=$(printf '%s' "${NOT_READY:-}" | jq -r 'keys[]' 2>/dev/null || true)
+          RED=$(awk -F'\t' '$2=="failure"||$2=="cancelled"' /tmp/all-nightly-legs.tsv 2>/dev/null || true)
+          if [ -z "$NR_ENVS" ] || [ -z "$RED" ] || [ "$SELECT_RESULT" != success ] || [ "$BUILD_RESULT" != success ]; then
+            echo "canary_only=false" | tee -a "$GITHUB_OUTPUT"; exit 0
+          fi
+          OTHER=$(printf '%s\n' "$RED" | awk -F'\t' -v nr="$NR_ENVS" 'BEGIN { n = split(nr, a, "\n"); for (i = 1; i <= n; i++) bad[a[i]] = 1 } !($1 ~ /^Nightly S1 direct/ && ($3 in bad))' | grep -c . || true)
+          if [ "$OTHER" -eq 0 ]; then
+            echo "canary_only=true" | tee -a "$GITHUB_OUTPUT"
+            echo "Every red leg is an S1 direct canary on a not-ready env; the failure issue is skipped, the env-not-ready issue carries it."
+          else
+            echo "canary_only=false" | tee -a "$GITHUB_OUTPUT"
+          fi
+
+      # Runner-loss deferral (#1622; watchdog design, #1645/#1650/#1651).
+      # Runs exactly when the failure issue below would be filed but for
+      # runner loss: a first-attempt SCHEDULED run whose every red leg in
+      # `needs` is a lost runner. The issue is deferred, not dropped.
+      # e2e-runner-loss-rerun.yml (the watchdog) reads this step's conclusion
+      # for this attempt. A newer attempt's own report files the issue if it
+      # is still red (attempts >= 2 never defer). If no newer attempt appears
+      # after its grace period, the watchdog files the issue with the label and
+      # title printed here, so dedup and "Re-run passed" find it. In this repo
+      # nothing re-runs a red attempt automatically (no cattery-scheduler on
+      # ubuntu-latest), so a runner-loss night is filed by the watchdog.
+      # Release runs never defer. Keep this gate the complement of the Open
+      # failure issue gate (test/test.js guards it).
+      - name: Defer the failure issue to the runner-loss watchdog
+        id: runner-loss-defer
+        if: >
+          always() &&
+          github.event_name == 'schedule' && github.run_attempt == 1 &&
+          (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) &&
+          steps.canary.outputs.canary_only != 'true' &&
+          steps.runner-loss.outputs.verdict == 'all-runner-loss'
+        run: |
+          # The watchdog parses these two lines out of this job's log. printf
+          # keeps the marker text out of the echoed script itself.
+          printf '%s %s\n' "runner-loss-watchdog:" "dedup_label=${DEDUP_LABEL:?Resolve step did not set DEDUP_LABEL}"
+          printf '%s %s\n' "runner-loss-watchdog:" "title=${ISSUE_TITLE:?Resolve step did not set ISSUE_TITLE}"
+          echo "Every red leg is a lost runner: the failure issue is deferred to the runner-loss watchdog (it files it if no newer attempt accounts for the night)." | tee -a "$GITHUB_STEP_SUMMARY"
 
       # workflow_dispatch runs are manual — skip auto-issue for those (maintainer
       # is already watching). schedule + release get an issue because failures
-      # there indicate drift nobody was watching for. `needs.*.result` values
-      # of 'failure' or 'cancelled' both indicate a broken run; 'skipped'
-      # (e.g. build-nightly failed upstream) also surfaces through build-nightly.
+      # there indicate drift nobody was watching for. `contains(needs.*.result, …)`
+      # checks every job in this job's needs: list, so adding/removing a
+      # scenario job here can never silently stop reporting it (port of
+      # bulletin #1512's /simplify pass — the twin's own hand-listed
+      # condition was missing nightly-s7, the same bug class).
       - name: Open failure issue
+        # always(): without a status function GitHub adds success(), so a
+        # failed Resolve/Fetch step would skip this and a total outage would
+        # file nothing.
         if: >
+          always() &&
           (github.event_name == 'schedule' || github.event_name == 'release') &&
-          (needs.build-nightly.result == 'failure'
-            || needs.ensure-e2e-authorized.result == 'failure'
-            || needs.nightly-s1-pool.result == 'failure'
-            || needs.nightly-s1-direct.result == 'failure'
-            || needs.nightly-s2-fresh.result == 'failure'
-            || needs.nightly-s3.result == 'failure'
-            || needs.nightly-s5.result == 'failure'
-            || needs.nightly-s6.result == 'failure'
-            || needs.nightly-s8.result == 'failure'
-            || needs.nightly-s9.result == 'failure'
-            || needs.nightly-s-grandpa-reupload.result == 'failure'
-            || needs.nightly-s-mortality.result == 'failure'
-            || needs.nightly-s-reprove.result == 'failure'
-            || needs.nightly-s-car.result == 'failure'
-            || needs.nightly-s-inc.result == 'failure'
-            || needs.nightly-s-ext-signer.result == 'failure'
-            || needs.nightly-verify-telemetry.result == 'failure'
-            || needs.nightly-verify-pool-distribution.result == 'failure'
-            || needs.nightly-pr-coverage.result == 'failure'
-            || needs.nightly-code-path-coverage.result == 'failure'
-            || needs.build-nightly.result == 'cancelled'
-            || needs.ensure-e2e-authorized.result == 'cancelled'
-            || needs.nightly-s1-pool.result == 'cancelled'
-            || needs.nightly-s1-direct.result == 'cancelled'
-            || needs.nightly-s2-fresh.result == 'cancelled'
-            || needs.nightly-s3.result == 'cancelled'
-            || needs.nightly-s5.result == 'cancelled'
-            || needs.nightly-s6.result == 'cancelled'
-            || needs.nightly-s8.result == 'cancelled'
-            || needs.nightly-s9.result == 'cancelled'
-            || needs.nightly-s-grandpa-reupload.result == 'cancelled'
-            || needs.nightly-s-mortality.result == 'cancelled'
-            || needs.nightly-s-reprove.result == 'cancelled'
-            || needs.nightly-s-car.result == 'cancelled'
-            || needs.nightly-s-inc.result == 'cancelled'
-            || needs.nightly-s-ext-signer.result == 'cancelled'
-            || needs.nightly-verify-telemetry.result == 'cancelled'
-            || needs.nightly-verify-pool-distribution.result == 'cancelled'
-            || needs.nightly-pr-coverage.result == 'cancelled'
-            || needs.nightly-code-path-coverage.result == 'cancelled')
+          (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) &&
+          steps.canary.outputs.canary_only != 'true' &&
+          steps.runner-loss-defer.outcome != 'success'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.build-nightly.outputs.deploy-tag }}
-          VERSION: ${{ needs.build-nightly.outputs.test-version }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           API_URL: ${{ github.api_url }}
           REPO: ${{ github.repository }}
         run: |
-          TODAY=$(date -u +%Y-%m-%d)
-          VERSION_LABEL="${VERSION:-latest stable}"
-
-          case "$TAG" in
-            e2e-ci-release)
-              TITLE="Release E2E failure: $VERSION_LABEL"
+          # Unset means the Resolve step failed. Stop rather than file a
+          # titleless issue that no later run can find.
+          TITLE="${ISSUE_TITLE:?Resolve step did not set ISSUE_TITLE}"
+          case "$TIER" in
+            release)
               CONTEXT="Post-release validation failed for \`$VERSION_LABEL\`. The version has already been published to npm; decide whether to yank (\`npm deprecate\`), fix-forward, or investigate before users hit it."
               ;;
             *)
-              TITLE="Nightly E2E failure: ${TODAY}"
-              CONTEXT="Nightly E2E workflow failed on ${TODAY}."
+              CONTEXT="Nightly E2E against main HEAD failed on ${TODAY}."
               ;;
           esac
 
           # Issue body = context paragraph + the same per-leg table that
           # lands in the Actions step summary + quick-navigation links.
+          # Dominant cause first (#1625): a same-cause streak reads as one thread.
+          CAUSE_LINE=$(cat /tmp/dominant-cause.md 2>/dev/null || true)
+          CAUSE_LABEL=$(cat /tmp/dominant-cause.label 2>/dev/null || true)
           {
+            if [ -n "$CAUSE_LINE" ]; then
+              echo "**$CAUSE_LINE**"
+              echo ""
+            fi
             echo "$CONTEXT"
             echo ""
             cat /tmp/report-body.md
@@ -2584,33 +3584,175 @@ jobs:
           # Use curl (always present on runner) rather than gh CLI, which is
           # absent on ubuntu-latest runners and silently fails with exit 127.
           BODY=$(cat /tmp/issue-body.md)
-          # Dedup: this report job re-runs on every run_attempt, so re-running a
-          # failed nightly used to open a SECOND identical issue (attempt 1 +
-          # attempt 2 → two "Nightly E2E failure: <date>"). Find an existing OPEN
-          # issue with this exact title; if present, comment the re-run link
-          # instead of creating a duplicate. (has(pull_request) filters out PRs,
-          # which the issues endpoint also returns.)
-          EXISTING=$(curl -fsSL \
+          DEDUP_LABEL="${DEDUP_LABEL:?Resolve step did not set DEDUP_LABEL}"
+          # Dedup: this report job re-runs on every run_attempt, so
+          # re-running a failed nightly used to open a SECOND identical
+          # issue. Find an existing OPEN issue carrying this run's
+          # DEDUP_LABEL — a structured (tier, date/version) key the Resolve
+          # step computed and already ensured exists as a label — rather
+          # than matching the rendered title, so a title reword can't break
+          # dedup. (has(pull_request) filters out PRs, which the issues
+          # endpoint also returns.)
+          EXISTING=$(curl -fsSL --max-time 30 -G \
             -H "Authorization: bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "$API_URL/repos/$REPO/issues?state=open&per_page=100" \
-            | jq -r --arg t "$TITLE" 'map(select(.title == $t and (has("pull_request") | not))) | (.[0].number // empty)')
+            --data-urlencode "labels=$DEDUP_LABEL" \
+            --data-urlencode "state=open" \
+            --data-urlencode "per_page=100" \
+            "$API_URL/repos/$REPO/issues" \
+            | jq -r 'map(select(has("pull_request") | not)) | (.[0].number // empty)')
           if [ -n "$EXISTING" ]; then
-            echo "Existing open issue #$EXISTING titled \"$TITLE\" — commenting instead of duplicating."
-            curl -fsSL \
+            echo "Existing open issue #$EXISTING labelled \"$DEDUP_LABEL\" — commenting instead of duplicating."
+            curl -fsSL --max-time 30 \
               -X POST \
               -H "Authorization: bearer $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "$API_URL/repos/$REPO/issues/$EXISTING/comments" \
-              -d "$(jq -n --arg body "Re-run also failed: $RUN_URL" '{body: $body}')"
+              -d "$(jq -n --arg body "Re-run also failed: $RUN_URL${CAUSE_LINE:+ ($CAUSE_LINE)}" '{body: $body}')"
           else
-            curl -fsSL \
+            # Create the dedup label just before the issue that has to carry
+            # it, rather than on every run: the lookup above is safe against
+            # a label that does not exist yet (the issues list returns an
+            # empty array, not an error), and a re-run that finds an
+            # existing issue is by definition looking at one that already
+            # carries the label. `|| true` tolerates the "already exists"
+            # 422 — the label outlives the run, so every attempt after the
+            # first on a given key is a 422.
+            curl -fsSL --max-time 30 -o /dev/null \
+              -X POST \
+              -H "Authorization: bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API_URL/repos/$REPO/labels" \
+              -d "$(jq -n --arg name "$DEDUP_LABEL" '{name: $name, color: "ededed", description: "Nightly/release failure-issue dedup key — do not remove from an open nightly-report issue."}')" \
+              || true
+            # Cause label (#1625): created on demand, attached at creation only. It is
+            # NOT part of the dedup lookup above, so dedup stays one issue per
+            # run day/tier whatever the cause. A blank label means no red leg
+            # had a class; the issue then carries the dedup label alone.
+            if [ -n "$CAUSE_LABEL" ]; then
+              curl -fsSL --max-time 30 -o /dev/null \
+                -X POST \
+                -H "Authorization: bearer $GITHUB_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "$API_URL/repos/$REPO/labels" \
+                -d "$(jq -n --arg name "$CAUSE_LABEL" '{name: $name, color: "fbca04", description: "Dominant cause of a nightly/release failure issue (#1625). Informational; not a dedup key."}')" \
+                || true
+            fi
+            curl -fsSL --max-time 30 \
               -X POST \
               -H "Authorization: bearer $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "$API_URL/repos/$REPO/issues" \
-              -d "$(jq -n --arg title "$TITLE" --arg body "$BODY" '{title: $title, body: $body}')"
+              -d "$(jq -n --arg title "$TITLE" --arg body "$BODY" --arg label "$DEDUP_LABEL" --arg cause "$CAUSE_LABEL" '{title: $title, body: $body, labels: ([$label] + (if $cause == "" then [] else [$cause] end))}')"
           fi
+
+      # ONE issue labelled env-not-ready (#1624), found by the label, not the
+      # title. First night: create it. Later nights: comment on it, so a
+      # multi-day outage is one thread. A re-run of the same night does not
+      # comment again. Schedule + release only, like the failure issue.
+      - name: Open or update the env-not-ready issue
+        if: >
+          always() &&
+          (github.event_name == 'schedule' || github.event_name == 'release') &&
+          needs.select-env.outputs.not_ready != '' &&
+          needs.select-env.outputs.not_ready != '{}'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+          NOT_READY: ${{ needs.select-env.outputs.not_ready }}
+          EVENT: ${{ github.event_name }}
+        shell: bash
+        run: |
+          LABEL=env-not-ready
+          TODAY=$(date -u +%Y-%m-%d)
+          ENVS=$(echo "$NOT_READY" | jq -r 'keys | join(", ")')
+          {
+            echo "The E2E readiness check (tools/check-env-readiness.mjs, #1624) found ${ENVS} live but not testable on ${TODAY} (${EVENT}). The scenario matrix skipped it; the failures below are the environment, not the code."
+            echo ""
+            cat /tmp/readiness-section.md
+            echo "Fix the environment (DotNS profile drift: update the client or the deployment; funding: refill from //Alice; S3 fixture: re-register e2eownedns03 to Bob, see docs/e2e-bootstrap.md). Genuine scenario failures on ready envs still file the normal nightly failure issue."
+            echo ""
+            echo "- Run: $RUN_URL"
+          } > /tmp/env-not-ready-body.md
+          EXISTING=$(curl -fsSL --max-time 30 -G \
+            -H "Authorization: bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            --data-urlencode "labels=$LABEL" \
+            --data-urlencode "state=open" \
+            --data-urlencode "per_page=100" \
+            "$API_URL/repos/$REPO/issues" \
+            | jq -r 'map(select(has("pull_request") | not)) | (.[0].number // empty)')
+          if [ -n "$EXISTING" ]; then
+            if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]; then
+              echo "Re-run of the same night: #$EXISTING already has this run's comment."
+              exit 0
+            fi
+            echo "Open issue #$EXISTING is labelled $LABEL; commenting."
+            curl -fsSL --max-time 30 -o /dev/null -X POST \
+              -H "Authorization: bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API_URL/repos/$REPO/issues/$EXISTING/comments" \
+              -d "$(jq -n --arg body "$(cat /tmp/env-not-ready-body.md)" '{body: $body}')"
+          else
+            curl -fsSL --max-time 30 -o /dev/null -X POST \
+              -H "Authorization: bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API_URL/repos/$REPO/labels" \
+              -d "$(jq -n --arg name "$LABEL" '{name: $name, color: "d93f0b", description: "An e2eEligible env is live but failed the readiness check (#1624). One open issue at a time."}')" \
+              || true
+            curl -fsSL --max-time 30 -X POST \
+              -H "Authorization: bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API_URL/repos/$REPO/issues" \
+              -d "$(jq -n --arg title "E2E env not ready: ${ENVS} (${TODAY})" --arg body "$(cat /tmp/env-not-ready-body.md)" --arg label "$LABEL" '{title: $title, body: $body, labels: [$label]}')"
+          fi
+
+      - name: Note a green re-run on the day's failure issue
+        # Comment, do not close: a leg that passed on re-run still failed once.
+        # continue-on-error: a failed lookup shows as a failed step without turning a green run red.
+        if: >
+          always() &&
+          github.run_attempt > 1 &&
+          (github.event_name == 'schedule' || github.event_name == 'release') &&
+          !contains(needs.*.result, 'failure') &&
+          !contains(needs.*.result, 'cancelled')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          # No ISSUE_TITLE reference here on purpose — this step doesn't
+          # need the title, only the dedup label, which keeps it decoupled
+          # from any future title reword.
+          DEDUP_LABEL="${DEDUP_LABEL:?Resolve step did not set DEDUP_LABEL}"
+          # Same DEDUP_LABEL query as "Open failure issue" — the two must
+          # agree on identity or this step can fail to find what that one
+          # filed.
+          EXISTING=$(curl -fsSL --max-time 30 -G \
+            -H "Authorization: bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            --data-urlencode "labels=$DEDUP_LABEL" \
+            --data-urlencode "state=open" \
+            --data-urlencode "per_page=100" \
+            "$API_URL/repos/$REPO/issues" \
+            | jq -r 'map(select(has("pull_request") | not)) | (.[0].number // empty)')
+          if [ -z "$EXISTING" ]; then
+            echo "No open issue labelled \"$DEDUP_LABEL\", nothing to annotate."
+            exit 0
+          fi
+          echo "Run is green, annotating #$EXISTING."
+          curl -fsSL --max-time 30 \
+            -X POST \
+            -H "Authorization: bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL/repos/$REPO/issues/$EXISTING/comments" \
+            -d "$(jq -n --arg body "Re-run passed (attempt ${GITHUB_RUN_ATTEMPT}): $RUN_URL. The matrix is green now. The failure above still happened; close this once it is explained or fixed." '{body: $body}')"
 
   # ---- Post-nightly Sentry assertion harness (#181 Proposal 1) -----------
 
@@ -2642,6 +3784,7 @@ jobs:
             --org paritytech \
             --project 4511093597405264 \
             --tag "$DEPLOY_TAG" \
+            --run-id "$GITHUB_RUN_ID" \
             --version "$BULLETIN_DEPLOY_VERSION" \
             --since 6h \
             --min-spans 4 \
@@ -2681,6 +3824,7 @@ jobs:
             --org paritytech \
             --project 4511093597405264 \
             --tag "$DEPLOY_TAG" \
+            --run-id "$GITHUB_RUN_ID" \
             --since 24h \
             --min-distinct 5 \
             --max-share 0.40 \
@@ -2695,7 +3839,7 @@ jobs:
 
   chain-call-encoding:
     name: Chain-call arg encoding (all extrinsics)
-    needs: detect-deps-change
+    needs: [detect-deps-change, select-env]
     # Runs on every trigger (PR / push / schedule / release / dispatch) EXCEPT
     # a release-only version bump on pull_request/push (#195) — same
     # skip-safe pattern as detect-noop-push: a skipped predecessor (every
@@ -2709,8 +3853,23 @@ jobs:
     # path filter used to skip entirely. The chain-free completeness guard
     # also runs in Unit Tests (npm test); this job adds the live-chain
     # encode check.
+    #
+    # needs.select-env.result == 'success' (#1595 follow-up, port of bulletin
+    # PR #1596): this job used to always default to paseo-next-v2 (PAD_ENV
+    # unset), so a dead primary-env endpoint (e.g. the People chain's RPC)
+    # hung/failed this job even though select-env's probe+fallback would have
+    # routed every other E2E job to a healthy env. Gating on select-env — the
+    # same pattern test-pr/dispatch-s-v060-unblock/nightly-* already use —
+    # folds in select-env's own gating (including the noop-push skip) for
+    # free, while the explicit detect-deps-change check directly below keeps
+    # that property independently verifiable on this job too, exactly as
+    # before. NOTE: this repo has only one e2eEligible env (paseo-next-v2),
+    # so it cannot actually fall back yet — wired anyway to stay in sync with
+    # bulletin-deploy; this job stays red during a People outage until a
+    # second eligible env exists here.
     if: |
       always() &&
+      needs.select-env.result == 'success' &&
       (needs.detect-deps-change.result == 'skipped' || needs.detect-deps-change.outputs.is_version_only != 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -2723,10 +3882,25 @@ jobs:
           node-version: 22
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
-      - run: npm ci
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
+      - name: npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
+      # Step-level safety net (#1595): every RPC call in the test is already
+      # bounded by its own timeout (30s connect / 20s request), but
+      # --test-timeout is a second line of defense in case some future call
+      # slips through unbounded. Its own timeout-minutes stays below the
+      # job's 10 so a runaway step is caught here, not by the job cancelling
+      # the whole run.
       - name: Assert every extrinsic encodes against the live chain
-        run: E2E=1 node --test test/e2e-chain-calls.test.js
+        timeout-minutes: 5
+        env:
+          PAD_ENV: ${{ needs.select-env.outputs.selected_env }}
+        run: E2E=1 node --test --test-timeout=60000 test/e2e-chain-calls.test.js
 
   # Authoritative daily drift detector: are the DotNS contract addresses in
   # assets/environments.json still in sync with paritytech/dotns DEPLOYMENTS.md?
@@ -2751,23 +3925,36 @@ jobs:
           node-version: 22
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       # paritytech/dotns is a private repo — GITHUB_TOKEN can't read it. With the
       # DOTNS_REPO_READ_TOKEN PAT this is the real drift check; without it the
-      # tool soft-skips (exit 0) on the fetch failure rather than false-failing.
+      # tool soft-skips on the fetch failure rather than false-failing.
+      # Exit codes: 0 match or soft-skip, 1 a real divergence, 2 the check could
+      # not run and nothing was compared. steps.*.outcome collapses 1 and 2, so
+      # the filer below gates on the captured code.
       - name: Check DotNS contract addresses against DEPLOYMENTS.md
+        id: check-addresses
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.DOTNS_REPO_READ_TOKEN || secrets.GITHUB_TOKEN }}
-        run: node tools/check-dotns-contract-addresses.mjs
+        run: |
+          set +e
+          node tools/check-dotns-contract-addresses.mjs
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
       - name: Open issue on address drift
-        if: failure()
+        if: steps.check-addresses.outcome == 'failure' && steps.check-addresses.outputs.exit_code == '1'
         uses: actions/github-script@v8
         continue-on-error: true
         with:
           script: |
             const title = 'DotNS contract address drift detected';
             const body = [
-              'The nightly DotNS address drift check failed.',
+              'The nightly DotNS address drift check measured a real divergence.',
               '',
               `Run: https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
               '',
@@ -2786,6 +3973,19 @@ jobs:
               return;
             }
             await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title, body });
+      - name: Fail the job when the drift check did not pass
+        if: steps.check-addresses.outcome == 'failure'
+        env:
+          EXIT_CODE: ${{ steps.check-addresses.outputs.exit_code }}
+        run: |
+          if [ "$EXIT_CODE" = "1" ]; then
+            echo ">> FAIL: DotNS address drift: a real divergence was measured."
+            echo "::error::DotNS address drift: a real divergence was measured."
+          else
+            echo ">> FAIL: DotNS address drift: check could not run (exit $EXIT_CODE); nothing was compared."
+            echo "::error::DotNS address drift: check could not run (exit $EXIT_CODE); nothing was compared."
+          fi
+          exit 1
 
   nightly-code-path-coverage:
     name: Nightly · Code-path coverage
@@ -2800,12 +4000,20 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      # Exit codes as in nightly-dotns-address-drift: 1 = dead path, 2 = could not run.
       - name: Check dead-branch coverage in Sentry
+        id: check-coverage
+        continue-on-error: true
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-        run: python3 tools/check-code-path-coverage.py
+        run: |
+          set +e
+          python3 tools/check-code-path-coverage.py
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
       - name: Open issue on dead paths
-        if: failure()
+        if: steps.check-coverage.outcome == 'failure' && steps.check-coverage.outputs.exit_code == '1'
         uses: actions/github-script@v8
         continue-on-error: true
         with:
@@ -2835,3 +4043,16 @@ jobs:
               title, body,
               labels: ['observability'],
             });
+      - name: Fail the job if the check did not pass
+        if: steps.check-coverage.outcome == 'failure'
+        env:
+          EXIT_CODE: ${{ steps.check-coverage.outputs.exit_code }}
+        run: |
+          if [ "$EXIT_CODE" = "1" ]; then
+            echo ">> FAIL: Code-path coverage: dead code path found."
+            echo "::error::Code-path coverage: dead code path found."
+          else
+            echo ">> FAIL: Code-path coverage: check did not run (exit $EXIT_CODE); nothing was measured."
+            echo "::error::Code-path coverage: check did not run (exit $EXIT_CODE); nothing was measured."
+          fi
+          exit 1

@@ -6,12 +6,13 @@
 // SDK modules that trigger the "@parity/product-sdk-logger" localStorage warning.
 import "../dist/suppress-localstorage-warning.js";
 
-import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, unpublish, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, validateNoManifestFlags } from "../dist/deploy.js";
-import { VERSION, setDeployAttribute, captureWarning, closeTelemetry, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
-import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
+import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, resolveEffectiveMnemonic, mnemonicConflictNotice, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, printDeploymentCompleteBanner } from "../dist/deploy.js";
+import { VERSION, setDeployAttribute, captureWarning, closeTelemetry, markDeployFatal, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
+import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion, isInteractive } from "../dist/version-check.js";
 import { setDeployContext, installLogCapture, buildCliFlagsSummary } from "../dist/bug-report.js";
 import { loadRunState, writeRunState, shouldSkipStaleWarning, shouldShowOomHint, probablyOomRssMb } from "../dist/run-state.js";
-import { loadEnvironments, listEnvironments, formatEnvironmentTable, DEFAULT_ENV_ID } from "../dist/environments.js";
+import { loadEnvironments, listEnvironments, formatEnvironmentTable, resolveEndpoints, DEFAULT_ENV_ID } from "../dist/environments.js";
+import { DEFAULT_TLD } from "../dist/dotns.js";
 import * as fs from "fs";
 import * as readline from "readline";
 
@@ -36,6 +37,7 @@ for (let i = 0; i < args.length; i++) {
   else if (args[i] === "--pool-size") { flags.poolSize = parseInt(args[++i], 10); }
   else if (args[i] === "--mnemonic") { flags.mnemonic = args[++i]; }
   else if (args[i] === "--derivation-path") { flags.derivationPath = args[++i]; }
+  else if (args[i] === "--product-name") { flags.productName = args[++i]; }
   else if (args[i] === "--rpc") { flags.rpc = args[++i]; }
   else if (args[i] === "--env") { flags.env = args[++i]; }
   else if (args[i] === "--contract") {
@@ -62,9 +64,6 @@ for (let i = 0; i < args.length; i++) {
   else if (args[i].startsWith("--reproducible=")) { flags.reproducibleSource = args[i].slice("--reproducible=".length); }
   else if (args[i] === "--dump-car") { flags.dumpCar = true; }
   else if (args[i].startsWith("--dump-car=")) { flags.dumpCar = args[i].slice("--dump-car=".length); }
-  else if (args[i] === "--publish") { flags.publish = true; }
-  else if (args[i] === "--unpublish") { flags.unpublish = true; }
-  else if (args[i] === "--fail-on-publish-error") { flags.failOnPublishError = true; }
   else if (args[i] === "--suri") { flags.suri = args[++i]; }
   else if (args[i] === "--no-transfer-to-signedin-user") { flags.noTransferToSignedinUser = true; }
   else if (args[i] === "--to") { flags.to = args[++i]; }
@@ -73,24 +72,9 @@ for (let i = 0; i < args.length; i++) {
   else { positional.push(args[i]); }
 }
 
-if (flags.publish && flags.unpublish) {
-  console.error("Error: --publish and --unpublish are mutually exclusive.");
-  process.exit(1);
-}
-
-// --no-manifest (--content-only) skips manifest publishing even when a
-// polkadot-app-deploy.config.* is discoverable; --publish depends on those
-// manifest records (Publisher listing -> Browse), so the combination is
-// rejected up front rather than silently publishing a domain with no manifest.
-const noManifestErr = validateNoManifestFlags({ noManifest: !!flags.noManifest, publish: !!flags.publish });
-if (noManifestErr) {
-  console.error(noManifestErr);
-  process.exit(1);
-}
-
 // The mnemonic actually used to sign — --mnemonic flag > MNEMONIC env var >
-// DOTNS_MNEMONIC env var. Used everywhere deploy/publish/unpublish need a
-// signer identity (existence guards below intentionally keep checking
+// DOTNS_MNEMONIC env var. Used everywhere a deploy needs a signer identity
+// (existence guards below intentionally keep checking
 // flags.mnemonic / process.env.MNEMONIC directly — only the VALUE forwarded
 // to options.mnemonic changes here).
 const effectiveMnemonic = resolveEffectiveMnemonic({
@@ -98,6 +82,15 @@ const effectiveMnemonic = resolveEffectiveMnemonic({
   envMnemonic: process.env.MNEMONIC,
   envDotnsMnemonic: process.env.DOTNS_MNEMONIC,
 });
+
+// bulletin #1553/#1461: surface it when MNEMONIC and DOTNS_MNEMONIC are both
+// set and disagree — only meaningful when no --mnemonic flag was given (a
+// flag makes both env vars irrelevant), and skipped on --help/--version
+// since neither deploys anything.
+if (!flags.mnemonic && !flags.help && !flags.version) {
+  const mnemonicNotice = mnemonicConflictNotice({ envMnemonic: process.env.MNEMONIC, envDotnsMnemonic: process.env.DOTNS_MNEMONIC });
+  if (mnemonicNotice) console.error(mnemonicNotice);
+}
 
 // The env id actually targeted this session — --env flag > PAD_ENV env var.
 // `undefined` here still means "let deploy()/the DEFAULT_ENV_ID fallback
@@ -130,32 +123,6 @@ if (flags.listEnvironments) {
     process.exit(0);
   } catch (e) {
     console.error(`Error: failed to load environments: ${e?.message ?? e}`);
-    process.exit(1);
-  }
-}
-
-if (flags.unpublish) {
-  if (!flags.mnemonic && !process.env.MNEMONIC) {
-    console.error("Error: --unpublish requires --mnemonic (or MNEMONIC env var).");
-    process.exit(1);
-  }
-  const [domain] = positional;
-  if (!domain) {
-    console.error("Error: --unpublish requires a domain (e.g. my-app.dot)");
-    process.exit(1);
-  }
-  try {
-    const result = await unpublish(domain, {
-      mnemonic: effectiveMnemonic,
-      derivationPath: flags.derivationPath,
-      rpc: flags.rpc,
-      env: effectiveEnvId,
-    });
-    console.log(`Domain: ${result.domainName}`);
-    console.log(`Status: ${result.status}`);
-    process.exit(0);
-  } catch (e) {
-    console.error(`Unpublish failed:`, e?.message ?? e);
     process.exit(1);
   }
 }
@@ -245,11 +212,6 @@ if (positional[0] === "product") {
   process.exit(2);
 }
 
-if (flags.publish && !flags.mnemonic && !process.env.MNEMONIC) {
-  console.error("Error: --publish requires --mnemonic (or MNEMONIC env var).");
-  process.exit(1);
-}
-
 if (flags.help || positional.length === 0) {
   console.log(`polkadot-app-deploy v${VERSION}
 
@@ -285,6 +247,7 @@ Options:
                            --contract DOTNS_REGISTRY=0x.. --contract DOTNS_CONTENT_RESOLVER=0x..
   --mnemonic "..."         DotNS owner mnemonic (or set MNEMONIC env var)
   --derivation-path "..."  Optional Substrate-style path applied to --mnemonic (e.g. //deploy/3)
+  --product-name "..."     Deploy as this product's host-derived account (RFC-0022, index 0), so the name is owned by the account the product signs with at runtime
   --no-transfer-to-signedin-user
                            When signed in, sign every DotNS tx with your mobile
                            session (today's behavior) instead of the default:
@@ -311,18 +274,7 @@ Options:
                       Skip manifest publishing entirely, even when a
                       polkadot-app-deploy.config.* is discoverable — plain
                       content deploy (storage + root contenthash), same as
-                      having no config at all. Mutually exclusive with --publish.
-  --publish           After deploy, list <domain> in the on-chain Publisher
-                      registry (Publisher.publish). Only takes effect on envs
-                      with a deployed Publisher (currently: devnet).
-                      Requires --mnemonic (the signer must own the label).
-  --unpublish         Standalone mode: removes <domain> from the Publisher
-                      registry (Publisher.unpublish). Skips the deploy.
-                      Usage: polkadot-app-deploy --unpublish <domain.dot>
-                      Requires --mnemonic. Mutually exclusive with --publish.
-  --fail-on-publish-error
-                      Exit non-zero if --publish fails after a successful deploy.
-                      Default: non-fatal (warning logged, exit 0).
+                      having no config at all.
   --version           Show version
   --help              Show this help`);
   process.exit(0);
@@ -400,9 +352,6 @@ if (!flags.help && !flags.version) {
     if (finalizing) return;
     finalizing = true;
     try {
-      setDeployAttribute("deploy.status", "killed");
-      setDeployAttribute("deploy.killed", reason);
-      setDeployAttribute("deploy.sad", "true");
       captureWarning(`deploy process terminated: ${reason}`);
     } catch { /* telemetry best-effort */ }
     try { await closeTelemetry(1000); } catch { /* ignore */ }
@@ -435,7 +384,7 @@ if (!flags.help && !flags.version) {
       } catch { /* telemetry best-effort */ }
       return;
     }
-    try { setDeployAttribute("deploy.error", msgStr.slice(0, 200)); } catch {}
+    try { markDeployFatal(e); } catch {}
     finalize(kind, 2);
   };
   process.on("uncaughtException", (e) => handleUnhandled(e, "uncaught"));
@@ -445,9 +394,16 @@ if (!flags.help && !flags.version) {
   // and are retryable from the consumer's perspective. Contrast with
   // NonRetryableError exits (code 78, POSIX EX_CONFIG) which callers must
   // NOT retry — see EXIT_CODE_NO_RETRY in src/errors.ts.
-  process.on("SIGINT", () => finalize("SIGINT", 130));
-  process.on("SIGTERM", () => finalize("SIGTERM", 143));
-  process.on("SIGHUP", () => finalize("SIGHUP", 129));
+  const onSignal = (sig, exitCode) => {
+    try {
+      setDeployAttribute("deploy.status", "killed");
+      setDeployAttribute("deploy.killed", sig);
+    } catch { /* telemetry best-effort */ }
+    finalize(sig, exitCode);
+  };
+  process.on("SIGINT", () => onSignal("SIGINT", 130));
+  process.on("SIGTERM", () => onSignal("SIGTERM", 143));
+  process.on("SIGHUP", () => onSignal("SIGHUP", 129));
 }
 
 try {
@@ -500,24 +456,59 @@ try {
   // --no-manifest (--content-only) skips this entirely — the deploy is
   // content-only regardless of any discoverable config, so there's nothing to
   // preflight.
+  //
+  // #1164: hoisted so the SAME loaded config (one filesystem walk-up + parse)
+  // can drive both the manifestPending banner decision below and the actual
+  // publishManifest() call further down — previously each of those call sites
+  // reloaded the config independently.
+  let preflightedConfig = null;
   if (!flags.noManifest) {
     try {
-      const { preflightProductConfig } = await import("../dist/index.js");
+      const { preflightProductConfig, reconcileManifestDomain } = await import("../dist/index.js");
       // config-load resolves a relative cwd internally, so no node:path here
       // (it's only dynamically imported later, in the publish block).
-      await preflightProductConfig(
-        flags.config ? { path: flags.config } : { cwd: buildDir, walkUp: true },
-      );
+      // #1572: preflightProductConfig (config discovery/parse + icon/executable
+      // file checks) and loadEnvironments (a local environments.json read)
+      // have no data dependency on each other — run them concurrently rather
+      // than paying their I/O sequentially.
+      const [loadedConfig, { doc }] = await Promise.all([
+        preflightProductConfig(
+          flags.config ? { path: flags.config } : { cwd: buildDir, walkUp: true },
+        ),
+        loadEnvironments({ userFilePath: flags.environmentFile ?? process.env.PAD_ENV_FILE }),
+      ]);
+      preflightedConfig = loadedConfig;
+      // Reconcile the config's domain against the ACTUAL deploy target
+      // BEFORE deploy() runs at all — this is the real "nothing uploaded
+      // yet" gate; src/manifest/publish.ts's own call to the same helper
+      // (inside publishManifest) is only a backstop for a library caller
+      // that skips this CLI entirely. Same env/TLD resolution publishManifest
+      // itself uses (loadEnvironments + resolveEndpoints), so this sees the
+      // identical environment the deploy will target — no RPC call, both are
+      // local config reads.
+      if (loadedConfig) {
+        const resolved = resolveEndpoints(doc, effectiveEnvId ?? DEFAULT_ENV_ID);
+        const envTld = resolved.tld ?? DEFAULT_TLD;
+        reconcileManifestDomain(loadedConfig.config.domain, domain, envTld, loadedConfig.sourcePath);
+      }
     } catch (err) {
       console.error(`Error: ${err?.message ?? err}`);
       process.exit(err instanceof NonRetryableError ? EXIT_CODE_NO_RETRY : 1);
     }
   }
 
+  // #1164: determine up front whether a manifest publish will follow, so
+  // deploy() can defer the "DEPLOYMENT COMPLETE" banner until publishManifest
+  // actually succeeds. Reuses the SAME preflightedConfig loaded just above —
+  // no second config load.
+  const manifestWillPublish = shouldPublishManifest({ configFound: !!preflightedConfig, noManifest: !!flags.noManifest });
+
   const result = await deploy(buildDir, domain, {
     mnemonic: effectiveMnemonic,
     derivationPath: flags.derivationPath,
+    productName: flags.productName,
     suri: flags.suri,
+    manifestPending: manifestWillPublish,
     rpc: flags.rpc,
     env: effectiveEnvId,
     poolSize: flags.poolSize,
@@ -529,8 +520,6 @@ try {
     allowLargeDeploy: flags.allowLargeDeploy,
     reproducibleSource: flags.reproducibleSource,
     dumpCar: flags.dumpCar,
-    publish: flags.publish,
-    failOnPublishError: flags.failOnPublishError,
     transferToSignedInUser: !flags.noTransferToSignedinUser,
     // Human-first phone signing hooks (spec: 2026-06-13-human-first-phone-signing-design).
     onPhoneSignaturePlan: (steps) => {
@@ -550,42 +539,59 @@ try {
     // `reason: "silence"` marks a watcher-silence re-arm (no response within
     // the budget) as distinct from the pre-existing verifyEffect-false-negative
     // re-sign case (undefined/"resign", still rendered off `attempt`).
-    confirmPhoneReady: ({ label, attempt, approvalBudgetMs, reason }) => new Promise((resolve, reject) => {
-      const budgetSeconds = Math.round(approvalBudgetMs / 1000);
-      if (reason === "silence") {
-        console.log(`\n   still nothing from your phone — press Y to re-send, Ctrl-C to abort`);
-      } else if (attempt >= 2) {
-        console.log(`\n   Re-sign needed (attempt ${attempt}) — approve on your phone, then press Y to continue (Ctrl-C to abort).`);
-      } else {
-        console.log(`\n   Check your phone → ${label}`);
-        console.log(`   Press Y when ready — you'll have ~${budgetSeconds}s to approve on your phone (Ctrl-C to abort):`);
-      }
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      let settled = false;
-      const settle = (fn) => { if (!settled) { settled = true; rl.close(); fn(); } };
-      rl.on("close", () => settle(reject.bind(null, new Error("aborted by user"))));
-      const ask = () => {
-        rl.question("   > ", (line) => {
-          const answer = line.trim().toLowerCase();
-          // #194: require an EXPLICIT y/yes — bare Enter is the input most
-          // likely to come from something other than a deliberate keypress
-          // (buffered newline, stray Enter, piped stdin), and accepting it
-          // starts a fatal clock with nobody watching.
-          if (answer === "y" || answer === "yes") {
-            settle(resolve);
-          } else {
-            ask();
-          }
-        });
-      };
-      ask();
-    }),
+    confirmPhoneReady: ({ label, attempt, approvalBudgetMs, reason }) => {
+      // #1363: a non-interactive caller (CI, no TTY) can reach this gate — e.g.
+      // a stale login session left on the runner's $HOME resolves the signer to
+      // "phone required" even though nobody set out to run interactively. Fail
+      // fast with an actionable message BEFORE creating readline: readline's
+      // "close" fires immediately on a closed/non-TTY stdin, and the old
+      // unconditional rl.on("close", ...) below rejected with "aborted by
+      // user" for that case too — indistinguishable from a real Ctrl-C, and
+      // wrong (nobody aborted anything). Reuses isInteractive() (TTY + !CI)
+      // rather than adding a second interactivity check.
+      if (!isInteractive()) return Promise.reject(nonInteractivePhoneConfirmationError(label));
+      return new Promise((resolve, reject) => {
+        const budgetSeconds = Math.round(approvalBudgetMs / 1000);
+        if (reason === "silence") {
+          console.log(`\n   still nothing from your phone — press Y to re-send, Ctrl-C to abort`);
+        } else if (attempt >= 2) {
+          console.log(`\n   Re-sign needed (attempt ${attempt}) — approve on your phone, then press Y to continue (Ctrl-C to abort).`);
+        } else {
+          console.log(`\n   Check your phone → ${label}`);
+          console.log(`   Press Y when ready — you'll have ~${budgetSeconds}s to approve on your phone (Ctrl-C to abort):`);
+        }
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        let settled = false;
+        const settle = (fn) => { if (!settled) { settled = true; rl.close(); fn(); } };
+        rl.on("close", () => settle(reject.bind(null, new Error("aborted by user"))));
+        const ask = () => {
+          rl.question("   > ", (line) => {
+            const answer = line.trim().toLowerCase();
+            // #194: require an EXPLICIT y/yes — bare Enter is the input most
+            // likely to come from something other than a deliberate keypress
+            // (buffered newline, stray Enter, piped stdin), and accepting it
+            // starts a fatal clock with nobody watching.
+            if (answer === "y" || answer === "yes") {
+              settle(resolve);
+            } else {
+              ask();
+            }
+          });
+        };
+        ask();
+      });
+    },
   });
 
   const output = process.env.GITHUB_OUTPUT;
   if (output) {
     fs.appendFileSync(output, `cid=${result.cid}\n`);
     fs.appendFileSync(output, `domain=${result.domainName}\n`);
+    // #1157: same env-aware URL as the "Check it out here" console line —
+    // lets the reusable workflow's PR-comment/summary step reuse this
+    // resolution instead of recomputing a gateway URL from its own
+    // hardcoded-dot.li default.
+    fs.appendFileSync(output, `browserUrl=${result.browserUrl}\n`);
   }
 
   console.log(`CID: ${result.cid}`);
@@ -599,16 +605,15 @@ try {
   //
   // --no-manifest (--content-only) skips manifest publishing even when a
   // config is present. shouldPublishManifest() is the single source of truth
-  // for that decision (config discovery still runs either way, so the
-  // "config found but --no-manifest set" case is exercised for real, not just
-  // in unit tests).
+  // for that decision.
+  //
+  // #1164: reuses `preflightedConfig` (loaded once, above) instead of a
+  // second independent tryLoadProductConfig call.
   {
-    const { tryLoadProductConfig, publishManifest } = await import("../dist/index.js");
+    const { publishManifest } = await import("../dist/index.js");
     const path = await import("node:path");
     const buildDirAbs = path.resolve(buildDir);
-    const loaded = await tryLoadProductConfig(
-      flags.config ? { path: flags.config } : { cwd: buildDirAbs, walkUp: true },
-    );
+    const loaded = preflightedConfig;
     if (shouldPublishManifest({ configFound: !!loaded, noManifest: !!flags.noManifest })) {
       try {
         await publishManifest({
@@ -619,11 +624,26 @@ try {
           rpc: flags.rpc,
           mnemonic: effectiveMnemonic,
           derivationPath: flags.derivationPath,
+          productName: flags.productName,
+          // The slot signer deploy() resolved from the login session, so the manifest's
+          // uploads are billed to the same allowance the content was. Undefined for every
+          // other signer shape, which publishManifest resolves from the options above.
+          storageSigner: result.storageSigner,
+          storageSignerAddress: result.storageSignerAddress,
         });
+        // #1164: deploy() deferred the real completion banner (manifestPending
+        // was set above) — print it now that the manifest phase actually
+        // succeeded, so a manifest publish failure never leaves a false
+        // "DEPLOYMENT COMPLETE!" on screen.
+        printDeploymentCompleteBanner(result.fullDomain, result.browserUrl);
       } catch (err) {
         console.error(`Manifest publish failed: ${err?.message ?? err}`);
         process.exit(err instanceof NonRetryableError ? EXIT_CODE_NO_RETRY : 1);
       }
+    } else if (!loaded && !flags.noManifest) {
+      // Only the walk-up can come back empty: an explicit --config that is
+      // missing throws out of tryLoadProductConfig rather than returning null.
+      console.log(`No product config found from ${buildDirAbs} upward; content deployed, no manifest published.`);
     }
     // No config (or --no-manifest) → the contenthash-only deploy above is the whole job; nothing else to do.
   }

@@ -15,17 +15,6 @@ export function formatWhoami(addresses: SessionAddresses | null): string {
     if (!addresses) {
         return `Not logged in. Run \`${CLI_NAME} login\` to sign in.`;
     }
-    if (!addresses.productResolved) {
-        // Never print the stand-in as if it were the product account: it is the
-        // wallet root, nobody can sign for it as a product account, and printing
-        // it invites someone to fund a dead address.
-        return [
-            `Logged in:`,
-            `  Root address:    ${addresses.rootAddress}`,
-            `  Product address: unresolved — your wallet did not return it`,
-            `                   (deploys still work; the phone signs as the real account)`,
-        ].join("\n");
-    }
     return [
         `Logged in:`,
         `  Root address:    ${addresses.rootAddress}`,
@@ -61,6 +50,9 @@ export async function runWhoami(envId: string): Promise<void> {
         if (e?.name === "SignerNotAvailableError") {
             // Expected: session file exists but no usable signer — treat as stale.
             console.error(STALE_SESSION_MESSAGE);
+        } else if (e?.name === "NonRetryableError") {
+            // Signed in, but the phone did not return this env's account key.
+            console.error(e.message);
         } else {
             // Unexpected error (WS failure, People chain unavailable, etc.).
             console.log(`Could not reach login service: ${e?.message ?? String(err)}`);
