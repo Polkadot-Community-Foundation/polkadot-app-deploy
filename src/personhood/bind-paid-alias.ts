@@ -11,6 +11,7 @@ import {
   PROOF_BYTES,
 } from "./constants.js";
 import { buildAliasProofMessage, getProofValidAtSec } from "./proof-validity.js";
+import { readAliasFee, readRingRoots } from "./chain-state.js";
 
 // ---------------------------------------------------------------------------
 // Loose type shapes
@@ -25,8 +26,6 @@ type AhApi = {
   };
   query: {
     AliasAccounts: {
-      // §3.1: Storage renamed from PaidAliasFee → AliasFee (individuality#955).
-      AliasFee: { getValue: (opts?: { at: string }) => Promise<bigint | undefined> };
       AccountToAlias: {
         getValue: (
           who: SS58String,
@@ -41,18 +40,6 @@ type AhApi = {
           who: SS58String,
           opts?: { at: string },
         ) => Promise<{ balance: bigint } | undefined>;
-      };
-    };
-    MembersSubscriber: {
-      RingRoots: {
-        getValue: (
-          ident: string,
-          ringIndex: number,
-          opts?: { at: string },
-        ) => Promise<
-          | Array<{ revision: number; root: Uint8Array }>
-          | undefined
-        >;
       };
     };
     Timestamp: {
@@ -133,8 +120,7 @@ type PeopleApi = {
 export type PaidAliasBindingErrorKind =
   | "NotARecognizedPerson"
   | "RingRootNotFound"
-  // §3.5: Error renamed from PaidAliasFeeUnset → AliasFeeUnset (individuality#955).
-  | "AliasFeeUnset"
+  | "AliasRegistrationClosed"
   | "InsufficientPgas"
   | "BadProof"
   | "DispatchError"
@@ -232,12 +218,13 @@ export const bindPaidAliasToAccount = async ({
     });
   }
 
-  // 1. AliasFee must be set (§3.1: storage renamed from PaidAliasFee → AliasFee).
-  const fee = await ah.query.AliasAccounts.AliasFee.getValue({ at: "best" });
-  if (fee === undefined) {
+  // 1. Alias registration must be open: the runtime has an alias fee.
+  const fee = await readAliasFee(ah);
+  if (fee === null) {
     throw new PaidAliasBindingError(
-      "AliasAccounts.AliasFee is unset — needs sudo `set_alias_fee`",
-      { kind: "AliasFeeUnset" },
+      "alias registration is closed on this chain: no alias fee is set. " +
+        "Root opens it by setting the Parameters(AliasAccounts.AliasFee) runtime parameter",
+      { kind: "AliasRegistrationClosed" },
     );
   }
 
@@ -295,11 +282,7 @@ export const bindPaidAliasToAccount = async ({
   const ringExponent: RingExponent =
     ringExp.type === "R2e9" ? 9 : ringExp.type === "R2e10" ? 10 : 14;
 
-  const ringRoots = await ah.query.MembersSubscriber.RingRoots.getValue(
-    collectionId,
-    ringIndex,
-    { at: "best" },
-  );
+  const ringRoots = await readRingRoots(ah, collectionId, ringIndex);
   if (!ringRoots || ringRoots.length === 0) {
     throw new PaidAliasBindingError(
       "AH has no RingRoots for this (collection, ring_index)",
@@ -451,12 +434,11 @@ const narrowDispatchError = (
       if (v.type === "AliasAccounts" && v.value?.type === "BadProof") {
         return "BadProof";
       }
-      // §3.5: Error renamed from PaidAliasFeeUnset → AliasFeeUnset (individuality#955).
       if (
         v.type === "AliasAccounts" &&
         v.value?.type === "AliasFeeUnset"
       ) {
-        return "AliasFeeUnset";
+        return "AliasRegistrationClosed";
       }
     }
   }

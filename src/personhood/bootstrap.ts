@@ -30,6 +30,7 @@ import { claimPgas, type BuildRingProof } from "./claim-pgas.js";
 import { makeOneShotBuildRingProof } from "./ring-proof.js";
 import { bindPaidAliasToAccount } from "./bind-paid-alias.js";
 import { runChainPrereqProbes } from "./chain-prereqs.js";
+import { readAliasFee } from "./chain-state.js";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -39,7 +40,7 @@ export interface BootstrapState {
   recognized: boolean;              // member key present in People.Members.Members
   personalIdBound: boolean;         // People.AccountToPersonalId(ss58) ⇒ personalId
   pgasBalance: bigint;              // Assets.Account(PGAS_ASSET_ID, ss58)
-  paidAliasFee: bigint;             // AliasAccounts.AliasFee (§3.1: storage renamed from PaidAliasFee)
+  aliasFee: bigint | null;          // alias registration fee; null while registration is closed
   aliasBound: {
     paid: boolean;
     contextHex: string;
@@ -73,8 +74,6 @@ type AhApi = {
       };
     };
     AliasAccounts: {
-      // §3.1: Storage renamed from PaidAliasFee → AliasFee (individuality#955).
-      AliasFee: { getValue: (opts?: { at: string }) => Promise<bigint | undefined> };
       AccountToAlias: {
         getValue: (who: SS58String, opts?: { at: string }) => Promise<{
           // NOTE: `paid` field removed in individuality#955.
@@ -144,11 +143,10 @@ export async function probeBootstrapState({
   const people = peopleUnsafeApi as unknown as PeopleApi;
   const ah = ahUnsafeApi as unknown as AhApi;
 
-  const [memberPosition, pgasAcct, feeRaw, aliasRow] = await Promise.all([
+  const [memberPosition, pgasAcct, aliasFee, aliasRow] = await Promise.all([
     people.query.Members.Members.getValue(PEOPLE_MEMBER_IDENTIFIER_HEX, bytesToHex(memberKey), { at: "best" }),
     ah.query.Assets.Account.getValue(PGAS_ASSET_ID, account, { at: "best" }),
-    // §3.1: Storage renamed from PaidAliasFee → AliasFee (individuality#955).
-    ah.query.AliasAccounts.AliasFee.getValue({ at: "best" }),
+    readAliasFee(ah),
     ah.query.AliasAccounts.AccountToAlias.getValue(account, { at: "best" }),
   ]);
 
@@ -164,7 +162,6 @@ export async function probeBootstrapState({
   }
 
   const pgasBalance = pgasAcct?.balance ?? 0n;
-  const paidAliasFee = feeRaw ?? 0n;
 
   const aliasBound = aliasRow
     ? {
@@ -184,7 +181,7 @@ export async function probeBootstrapState({
     recognized,
     personalIdBound,
     pgasBalance,
-    paidAliasFee,
+    aliasFee,
     aliasBound,
     reviveMapped,
   };
@@ -192,13 +189,16 @@ export async function probeBootstrapState({
 
 /**
  * Determine the next action needed given the current bootstrap state.
- * Returns null when the flow is complete.
+ * Returns null when nothing is left to do: the flow is complete, or alias
+ * registration is closed (`aliasFee === null`), which stops it after the
+ * personal-ID binding.
  */
 export function nextBootstrapAction(
   state: BootstrapState,
 ): "bind-personal-id" | "claim-pgas" | "bind-paid-alias" | null {
   if (!state.personalIdBound) return "bind-personal-id";
-  if (state.pgasBalance < state.paidAliasFee) return "claim-pgas";
+  if (state.aliasFee === null) return null;
+  if (state.pgasBalance < state.aliasFee) return "claim-pgas";
   if (!state.aliasBound?.paid) return "bind-paid-alias";
   return null;
 }
@@ -370,8 +370,10 @@ export async function runBootstrap({
 
     const buildRingProof: BuildRingProof = makeOneShotBuildRingProof(verifiable.one_shot, memberEntropy);
 
+    // Steps 3 and 4 only run while alias registration is open.
+
     // Step 3: claim PGAS if balance insufficient.
-    if (currentState.pgasBalance < currentState.paidAliasFee) {
+    if (currentState.aliasFee !== null && currentState.pgasBalance < currentState.aliasFee) {
       const _claimPgas = _testApis?.claimPgas ?? claimPgas;
       await _claimPgas({
         peopleUnsafeApi,
@@ -392,7 +394,7 @@ export async function runBootstrap({
     }
 
     // Step 4: bind paid alias if not yet done.
-    if (!currentState.aliasBound?.paid) {
+    if (currentState.aliasFee !== null && !currentState.aliasBound?.paid) {
       const _bindPaidAlias = _testApis?.bindPaidAliasToAccount ?? bindPaidAliasToAccount;
       await _bindPaidAlias({
         peopleUnsafeApi,

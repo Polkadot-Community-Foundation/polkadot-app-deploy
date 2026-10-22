@@ -21,6 +21,7 @@ import {
   PGAS_ASSET_ID,
   PROOF_BYTES,
 } from "./constants.js";
+import { readRingRoots } from "./chain-state.js";
 
 // ---------------------------------------------------------------------------
 // Loose type shapes
@@ -53,18 +54,6 @@ type AhApi = {
           who: SS58String,
           opts?: { at: string },
         ) => Promise<{ balance: bigint } | undefined>;
-      };
-    };
-    MembersSubscriber: {
-      RingRoots: {
-        getValue: (
-          ident: string,
-          ringIndex: number,
-          opts?: { at: string },
-        ) => Promise<
-          | Array<{ revision: number; root: Uint8Array }>
-          | undefined
-        >;
       };
     };
   };
@@ -355,11 +344,7 @@ export const claimPgas = async ({
   const ringExponent: RingExponent =
     ringExp.type === "R2e9" ? 9 : ringExp.type === "R2e10" ? 10 : 14;
 
-  const ringRoots = await ah.query.MembersSubscriber.RingRoots.getValue(
-    collectionId,
-    ringIndex,
-    { at: "best" },
-  );
+  const ringRoots = await readRingRoots(ah, collectionId, ringIndex);
   if (!ringRoots || ringRoots.length === 0) {
     throw new PgasClaimError(
       "AH has no RingRoots for this (collection, ring_index)",

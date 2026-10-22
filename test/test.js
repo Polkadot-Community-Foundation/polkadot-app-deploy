@@ -13,6 +13,7 @@ import { reproveAliasToAccount } from "../dist/personhood/reprove.js";
 import { claimPgas, buildAsPgasClaimExtensionValue, buildImplicationExclude } from "../dist/personhood/claim-pgas.js";
 import { probeRingCollectionExponents, probePgasAsset, probePgasNativePool } from "../dist/personhood/chain-prereqs.js";
 import { bindPaidAliasToAccount } from "../dist/personhood/bind-paid-alias.js";
+import { readAliasFee, readRingRoots } from "../dist/personhood/chain-state.js";
 import { bindPersonalIdToAccount, buildAsPersonExtensionValue } from "../dist/personhood/bind-personal-id.js";
 import * as fs from "fs";
 import * as path from "path";
@@ -18798,12 +18799,102 @@ describe("deriveMemberEntropy", () => {
 // ---------------------------------------------------------------------------
 // Stage 2: bootstrap state-machine tests (mock APIs, no chain)
 // ---------------------------------------------------------------------------
+
+// The alias fee as the runtime parameter Parameters(AliasAccounts(AliasFee)); undefined = unset.
+const aliasFeeParameters = (fee) => ({
+  Parameters: {
+    getValue: async () =>
+      fee === undefined ? undefined : { type: "AliasAccounts", value: { type: "AliasFee", value: fee } },
+  },
+});
+
+describe("personhood chain-state reads", () => {
+  const missingEntry = (entry) => async () => {
+    throw new Error(`Runtime entry Storage(${entry}) not found`);
+  };
+
+  function ringRootsApi(currentGeneration) {
+    const calls = [];
+    const api = {
+      query: {
+        MembersSubscriber: {
+          CurrentGeneration: { getValue: currentGeneration },
+          RingRoots: {
+            getValue: async (...args) => {
+              calls.push(args);
+              return [{ revision: 1, root: new Uint8Array(32) }];
+            },
+          },
+        },
+      },
+    };
+    return { api, calls };
+  }
+
+  test("ring roots are read at CurrentGeneration", async () => {
+    const { api, calls } = ringRootsApi(async () => 3);
+    const roots = await readRingRoots(api, "0xabcd", 2);
+    assert.equal(roots.length, 1);
+    assert.deepEqual(calls, [[3, "0xabcd", 2, { at: "best" }]],
+      ">> FAIL: RingRoots must be keyed (generation, collection, ring index)");
+  });
+
+  test("ring roots use the two-key layout on runtimes without CurrentGeneration", async () => {
+    const { api, calls } = ringRootsApi(missingEntry("MembersSubscriber.CurrentGeneration"));
+    await readRingRoots(api, "0xabcd", 2);
+    assert.deepEqual(calls, [["0xabcd", 2, { at: "best" }]]);
+  });
+
+  test("other CurrentGeneration errors propagate", async () => {
+    const { api } = ringRootsApi(async () => { throw new Error("socket closed"); });
+    await assert.rejects(readRingRoots(api, "0xabcd", 2), /socket closed/);
+  });
+
+  test("the alias fee comes from Parameters(AliasAccounts.AliasFee)", async () => {
+    let key;
+    const api = {
+      query: {
+        Parameters: {
+          Parameters: {
+            getValue: async (k) => {
+              key = k;
+              return { type: "AliasAccounts", value: { type: "AliasFee", value: 1000n } };
+            },
+          },
+        },
+      },
+    };
+    assert.equal(await readAliasFee(api), 1000n);
+    assert.equal(key.type, "AliasAccounts");
+    assert.equal(key.value.type, "AliasFee");
+  });
+
+  test("an unset alias fee parameter means registration is closed", async () => {
+    assert.equal(await readAliasFee({ query: { Parameters: aliasFeeParameters(undefined) } }), null);
+  });
+
+  test("the alias fee falls back to AliasAccounts.AliasFee storage on older runtimes", async () => {
+    for (const error of [
+      "Runtime entry Storage(Parameters.Parameters) not found",
+      "Incompatible runtime entry Storage(Parameters.Parameters)",
+    ]) {
+      const api = (legacy) => ({
+        query: {
+          Parameters: { Parameters: { getValue: async () => { throw new Error(error); } } },
+          AliasAccounts: { AliasFee: { getValue: async () => legacy } },
+        },
+      });
+      assert.equal(await readAliasFee(api(100n)), 100n, `>> FAIL: legacy fee after "${error}"`);
+      assert.equal(await readAliasFee(api(undefined)), null);
+    }
+  });
+});
 describe("nextBootstrapAction", () => {
   const BASE_STATE = {
     recognized: true,
     personalIdBound: false,
     pgasBalance: 0n,
-    paidAliasFee: 100n,
+    aliasFee: 100n,
     aliasBound: null,
     reviveMapped: false,
   };
@@ -18814,7 +18905,7 @@ describe("nextBootstrapAction", () => {
 
   test("returns claim-pgas when personalId is bound but PGAS insufficient", () => {
     assert.equal(
-      nextBootstrapAction({ ...BASE_STATE, personalIdBound: true, pgasBalance: 50n, paidAliasFee: 100n }),
+      nextBootstrapAction({ ...BASE_STATE, personalIdBound: true, pgasBalance: 50n, aliasFee: 100n }),
       "claim-pgas",
     );
   });
@@ -18825,7 +18916,7 @@ describe("nextBootstrapAction", () => {
         ...BASE_STATE,
         personalIdBound: true,
         pgasBalance: 200n,
-        paidAliasFee: 100n,
+        aliasFee: 100n,
         aliasBound: null,
       }),
       "bind-paid-alias",
@@ -18838,7 +18929,7 @@ describe("nextBootstrapAction", () => {
         ...BASE_STATE,
         personalIdBound: true,
         pgasBalance: 200n,
-        paidAliasFee: 100n,
+        aliasFee: 100n,
         aliasBound: { paid: false, contextHex: "0x00", revision: 1 },
       }),
       "bind-paid-alias",
@@ -18851,11 +18942,16 @@ describe("nextBootstrapAction", () => {
         ...BASE_STATE,
         personalIdBound: true,
         pgasBalance: 200n,
-        paidAliasFee: 100n,
+        aliasFee: 100n,
         aliasBound: { paid: true, contextHex: "0x646f746e73", revision: 5 },
       }),
       null,
     );
+  });
+
+  test("stops after the personal-ID binding while alias registration is closed", () => {
+    assert.equal(nextBootstrapAction({ ...BASE_STATE, aliasFee: null }), "bind-personal-id");
+    assert.equal(nextBootstrapAction({ ...BASE_STATE, personalIdBound: true, aliasFee: null }), null);
   });
 });
 
@@ -18864,7 +18960,7 @@ describe("probeBootstrapState (mock APIs)", () => {
   function buildMockApis({
     memberIncluded = false,
     pgasBalance = 0n,
-    paidAliasFee = undefined,
+    aliasFee = undefined,
     aliasRow = undefined,
     personalIdOnPeople = undefined,
   } = {}) {
@@ -18890,9 +18986,8 @@ describe("probeBootstrapState (mock APIs)", () => {
             getValue: async () => pgasBalance > 0n ? { balance: pgasBalance } : undefined,
           },
         },
+        Parameters: aliasFeeParameters(aliasFee),
         AliasAccounts: {
-          // §3.1: Renamed from PaidAliasFee → AliasFee (individuality#955).
-          AliasFee: { getValue: async () => paidAliasFee },
           AccountToAlias: { getValue: async () => aliasRow },
         },
       },
@@ -18965,6 +19060,19 @@ describe("probeBootstrapState (mock APIs)", () => {
     assert.equal(state.aliasBound.contextHex, "0x646f746e73");
   });
 
+  test("aliasFee is the parameter value, or null while registration is closed", async () => {
+    for (const [aliasFee, expected] of [[1000n, 1000n], [undefined, null]]) {
+      const { peopleUnsafeApi, ahUnsafeApi } = buildMockApis({ aliasFee });
+      const state = await probeBootstrapState({
+        peopleUnsafeApi,
+        ahUnsafeApi,
+        memberKey: new Uint8Array(32),
+        account: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+      });
+      assert.equal(state.aliasFee, expected);
+    }
+  });
+
   test("personalIdBound=true when People.AccountToPersonalId returns a value", async () => {
     const { peopleUnsafeApi, ahUnsafeApi } = buildMockApis({ personalIdOnPeople: 123n });
     const state = await probeBootstrapState({
@@ -19029,6 +19137,7 @@ function buildReproveApis({
         AccountToAlias: { getValue: async () => aliasRow },
       },
       MembersSubscriber: {
+        CurrentGeneration: { getValue: async () => 0 },
         RingRoots: { getValue: async () => ringRoots },
       },
       // §3.3: proof_valid_at sourced from Timestamp.Now / 1000n.
@@ -19335,6 +19444,7 @@ function buildClaimPgasApis({
         Account: { getValue: async () => ({ balance: 100n }) },
       },
       MembersSubscriber: {
+        CurrentGeneration: { getValue: async () => 0 },
         RingRoots: { getValue: async () => ringRoots },
       },
     },
@@ -19562,7 +19672,7 @@ describe("bindPersonalIdToAccount (mock APIs)", () => {
 // ---------------------------------------------------------------------------
 
 function buildPaidAliasApis({
-  paidAliasFee = 100n,
+  aliasFee = 100n,
   pgasBalance = 200n,
   memberPosition = { type: "Included", value: { ring_index: 0, ring_page: 0 } },
   ringEntries = [
@@ -19580,15 +19690,15 @@ function buildPaidAliasApis({
       },
     },
     query: {
+      Parameters: aliasFeeParameters(aliasFee),
       AliasAccounts: {
-        // §3.1: Renamed from PaidAliasFee → AliasFee (individuality#955).
-        AliasFee: { getValue: async () => paidAliasFee },
         AccountToAlias: { getValue: async () => undefined },
       },
       Assets: {
         Account: { getValue: async () => pgasBalance > 0n ? { balance: pgasBalance } : undefined },
       },
       MembersSubscriber: {
+        CurrentGeneration: { getValue: async () => 0 },
         RingRoots: { getValue: async () => ringRoots },
       },
       // §3.3: proof_valid_at sourced from Timestamp.Now / 1000n.
@@ -19689,7 +19799,7 @@ describe("bindPaidAliasToAccount (mock APIs)", () => {
   });
 
   test("throws InsufficientPgas when balance below fee", async () => {
-    const { ahUnsafeApi, peopleUnsafeApi } = buildPaidAliasApis({ pgasBalance: 50n, paidAliasFee: 100n });
+    const { ahUnsafeApi, peopleUnsafeApi } = buildPaidAliasApis({ pgasBalance: 50n, aliasFee: 100n });
     await assert.rejects(
       bindPaidAliasToAccount({ peopleUnsafeApi, ahUnsafeApi, account: MOCK_ALICE, memberKey: MOCK_MEMBER_KEY, contextBytes: CONTEXT_BYTES, signCall: makeSigner(), buildRingProof }),
       (err) => err.kind === "InsufficientPgas",
@@ -19727,7 +19837,7 @@ describe("runBootstrap (mock — no chain)", () => {
       recognized: true,
       personalIdBound: true,
       pgasBalance: 500n,
-      paidAliasFee: 100n,
+      aliasFee: 100n,
       aliasBound: { paid: true, contextHex: MOCK_CONTEXT_HEX, revision: 5 },
       reviveMapped: true,
     };
@@ -19739,7 +19849,7 @@ describe("runBootstrap (mock — no chain)", () => {
       recognized: true,
       reviveMapped: false,
       pgasBalance: 0n,
-      paidAliasFee: 100n,
+      aliasFee: 100n,
       aliasBound: null,
     };
 
@@ -19770,9 +19880,8 @@ describe("runBootstrap (mock — no chain)", () => {
     const ahUnsafeApi = {
       query: {
         Assets: { Account: { getValue: async () => undefined } },
+        Parameters: aliasFeeParameters(undefined),
         AliasAccounts: {
-          // §3.1: Renamed from PaidAliasFee → AliasFee (individuality#955).
-          AliasFee: { getValue: async () => undefined },
           AccountToAlias: { getValue: async () => undefined },
         },
       },
@@ -19805,9 +19914,8 @@ describe("runBootstrap (mock — no chain)", () => {
       ahUnsafeApi: {
         query: {
           Assets: { Account: { getValue: async () => ({ balance: 500n }) } },
+          Parameters: aliasFeeParameters(100n),
           AliasAccounts: {
-            // §3.1: Renamed from PaidAliasFee → AliasFee (individuality#955).
-            AliasFee: { getValue: async () => 100n },
             AccountToAlias: { getValue: async () => aliasRow },
           },
         },
@@ -19863,9 +19971,8 @@ describe("runBootstrap (mock — no chain)", () => {
         Assets: {
           Account: { getValue: async () => ({ balance: 1_000_000n }) },
         },
+        Parameters: aliasFeeParameters(100n),
         AliasAccounts: {
-          // §3.1: Renamed from PaidAliasFee → AliasFee (individuality#955).
-          AliasFee: { getValue: async () => 100n },
           AccountToAlias: { getValue: async () => ({
             // `paid` field removed from AccountToAlias in individuality#955.
             revision: 1,
@@ -19917,6 +20024,35 @@ describe("runBootstrap (mock — no chain)", () => {
 
     assert.equal(capturedBindPersonalIdArgs.length, 1, "bindPersonalIdToAccount should be called exactly once");
     assert.equal(capturedBindPersonalIdArgs[0].personalId, 42n, "personalId must be the value from People.Keys, not 0n");
+  });
+
+  test("runBootstrap binds the personal ID and stops there while alias registration is closed", async () => {
+    const { peopleUnsafeApi, ahUnsafeApi, ahClient, peopleClient, capturedBindPersonalIdArgs, mockBindPersonalId } =
+      buildBootstrapTestApis({ personalIdBound: false });
+    ahUnsafeApi.query.Parameters = aliasFeeParameters(undefined);
+    ahUnsafeApi.query.Assets.Account.getValue = async () => undefined;
+    ahUnsafeApi.query.AliasAccounts.AccountToAlias.getValue = async () => undefined;
+    const unexpected = (step) => async () => { throw new Error(`${step} must not run while registration is closed`); };
+
+    const result = await runBootstrap({
+      mnemonic: BOOTSTRAP_TEST_MNEMONIC,
+      environmentId: "paseo-next-v2",
+      requireRecognized: false,
+      _testApis: {
+        ahUnsafeApi,
+        peopleUnsafeApi,
+        ahClient,
+        peopleClient,
+        bindPersonalIdToAccount: mockBindPersonalId,
+        claimPgas: unexpected("claim-pgas"),
+        bindPaidAliasToAccount: unexpected("bind-paid-alias"),
+        runChainPrereqProbes: async () => {},
+      },
+    });
+
+    assert.equal(capturedBindPersonalIdArgs.length, 1);
+    assert.deepEqual(result.actionsExecuted, ["bind-personal-id"]);
+    assert.equal(result.finalState.aliasFee, null);
   });
 
   test("runBootstrap throws with 'personhood faucet' message when People.Keys returns undefined", async () => {
@@ -23357,14 +23493,15 @@ describe("bind-paid-alias tx-shape: set_alias_account with proof_valid_at (indiv
         },
       },
       query: {
+        Parameters: aliasFeeParameters(100n),
         AliasAccounts: {
-          AliasFee: { getValue: async () => 100n },
           AccountToAlias: { getValue: async () => undefined },
         },
         Assets: {
           Account: { getValue: async () => ({ balance: 200n }) },
         },
         MembersSubscriber: {
+          CurrentGeneration: { getValue: async () => 0 },
           RingRoots: { getValue: async () => [{ revision: 7, root: new Uint8Array(32) }] },
         },
         Timestamp: {
@@ -23446,9 +23583,8 @@ describe("bind-paid-alias tx-shape: set_alias_account with proof_valid_at (indiv
       ">> FAIL: tx-shape-bind: proof_valid_at must equal Timestamp.Now / 1000n");
   });
 
-  test("§3.1: reads AliasFee (not PaidAliasFee) — mock verifies no access to old name", async () => {
-    // Build an API where AliasFee works but PaidAliasFee would throw. If the code
-    // still reads PaidAliasFee, it will throw "Cannot read properties of undefined".
+  test("reads the alias fee from the Parameters(AliasAccounts.AliasFee) runtime parameter", async () => {
+    // The mock has no AliasAccounts.AliasFee storage: reading it would throw.
     const ahUnsafeApiWithOnlyAliasFee = {
       constants: {
         AliasAccounts: {
@@ -23457,13 +23593,13 @@ describe("bind-paid-alias tx-shape: set_alias_account with proof_valid_at (indiv
         },
       },
       query: {
+        Parameters: aliasFeeParameters(100n),
         AliasAccounts: {
-          AliasFee: { getValue: async () => 100n },
           // PaidAliasFee intentionally absent — accessing it would throw
           AccountToAlias: { getValue: async () => undefined },
         },
         Assets: { Account: { getValue: async () => ({ balance: 200n }) } },
-        MembersSubscriber: { RingRoots: { getValue: async () => [{ revision: 1, root: new Uint8Array(32) }] } },
+        MembersSubscriber: { CurrentGeneration: { getValue: async () => 0 }, RingRoots: { getValue: async () => [{ revision: 1, root: new Uint8Array(32) }] } },
         Timestamp: { Now: { getValue: async () => 1_000_000_000n } },
       },
       tx: {
@@ -23500,11 +23636,11 @@ describe("bind-paid-alias tx-shape: set_alias_account with proof_valid_at (indiv
         signCall: { publicKey: new Uint8Array(32), signTx: async () => new Uint8Array(64), signBytes: async () => new Uint8Array(64) },
         buildRingProof: async () => ({ proof: BIND_MOCK_PROOF_BYTES, alias: new Uint8Array(32) }),
       }),
-      ">> FAIL: §3.1: bind should succeed when only AliasFee is present (PaidAliasFee removed from chain)",
+      ">> FAIL: bind should succeed with the fee set only as the runtime parameter",
     );
   });
 
-  test("§3.5: AliasFeeUnset error kind when AliasFee is undefined (renamed from PaidAliasFeeUnset)", async () => {
+  test("AliasRegistrationClosed when the alias fee parameter is unset", async () => {
     const ahNoFee = {
       constants: {
         AliasAccounts: {
@@ -23513,12 +23649,12 @@ describe("bind-paid-alias tx-shape: set_alias_account with proof_valid_at (indiv
         },
       },
       query: {
+        Parameters: aliasFeeParameters(undefined),
         AliasAccounts: {
-          AliasFee: { getValue: async () => undefined },  // fee not set
           AccountToAlias: { getValue: async () => undefined },
         },
         Assets: { Account: { getValue: async () => ({ balance: 200n }) } },
-        MembersSubscriber: { RingRoots: { getValue: async () => [] } },
+        MembersSubscriber: { CurrentGeneration: { getValue: async () => 0 }, RingRoots: { getValue: async () => [] } },
         Timestamp: { Now: { getValue: async () => 1_000_000_000n } },
       },
       tx: { AliasAccounts: { set_alias_account: () => { throw new Error("should not reach tx"); } } },
@@ -23541,8 +23677,8 @@ describe("bind-paid-alias tx-shape: set_alias_account with proof_valid_at (indiv
         signCall: { publicKey: new Uint8Array(32), signTx: async () => new Uint8Array(64), signBytes: async () => new Uint8Array(64) },
         buildRingProof: async () => ({ proof: BIND_MOCK_PROOF_BYTES, alias: new Uint8Array(32) }),
       }),
-      (err) => err.kind === "AliasFeeUnset",
-      ">> FAIL: §3.5: AliasFee unset must throw with kind 'AliasFeeUnset' (renamed from PaidAliasFeeUnset)",
+      (err) => err.kind === "AliasRegistrationClosed" && /registration is closed/.test(err.message),
+      ">> FAIL: an unset alias fee must throw AliasRegistrationClosed with a clear message",
     );
   });
 });
@@ -23579,6 +23715,7 @@ describe("reprove tx-shape: proof_valid_at in reprove_alias_account (individuali
           },
         },
         MembersSubscriber: {
+          CurrentGeneration: { getValue: async () => 0 },
           RingRoots: { getValue: async () => [{ revision: 2, root: new Uint8Array(32) }] },
         },
         Timestamp: {
@@ -23689,7 +23826,7 @@ describe("AliasAccounts migration safety — constants and symbol renames (indiv
           AccountToAlias: { getValue: async () => undefined },
         },
         Assets: { Account: { getValue: async () => ({ balance: 0n }) } },
-        MembersSubscriber: { RingRoots: { getValue: async () => [] } },
+        MembersSubscriber: { CurrentGeneration: { getValue: async () => 0 }, RingRoots: { getValue: async () => [] } },
         Timestamp: { Now: { getValue: async () => 1_000_000_000n } },
       },
       tx: { AliasAccounts: { set_alias_account: () => {} } },
@@ -23867,6 +24004,7 @@ describe("validate_with_commitment pre-flight (§5)", () => {
           Account: { getValue: async () => ({ balance: 1000n }) },
         },
         MembersSubscriber: {
+          CurrentGeneration: { getValue: async () => 0 },
           RingRoots: { getValue: async () => ringRoots },
         },
       },

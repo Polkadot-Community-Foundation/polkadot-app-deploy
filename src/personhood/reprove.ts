@@ -10,6 +10,7 @@ import type { PolkadotSigner, SS58String } from "polkadot-api";
 import { bytesToHex, encodeMembers, hexToBytes } from "./encoding.js";
 import { PEOPLE_MEMBER_IDENTIFIER_HEX, PROOF_BYTES } from "./constants.js";
 import { buildAliasProofMessage, getProofValidAtSec } from "./proof-validity.js";
+import { readRingRoots } from "./chain-state.js";
 
 // ---------------------------------------------------------------------------
 // Loose type shapes for the untyped papi APIs
@@ -39,21 +40,6 @@ type AhApi = {
               // NOTE: `paid` field removed in individuality#955 — the pallet collapsed
               // its paid/free split; there is now one path (AliasFee applies to all).
             }
-          | undefined
-        >;
-      };
-    };
-    MembersSubscriber: {
-      RingRoots: {
-        getValue: (
-          ident: string,
-          ringIndex: number,
-          opts?: { at: string },
-        ) => Promise<
-          | Array<{
-              revision: number;
-              root: Uint8Array;
-            }>
           | undefined
         >;
       };
@@ -266,11 +252,7 @@ export const reproveAliasToAccount = async ({
   const ringExponent: RingExponent =
     ringExp.type === "R2e9" ? 9 : ringExp.type === "R2e10" ? 10 : 14;
 
-  const ringRoots = await ah.query.MembersSubscriber.RingRoots.getValue(
-    stored.collection,
-    ringIndex,
-    { at: "best" },
-  );
+  const ringRoots = await readRingRoots(ah, stored.collection, ringIndex);
   if (!ringRoots || ringRoots.length === 0) {
     throw new ReproveAliasError(
       "AH has no RingRoots for this (collection, ring_index)",
