@@ -8,6 +8,9 @@ export const DOTNS_CONTEXT_HEX =
 
 export const DOTNS_CONTEXT_BYTES: Uint8Array = Binary.fromHex(DOTNS_CONTEXT_HEX);
 
+// Transaction extension that authorizes `Pgas.claim_pgas` with a ring proof.
+export const AS_PGAS_IDENTIFIER = "AsPgas";
+
 // PGAS fungible asset ID on Asset Hub.
 export const PGAS_ASSET_ID = 2_000_000_000;
 

@@ -19415,7 +19415,7 @@ function buildClaimPgasApis({
         await signer.signTx(
           new Uint8Array([0x01, 0x02, 0x03]),
           fakeExtensions,
-          // Fake metadata bytes (enough to not crash readExtensionOrder — we override it)
+          // Not metadata: these tests stop before the capture is used.
           new Uint8Array(0),
         );
       } catch (e) {
@@ -19590,10 +19590,10 @@ describe("claimPgas (mock APIs)", () => {
 // Unit tests for bindPersonalIdToAccount (mock APIs, no chain)
 // ---------------------------------------------------------------------------
 
-// bindPersonalIdToAccount: the extension capture path calls readExtensionOrder(metadata),
-// which requires real SCALE-encoded metadata to parse.  Tests that exercise the full capture
-// pipeline are best covered by the E2E on Alice.  Here we test the guards that fire *before*
-// or independently of the capture step.
+// bindPersonalIdToAccount: the extension capture path calls selectExtensionPipeline(metadata),
+// which requires real SCALE-encoded metadata to parse. The full capture pipeline is covered
+// against recorded metadata in test/personhood-extensions.test.js. Here we test the guards that
+// fire *before* or independently of the capture step.
 
 describe("bindPersonalIdToAccount (mock APIs)", () => {
   const signMember = async (msg) => new Uint8Array(96).fill(0xaa);
