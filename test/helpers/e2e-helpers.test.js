@@ -686,9 +686,10 @@ describe("resolveE2eEnv", () => {
 
   test("resolves per-environment values rather than a fixed literal", async () => {
     const dflt = await resolveE2eEnv(null);
-    const devnet = await resolveE2eEnv("devnet");
+    // Fork: devnet is the default env, so compare it against paseo-next-v2.
+    const other = await resolveE2eEnv("paseo-next-v2");
     for (const key of ["tld", "bulletin", "gateway"]) {
-      assert.notEqual(dflt[key], devnet[key],
+      assert.notEqual(dflt[key], other[key],
         `>> FAIL: resolveE2eEnv: ${key} is identical across two environments, so it is not being read from environments.json`);
     }
     assert.equal(dflt.dotnsConnectOptions.rpc, dflt.dotnsConnectOptions.assetHubEndpoints[0],

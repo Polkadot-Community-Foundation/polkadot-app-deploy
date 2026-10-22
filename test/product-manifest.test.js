@@ -1438,12 +1438,10 @@ describe("publishManifest — Bulletin endpoint resolution (#1094)", () => {
     const loaded = {
       config: {
         ...VALID_CONFIG,
-        // #1572: must carry the DEFAULT env's real TLD (paseo-next-v2 ->
-        // "paseo", not the schema-generic ".dot" this fixture used before
-        // reconcileManifestDomain existed) — otherwise the env-TLD guard now
-        // fires before this test ever reaches the icon read it means to
-        // exercise.
-        domain: "manifestrpctest.paseo",
+        // #1572: must carry the DEFAULT env's real TLD (the fork's devnet ->
+        // "dot") — otherwise the env-TLD guard fires before this test ever
+        // reaches the icon read it means to exercise.
+        domain: "manifestrpctest.dot",
         icon: { path: "./missing-icon.png", format: "png" },
         executables: [],
       },
@@ -1451,7 +1449,7 @@ describe("publishManifest — Bulletin endpoint resolution (#1094)", () => {
     };
 
     await assert.rejects(
-      () => publishManifest({ loaded, domain: "manifestrpctest.paseo" }),
+      () => publishManifest({ loaded, domain: "manifestrpctest.dot" }),
       err => err.name === "NonRetryableError" && /Cannot read icon/.test(err.message),
       ">> FAIL: publishManifest #1094 default-env setup: expected the icon read to fail (fixture icon is intentionally missing) — check the fixture path, not the fix",
     );
