@@ -10,7 +10,8 @@ import { preflightSssAllowance } from "./sss-allowance-cache.js";
 import { sha256 } from "@noble/hashes/sha256";
 import { blake2b } from "@noble/hashes/blake2b";
 import { createClient as createPolkadotClient } from "polkadot-api";
-import { getWsProvider, WsEvent } from "polkadot-api/ws";
+import { WsEvent } from "polkadot-api/ws";
+import { getWsProvider } from "./ws.js";
 import { CID } from "multiformats/cid";
 import { create as createMultihash } from "multiformats/hashes/digest";
 import { base32 } from "multiformats/bases/base32";
@@ -23,7 +24,7 @@ import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "./ma
 import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManifest, CONTENT_HASH_RE, type ManifestFileEntry, type ManifestChunkEntry } from "./manifest.js";
 import { probeChunks, probeFinalityGap, getBestBlockNumber, type ChunkProbeResult } from "./chunk-probe.js";
 import { computeStats, telemetryAttributes, renderSummary } from "./incremental-stats.js";
-import { DotNS, fetchNonce, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD, computeDomainNode, topUpTargetFor, AUTO_MAP_RENT_HEADROOM } from "./dotns.js";
+import { assertTxCreator, DotNS, fetchNonce, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD, computeDomainNode, topUpTargetFor, AUTO_MAP_RENT_HEADROOM } from "./dotns.js";
 import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep, DotNSConnectOptions, DotnsSuccessAction } from "./dotns.js";
 import type { DotnsAbiProfile } from "./dotns-protocol.js";
 import { subnameNestingLevels } from "./subname-depth.js";
@@ -31,15 +32,15 @@ export type { PhoneSignatureStep };
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { derivePoolAccounts, fetchPoolAuthorizations, selectHealthyPoolAccount, checkPoolAccountNonceHealth, StuckPoolAccountError, STUCK_NONCE_GAP_THRESHOLD, withTimeout, stuckQueueMessage, parsePoolDerivationIndex, NONCE_HEALTH_SAMPLES, type NonceHealth, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet, resolvePoolMnemonic } from "./pool.js";
 import type { BulletinAuthorization, PoolAuthorization } from "./pool.js";
-import { initTelemetry, withSpan, withDeploySpan, setDeployAttribute, setDeploySentryTag, sampleMemory, setDeployReportContext, captureWarning, flush, VERSION, resolveRunner, resolveRunnerType, truncateAddress } from "./telemetry.js";
+import { initTelemetry, withSpan, withDeploySpan, setDeployAttribute, setDeploySentryTag, sampleMemory, setDeployReportContext, captureWarning, noteWarning, flush, VERSION, resolveRunner, resolveRunnerType, truncateAddress } from "./telemetry.js";
 import { loadEnvironments, describeContractSources, resolveEndpoints, getPopSelfServeConfig, DEFAULT_ENV_ID } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
 import { setDeployContext as setBugReportContext } from "./bug-report.js";
-import { getPolkadotSigner } from "polkadot-api/signer";
+import { getTxCreator } from "polkadot-api/tx-creator";
 import { sr25519CreateDerive } from "@polkadot-labs/hdkd";
 import { mnemonicToEntropy, entropyToMiniSecret, ss58Address } from "@polkadot-labs/hdkd-helpers";
 import { deriveProductSigner } from "./product-account.js";
-import type { PolkadotSigner } from "polkadot-api";
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
 import { CarReader } from "@ipld/car/reader";
 import {
   getSlotSignerProvider,
@@ -70,14 +71,14 @@ export interface DeployResult {
    * storage ran on a mnemonic, an external signer, or the pool — those the manifest step
    * resolves for itself from the options it is already given.
    */
-  storageSigner?: PolkadotSigner;
+  storageSigner?: SignerTxCreator;
   /** SS58 address of that slot account. Set whenever `storageSigner` is. */
   storageSignerAddress?: string;
 }
 
 export type DeployContent = string | Uint8Array | Uint8Array[];
 
-export { NonRetryableError, EXIT_CODE_NO_RETRY } from "./errors.js";
+export { InsufficientFundsError, NonRetryableError, EXIT_CODE_NO_RETRY } from "./errors.js";
 import { NonRetryableError } from "./errors.js";
 import { e2eNonceSeedBarrier } from "./e2e-nonce-barrier.js";
 
@@ -94,8 +95,8 @@ export function friendlyChainError(msg: string): string {
   return msg;
 }
 
-interface ProviderResult { client: any; unsafeApi: any; signer: PolkadotSigner; ss58: string; }
-interface ExistingProvider { client?: any; unsafeApi?: any; signer?: PolkadotSigner; ss58?: string; reconnect?: () => Promise<ProviderResult>; fetchNonce?: (rpc: string | string[], ss58: string) => Promise<number>; skipCids?: Set<string>; probeFailedCids?: Set<string>; gateway?: string;
+interface ProviderResult { client: any; unsafeApi: any; signer: SignerTxCreator; ss58: string; }
+interface ExistingProvider { client?: any; unsafeApi?: any; signer?: SignerTxCreator; ss58?: string; reconnect?: () => Promise<ProviderResult>; fetchNonce?: (rpc: string | string[], ss58: string) => Promise<number>; skipCids?: Set<string>; probeFailedCids?: Set<string>; gateway?: string;
   /**
    * CIDs the caller vouches are already on-chain. Chunks matching these CIDs
    * are skipped without any re-probe (unlike `skipCids` which re-probes before
@@ -221,7 +222,7 @@ export function makeBulletinStatusHandler(primary: string) {
     if (s.type === WsEvent.CONNECTED && s.uri !== primary) {
       _deployRpcFailedOver = true;
       setDeployAttribute("deploy.rpc.failed_over", "true");
-      captureWarning("Bulletin RPC failover", { from: primary, to: s.uri });
+      noteWarning("Bulletin RPC failover", { from: primary, to: s.uri });
     }
     if (s.type === WsEvent.CLOSE || s.type === WsEvent.ERROR) {
       try { _onWsHalt?.(); } catch { /* halt-callback failures are non-fatal */ }
@@ -336,10 +337,29 @@ export function retryBudgetExhausted(
   return inWindow > maxEvents;
 }
 
-// twin: upstream defines this next to its ChainError type, as part of an earlier
-// change (InvalidTransaction variant carried structurally) this repo has not
-// taken. Only the pure extractor is brought in, because isNonceCollisionError
-// needs it; nothing here sets chainErrorVariant, so the message is the carrier.
+/**
+ * InvalidTransaction variants where the tx may still be on chain and reissuing
+ * at a fresh nonce is the right response: a stale or future nonce, or an era
+ * that expired. Other variants (Payment, BadProof) fail the same way on every
+ * resubmission, so the retry backstops must not treat them as pool rejections.
+ */
+export const REISSUABLE_REJECTIONS = new Set(["Stale", "Future", "AncientBirthBlock"]);
+
+// twin: upstream's ChainError comes from an earlier change (#1256, the
+// InvalidTransaction variant carried structurally) this repo has not taken in
+// full. watchTransaction sets both fields; the chunk retry-exhaustion wrappers
+// do not carry them forward, so only the direct watchTransaction rejection
+// (which the pool-rejection backstops read) has them.
+/**
+ * An Error carrying the InvalidTransaction variant name captured at the point
+ * the chain-subscription error was produced.
+ */
+export interface ChainError extends Error {
+  chainErrorVariant?: string;
+  /** The pool rejected the tx, which papi reports as InvalidTxError (#1672). */
+  poolRejected?: boolean;
+}
+
 /**
  * Pulls the InvalidTransaction variant name (e.g. "AncientBirthBlock",
  * "BadProof", "Payment") out of the raw `{ "type": "Invalid", "value": {
@@ -353,20 +373,19 @@ export function extractInvalidTransactionVariant(msg: string): string | undefine
  * How the root-node store loop answers a failed submit (#1672). A tx the pool
  * rejects for its nonce is a nonce collision, not a lost connection: a sibling
  * deploy on the same signer took that nonce (S9), so the fix is a fresh nonce,
- * and a reconnect only burns budget. papi reports it as InvalidTxError Stale once
- * the block holding the other tx finalises, or as isValid:false on a reorg. A WS
- * halt or a connection error means the client is dead. Anything else keeps the
- * historical reconnect.
+ * and a reconnect only burns budget. papi reports it as InvalidTxError Stale. A
+ * WS halt or a connection error means the client is dead. Anything else keeps
+ * the historical reconnect.
  */
 export function classifyRootSubmitError(error: any, wsHalted: boolean): "reconnect" | "nonce-collision" {
   if (wsHalted || isConnectionError(error)) return "reconnect";
   return isNonceCollisionError(error) ? "nonce-collision" : "reconnect";
 }
 
-/** The pool rejected the tx for its nonce: InvalidTxError Stale, or isValid:false (#1672). */
+/** The pool rejected the tx for its nonce: InvalidTxError Stale (#1672). */
 export function isNonceCollisionError(error: any): boolean {
   const msg = String(error?.message ?? error);
-  return (error?.chainErrorVariant ?? extractInvalidTransactionVariant(msg)) === "Stale" || msg.includes("isValid:false");
+  return (error?.chainErrorVariant ?? extractInvalidTransactionVariant(msg)) === "Stale";
 }
 
 // Wait before re-reading the nonce after a collision (#1672). Two deploys on one
@@ -446,12 +465,12 @@ const CID_CONFIG = { version: 1, codec: 0x55, hashCode: SHA256_MULTIHASH_CODE, h
 // `path` defaults to "" (root key). Pass a path like "//deploy/3" to derive a
 // sub-account — used by pool mode, or by direct-signer tests that want to
 // exercise a specific pool-derived account without colliding with the root.
-export function deriveRootSigner(mnemonic: string, path: string = ""): { signer: PolkadotSigner; ss58: string } {
+export function deriveRootSigner(mnemonic: string, path: string = ""): { signer: SignerTxCreator; ss58: string } {
   const entropy = mnemonicToEntropy(mnemonic);
   const miniSecret = entropyToMiniSecret(entropy);
   const derive = sr25519CreateDerive(miniSecret);
   const keyPair = derive(path);
-  const signer = getPolkadotSigner(keyPair.publicKey, "Sr25519", keyPair.sign);
+  const signer = getTxCreator(keyPair.publicKey, "Sr25519", keyPair.sign);
   return { signer, ss58: ss58Address(keyPair.publicKey) };
 }
 
@@ -637,7 +656,7 @@ async function getDirectProvider(mnemonic: string, derivationPath: string = "", 
   return { client, unsafeApi, signer, ss58 };
 }
 
-async function getSignerProvider(signer: PolkadotSigner, ss58: string): Promise<ProviderResult> {
+async function getSignerProvider(signer: SignerTxCreator, ss58: string): Promise<ProviderResult> {
   const primary = BULLETIN_ENDPOINTS[0];
   console.log(`   Connecting to Bulletin: ${primary}`);
   const client = createPolkadotClient(getWsProvider(
@@ -768,7 +787,7 @@ export function __selectStorageProviderModeForTest(
  * exercising `resolveDeployActors`' SSO stack. Exported for unit testing.
  */
 export function deployActorsToSignerOptions(
-  actors: { worker: { signer: PolkadotSigner; address: string; source: string }; recipientH160?: string },
+  actors: { worker: { signer: SignerTxCreator; address: string; source: string }; recipientH160?: string },
 ): Pick<DeployOptions, "signer" | "signerAddress" | "transferTo" | "sessionSigner"> {
   return {
     signer: actors.worker.signer,
@@ -782,7 +801,7 @@ export function deployActorsToSignerOptions(
  * Decide how to source the signer for a deploy invocation. Exported for unit testing.
  *
  *  - "mnemonic"  — caller passed --mnemonic; use mnemonic-derived signer (existing path).
- *  - "injected"  — caller pre-built a PolkadotSigner (library or test seam).
+ *  - "injected"  — caller pre-built a SignerTxCreator (library or test seam).
  *  - "resolve"   — use resolveSigner: either --suri was passed (dev account /
  *                  mnemonic), OR a persisted login session exists (hasSession) so a
  *                  plain `deploy` uses the logged-in identity (the #411 UX). This is
@@ -1003,7 +1022,7 @@ export function selectStorageReconnect(options: DeployOptions): () => Promise<Pr
   // External signer (options.signer + options.signerAddress, NOT session-backed): use
   // getSignerProvider for Bulletin storage when no dedicated slot signer is available.
   // This supports programmatic callers (playground-cli, library consumers) that pass
-  // their own PolkadotSigner without a pre-allocated BulletInAllowance slot key. A
+  // their own SignerTxCreator without a pre-allocated BulletInAllowance slot key. A
   // phone-backed session signer with no slot (mode "pool" — bulletin #1452) falls
   // through below.
   if (mode === "signer")
@@ -1013,7 +1032,7 @@ export function selectStorageReconnect(options: DeployOptions): () => Promise<Pr
   return pool;
 }
 
-function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuccess: (event?: any) => T, { label = "transaction", timeoutMs, confirmIncluded }: WatchTransactionOptions = {}): Promise<WatchResult<T>> {
+function watchTransaction<T>(tx: any, signer: SignerTxCreator, txOpts: any, onSuccess: (event?: any) => T, { label = "transaction", timeoutMs, confirmIncluded }: WatchTransactionOptions = {}): Promise<WatchResult<T>> {
   const timeout = timeoutMs ?? TX_TIMEOUT_MS;
   return new Promise<WatchResult<T>>((resolve, reject) => {
     let settled = false;
@@ -1052,41 +1071,43 @@ function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuc
       if (await tryChainFallback()) return;
       settle(reject)(new Error(`${label} timed out after ${timeout / 1000}s waiting for block confirmation`));
     }, timeout);
-    sub = tx.signSubmitAndWatch(signer, txOpts).subscribe({
+    sub = tx.createSubmitAndWatch(signer, txOpts).subscribe({
       next: async (event: any) => {
-        if (event.type !== "txBestBlocksState") return;
-        if (event.found) {
-          if (event.ok) {
-            const receipt: ChainReceipt | undefined = event.block
-              ? { txHash: String(event.txHash), blockHash: String(event.block.hash), blockNumber: Number(event.block.number) }
-              : undefined;
-            settle(resolve)({ value: onSuccess(event), viaFallback: false, receipt });
-          } else settle(reject)(new Error(`${label} dispatch error`));
-          return;
-        }
-        // event.found === false: per polkadot-api's TxInBestBlocksNotFound, the
-        // tx is not currently in the best chain. The `isValid` flag distinguishes
-        // the two reasons:
-        //   isValid:true  → tx is still in the pool, not yet included (or
-        //                   reorged out and waiting to re-include). Normal pre-
-        //                   inclusion state — keep waiting.
-        //   isValid:false → tx has been rejected by the pool and will never
-        //                   include. Probe the best block (in case the chain
-        //                   actually included it but a peer disagrees) then
-        //                   reject so the retry loop can reissue with a fresh
-        //                   nonce. The previous code counted every isValid:true
-        //                   event as a "drop" and failed after 5, producing
-        //                   spurious `tx dropped from best chain 5 times`
-        //                   failures on slow blocks.
-        if (event.isValid === false) {
-          console.log(`      ${label}: tx rejected by pool (isValid:false), probing the best block...`);
-          if (await tryChainFallback()) return;
-          settle(reject)(new Error(`${label} tx rejected by pool (isValid:false)`));
-        }
+        // notInBestBlock means the tx is not in the best chain right now: still
+        // pooled, or reorged out and waiting to re-include. Either way keep
+        // waiting; a pool rejection arrives as InvalidTxError on `error` below.
+        if (event.type !== "inBestBlock") return;
+        if (event.ok) {
+          const receipt: ChainReceipt | undefined = event.block
+            ? { txHash: String(event.txHash), blockHash: String(event.block.hash), blockNumber: Number(event.block.number) }
+            : undefined;
+          settle(resolve)({ value: onSuccess(event), viaFallback: false, receipt });
+        } else settle(reject)(new Error(`${label} dispatch error`));
       },
-      error: (e: any) => {
+      error: async (e: any) => {
         const msg = e?.message || String(e).slice(0, 500);
-        settle(reject)(new Error(`${label} subscription error: ${friendlyChainError(msg)}`));
+        // Capture the InvalidTransaction variant off the untruncated `msg`
+        // now: this is the one place every chain-subscription error passes
+        // through before any downstream code bounds its length (#1256).
+        const variant = extractInvalidTransactionVariant(msg);
+        // papi reports every pool rejection as InvalidTxError, so narrow it to
+        // the variants the backstops were written for (#1672). A rejection can
+        // still have landed if a peer disagreed, so probe the best block first.
+        const poolRejected = e?.name === "InvalidTxError" && REISSUABLE_REJECTIONS.has(variant ?? "");
+        if (poolRejected) {
+          console.log(`      ${label}: tx rejected by pool, probing the best block...`);
+          if (await tryChainFallback()) return;
+        }
+        // Only the nonce-class variants get the "rejected by pool" wording.
+        // classifyErrorKind matches that phrase as nonce-stale ahead of its
+        // BadProof and AncientBirth rules, so using it for every variant would
+        // file those under the wrong kind.
+        const err: ChainError = new Error(variant === "Stale" || variant === "Future"
+          ? `${label} tx rejected by pool: ${friendlyChainError(msg)}`
+          : `${label} subscription error: ${friendlyChainError(msg)}`);
+        if (variant) err.chainErrorVariant = variant;
+        if (poolRejected) err.poolRejected = true;
+        settle(reject)(err);
       },
     });
   });
@@ -1257,7 +1278,7 @@ async function waitForChainLiveness(client: any, lastHeight: number | null, time
 export const __waitForChainLivenessForTest = waitForChainLiveness;
 
 // `opts.client` is a getter: the caller's client is reassigned on reconnect and destroyed on a WS halt.
-async function storeChunk(unsafeApi: any, signer: PolkadotSigner, chunkBytes: Uint8Array, nonce: number, opts: { client?: () => any } = {}): Promise<StoredChunk> {
+async function storeChunk(unsafeApi: any, signer: SignerTxCreator, chunkBytes: Uint8Array, nonce: number, opts: { client?: () => any } = {}): Promise<StoredChunk> {
   const cid = createCID(chunkBytes, CID_CONFIG.codec, CID_CONFIG.hashCode);
   const tx = unsafeApi.tx.TransactionStorage.store_with_cid_config({ cid: { codec: BigInt(CID_CONFIG.codec), hashing: toHashingEnum(CID_CONFIG.hashCode) }, data: chunkBytes });
   const txOpts = { mortality: { mortal: true, period: CHUNK_MORTALITY_PERIOD }, nonce };
@@ -1280,11 +1301,12 @@ export async function storeFile(
     hashCode = CID_CONFIG.hashCode,
   }: ExistingProvider & { hashCode?: number } = {},
 ): Promise<string> {
+  assertTxCreator(existingSigner, "ExistingProvider.signer");
   console.log(`\n   Size: ${(contentBytes.length / 1024).toFixed(2)} KB`);
   if (contentBytes.length > MAX_FILE_SIZE) throw new Error(`File exceeds 8MB limit. Use chunked deployment.`);
   const cid = createCID(contentBytes, CID_CONFIG.codec, hashCode);
   console.log(`   CID: ${cid.toString()}`);
-  let client: any, unsafeApi: any, signer: PolkadotSigner | undefined;
+  let client: any, unsafeApi: any, signer: SignerTxCreator | undefined;
   if (existingClient) {
     client = existingClient; unsafeApi = existingApi; signer = existingSigner;
   } else {
@@ -1341,12 +1363,13 @@ function assignDenseNonces(stored: (StoredChunk | null)[], startNonce: number): 
 export const __assignDenseNoncesForTest = assignDenseNonces;
 
 export async function storeChunkedContent(chunks: Uint8Array[], { client: existingClient, unsafeApi: existingApi, signer: existingSigner, ss58: existingSS58, reconnect, fetchNonce: fetchNonceOverride, skipCids, probeFailedCids, gateway: providerGateway, trustedCids, skipRootStore, handOffLiveClient }: ExistingProvider = {}): Promise<{ storageCid: string; tier2Verified: number; tier2Inconclusive: number; tier2Fallback: number; liveProvider: ExistingProvider; skipProbeResults: Map<string, true | false | null>; rootSkipped: boolean }> {
+  assertTxCreator(existingSigner, "ExistingProvider.signer");
   const _fetchNonce = fetchNonceOverride ?? fetchNonce;
   console.log(`\n   Data chunks: ${chunks.length}`);
   const totalBytes = chunks.reduce((s: number, c: Uint8Array) => s + c.length, 0);
   console.log(`   Total: ${(totalBytes / 1024).toFixed(2)} KB`);
 
-  let client: any, unsafeApi: any, signer: PolkadotSigner | undefined, ss58: string | undefined;
+  let client: any, unsafeApi: any, signer: SignerTxCreator | undefined, ss58: string | undefined;
   let ownsClient = false;
   if (existingClient) {
     client = existingClient; unsafeApi = existingApi; signer = existingSigner;
@@ -1435,6 +1458,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
   }
 
   let reconnectionsUsed = 0;
+  let chunkRetryCount = 0;
   // Sliding window of recovery-attempt timestamps (#216). Each chunk retry
   // and each reconnect appends; if more than RETRY_BUDGET_MAX_EVENTS land
   // within RETRY_BUDGET_WINDOW_MS, we bail to bound peak in-flight bytes
@@ -1464,9 +1488,10 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     recordRecoveryAndCheckBudget("reconnect");
     reconnectionsUsed++;
     setDeployAttribute("deploy.reconnects", reconnectionsUsed);
+    setDeployAttribute("deploy.reconnected", "true");
     const delay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, reconnectionsUsed - 1), RETRY_MAX_DELAY_MS);
     console.log(`\n   Connection lost, reconnecting to Bulletin in ${(delay / 1000).toFixed(0)}s (${reconnectionsUsed}/${MAX_RECONNECTIONS})...`);
-    captureWarning("WebSocket connection lost, reconnecting", { reconnection: reconnectionsUsed, maxReconnections: MAX_RECONNECTIONS });
+    noteWarning("WebSocket connection lost, reconnecting", { reconnection: reconnectionsUsed, maxReconnections: MAX_RECONNECTIONS });
     // Peak-during-reconnect answers whether destroyed clients release or pile.
     sampleMemory(`reconnect_${reconnectionsUsed}_before`);
     try { client.destroy(); } catch {}
@@ -1681,7 +1706,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
         // doReconnectAndRebase (not bare doReconnect): this guard runs *before*
         // the assignedNonces submission loop below, so a pool-account rotation
         // here must rebase assignedNonces to the new account's nonce base —
-        // else chunks submit with stale old-account nonces (isValid:false), which
+        // else chunks submit with stale old-account nonces, which
         // is not a connection error so the per-failure retry never reconnects and
         // the consumed-heuristic false-"includes" never-stored chunks (#32).
         // Return value unused: no in-flight chunks at the loop top, only the rebase matters.
@@ -1703,7 +1728,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
         const isRetry = uploadEmittedIndices.has(i);
         if (!isRetry) { uploadEmittedIndices.add(i); uploadEmitted++; }
         console.log(`   [${uploadEmitted}/${uploadTotal}] chunk ${i + 1} — ${(chunkData.length / 1024 / 1024).toFixed(2)} MB (nonce: ${nonce})${isRetry ? " (retry)" : ""}`);
-        return storeChunk(unsafeApi, signer as PolkadotSigner, chunkData, nonce, chunkOpts);
+        return storeChunk(unsafeApi, signer as SignerTxCreator, chunkData, nonce, chunkOpts);
       });
 
       const results = await Promise.allSettled(batchPromises);
@@ -1725,7 +1750,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
 
       // Reconnect only when the WebSocket subscription itself failed (the
       // observable's `error` channel fires for connection-level problems).
-      // Tx-level rejections (isValid:false from the pool, dispatch errors,
+      // Tx-level rejections (pool rejection, dispatch errors,
       // timeouts that fell back to nonce-advance) do NOT need a reconnect —
       // the WS is healthy, the retry path will reissue with a fresh nonce.
       const needsReconnect = failures.some(f => isConnectionError(f.error));
@@ -1759,7 +1784,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
         if (stored[fail.index] !== null) {
           continue;
         }
-        // isValid:false backstop: if the initial failure was a pool rejection AND
+        // Pool-rejection backstop: if the initial failure was a pool rejection AND
         // the chunk's CID was probe-failed (present:null), the chunk is probably
         // already on chain. Stop burning retries on a tx the chain will keep
         // rejecting, but "probably" is not evidence: it goes provisional and the
@@ -1768,19 +1793,23 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
         if (
           probeFailedCids &&
           probeFailedCids.has(failCid.toString()) &&
-          fail.error?.message?.includes("isValid:false")
+          fail.error?.poolRejected
         ) {
-          console.log(`   Chunk ${fail.index + 1}: isValid:false but CID was probe-failed — pending on-chain verification`);
-          captureWarning("isValid:false deferred to verification (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString() });
+          console.log(`   Chunk ${fail.index + 1}: pool-rejected but CID was probe-failed — pending on-chain verification`);
+          captureWarning("pool rejection deferred to verification (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString() });
           markProvisional(fail.index);
           continue;
         }
-        captureWarning("Chunk upload failed, retrying", { chunkIndex: fail.index + 1, maxRetries: MAX_CHUNK_RETRIES, error: fail.error?.message?.slice(0, 200) });
-        const isExpiryFailure = fail.error?.message?.includes("isValid:false");
+        chunkRetryCount++;
+        setDeployAttribute("deploy.chunk.retried", "true");
+        setDeployAttribute("deploy.chunk.retry_count", chunkRetryCount);
+        noteWarning("Chunk upload failed, retrying", { chunkIndex: fail.index + 1, maxRetries: MAX_CHUNK_RETRIES, error: fail.error?.message?.slice(0, 200) });
+        const isExpiryFailure = fail.error?.poolRejected === true;
         if (isExpiryFailure) {
-          console.log(`   Chunk ${fail.index + 1}: tx rejected (isValid:false), likely mortal era expiry — reissuing with fresh nonce`);
+          console.log(`   Chunk ${fail.index + 1}: tx rejected by pool, likely mortal era expiry — reissuing with fresh nonce`);
         }
         let retried = false;
+        let lastRetryError: Error | undefined;
         for (let attempt = 1; attempt <= MAX_CHUNK_RETRIES; attempt++) {
           recordRecoveryAndCheckBudget("chunk_retry");
           const retryDelay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), RETRY_MAX_DELAY_MS);
@@ -1843,7 +1872,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
               console.log(`   Chunk ${fail.index + 1}: chain still frozen at block ${heightBefore} after ${(CHUNK_LIVENESS_MAX_WAIT_MS / 1000).toFixed(0)}s wait — resubmitting anyway`);
             }
             const retryNonce = originalNonce ?? currentNonce;
-            const result = await storeChunk(unsafeApi, signer as PolkadotSigner, fail.chunkData, retryNonce, chunkOpts);
+            const result = await storeChunk(unsafeApi, signer as SignerTxCreator, fail.chunkData, retryNonce, chunkOpts);
             stored[fail.index] = result;
             if (result.viaFallback) nonceAdvanceIndices.add(fail.index);
             assignedNonces.delete(fail.index);
@@ -1853,20 +1882,21 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
             retried = true;
             break;
           } catch (e: any) {
-            // isValid:false backstop for retries: same logic as initial-failure path.
+            // Pool-rejection backstop for retries: same logic as initial-failure path.
             if (
               probeFailedCids &&
               probeFailedCids.has(failCid.toString()) &&
-              e?.message?.includes("isValid:false")
+              e?.poolRejected
             ) {
-              console.log(`   Chunk ${fail.index + 1}: retry isValid:false but CID was probe-failed — pending on-chain verification`);
-              captureWarning("isValid:false retry deferred to verification (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString(), attempt });
+              console.log(`   Chunk ${fail.index + 1}: retry pool-rejected but CID was probe-failed — pending on-chain verification`);
+              captureWarning("pool-rejection retry deferred to verification (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString(), attempt });
               markProvisional(fail.index);
               assignedNonces.delete(fail.index);
               retried = true;
               break;
             }
-            captureWarning("Chunk retry failed", { chunkIndex: fail.index + 1, attempt, maxRetries: MAX_CHUNK_RETRIES, error: e.message?.slice(0, 200) });
+            lastRetryError = e instanceof Error ? e : new Error(String(e));
+            noteWarning("Chunk retry failed", { chunkIndex: fail.index + 1, attempt, maxRetries: MAX_CHUNK_RETRIES, error: e.message?.slice(0, 200) });
             console.log(`   Retry ${attempt} failed: ${e.message?.slice(0, 80)}`);
             // If retry also failed with connection error, try reconnecting on next attempt
             if (isConnectionError(e) && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
@@ -1875,6 +1905,8 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           }
         }
         if (!retried) {
+          // Exhausted: the one event per chunk; per-attempt failures are breadcrumbs.
+          captureWarning("Chunk retry failed", { chunkIndex: fail.index + 1, attempts: MAX_CHUNK_RETRIES, error: (lastRetryError ?? fail.error)?.message?.slice(0, 200) });
           // When all reconnect slots are exhausted and the chunk failure is a
           // connection error, surface the root cause rather than wrapping it as
           // a chunk error (the reconnection budget, not the chunk, is the limit).
@@ -1913,7 +1945,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
             `txs but not including this chunk: check the account's pending queue and re-run the deploy.`,
           );
         }
-        captureWarning("nonce-advance collision: re-uploading missing chunks", {
+        noteWarning("nonce-advance collision: re-uploading missing chunks", {
           collision_count: missingResults.length,
         });
 
@@ -1932,7 +1964,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
             let freshNonce: number | undefined;
             try {
               freshNonce = await readChunkNonce();
-              const result = await storeChunk(unsafeApi, signer as PolkadotSigner, chunks[idx], freshNonce, chunkOpts);
+              const result = await storeChunk(unsafeApi, signer as SignerTxCreator, chunks[idx], freshNonce, chunkOpts);
               // A watch event in a best block is evidence; a probe-confirmed
               // result is re-verified next round.
               stored[idx] = result;
@@ -2053,7 +2085,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           if (classifyRootSubmitError(e, wsHaltDetected) === "nonce-collision") {
             // Not a connection loss (#1672): re-read the nonce and resubmit on the same client.
             console.log(`   Root node: nonce ${rootNonce} collided (${e.message?.replace(/\s+/g, " ").slice(0, 80)}), resubmitting at a fresh nonce (attempt ${rootAttempt}/${MAX_ROOT_RETRIES})`);
-            captureWarning("root-node nonce collision: resubmitting", { nonce: rootNonce, attempt: rootAttempt });
+            noteWarning("root-node nonce collision: resubmitting", { nonce: rootNonce, attempt: rootAttempt });
             await new Promise(r => setTimeout(r, nonceCollisionBackoffMs()));
             continue;
           }
@@ -2489,6 +2521,7 @@ export function resolveReproducibleTimestamp(source: string): string {
 }
 
 // ── Gateway pre-warm ───────────────────────────────────────────────────────
+const PREWARM_TIMEOUT_MS = 15_000;
 // Fire-and-forget HEAD requests for newly uploaded chunks so gateway caches
 // are warm before the first user hits the site. Errors are intentionally
 // swallowed — this is a best-effort optimisation only.
@@ -2496,7 +2529,8 @@ function preWarmGateway(chunkCids: string[], gateways: string[]): void {
   for (const cid of chunkCids) {
     for (const gw of gateways) {
       const url = `${gw.replace(/\/$/, "")}/ipfs/${cid}`;
-      fetch(url, { method: "HEAD" }).catch(() => {});
+      // #1675: bounded, so a hung gateway can't keep an in-process caller alive after deploy() returns.
+      fetch(url, { method: "HEAD", signal: AbortSignal.timeout(PREWARM_TIMEOUT_MS) }).catch(() => {});
     }
   }
 }
@@ -2545,7 +2579,7 @@ export function computePhaseACounts(
 // #1011: `submittedCount` (stored entries where !viaFallback) undercounts real
 // submissions — viaFallback is ALSO set for chunks that genuinely were submitted
 // this run via the nonce-advance heuristic, the timed-out-reconcile path, and the
-// isValid:false probe-failed backstop (none of those are "already on chain from
+// pool-rejection probe-failed backstop (none of those are "already on chain from
 // before this call"). `uploadTotal` is captured once, before the submission loop
 // starts, as the count of chunks NOT already resolved by the incremental-cache
 // pre-pass (trustedCids/skipCids) — i.e. the chunks this call actually drove
@@ -3024,7 +3058,7 @@ export async function storeDirectoryV2(
                   cid: { codec: BigInt(0x70), hashing: toHashingEnum(rootHashCode) },
                   data: rootDagBytes,
                 });
-                await watchTransaction(rootTx, phaseALiveProvider.signer as PolkadotSigner, { mortality: { mortal: true, period: 256 }, nonce: freshNonce }, () => storageCid, {
+                await watchTransaction(rootTx, phaseALiveProvider.signer as SignerTxCreator, { mortality: { mortal: true, period: 256 }, nonce: freshNonce }, () => storageCid, {
                   label: "root-reupload",
                   timeoutMs: CHUNK_TIMEOUT_MS,
                   confirmIncluded: () => cidPresentAtBest(phaseALiveProvider.client, storageCid),
@@ -3037,7 +3071,7 @@ export async function storeDirectoryV2(
                     `its bytes are not in phaseB.chunks (cannot re-upload). This indicates an internal state issue.`
                   );
                 }
-                await storeChunk(phaseALiveProvider.unsafeApi, phaseALiveProvider.signer as PolkadotSigner, chunkBytes, freshNonce, { client: () => phaseALiveProvider.client });
+                await storeChunk(phaseALiveProvider.unsafeApi, phaseALiveProvider.signer as SignerTxCreator, chunkBytes, freshNonce, { client: () => phaseALiveProvider.client });
               }
               reuploadCount++;
               console.log(`      [${i + 1}/${reuploadList.length}] re-uploaded ${cid.slice(0, 20)}… (nonce ${freshNonce})`);
@@ -3241,14 +3275,14 @@ export interface DeployOptions {
    */
   localSigner?: boolean;
   /** Pre-built signer — skips mnemonic derivation. Use for QR/mobile signing. */
-  signer?: PolkadotSigner;
+  signer?: SignerTxCreator;
   /** SS58 address for the signer (required when signer is provided). */
   signerAddress?: string;
   /**
    * Internal: `signer`/`signerAddress` were resolved from a phone-backed login
    * session (`resolveDeployActors`'s `actors.worker.source === "session"`), as
    * opposed to a local `--suri`/mnemonic-derived worker or a caller-injected
-   * `PolkadotSigner` (programmatic callers, e.g. playground-cli). Set by
+   * `SignerTxCreator` (programmatic callers, e.g. playground-cli). Set by
    * `deployActorsToSignerOptions`. Storage routing must not silently sign
    * Bulletin chunks with this signer when no allowance slot is available —
    * a session signer with no slot must route to pool instead. See bulletin #1452.
@@ -3256,7 +3290,7 @@ export interface DeployOptions {
   sessionSigner?: boolean;
   /** Slot-account signer for Bulletin chunk uploads. When set, used instead of pool/mnemonic
    *  for storage. DotNS still uses signer/signerAddress. */
-  storageSigner?: PolkadotSigner;
+  storageSigner?: SignerTxCreator;
   /** SS58 address of the slot account. Required when storageSigner is set. */
   storageSignerAddress?: string;
   /** Secret URI for dev signers (e.g. "//Alice" or a BIP-39 mnemonic). Passed to resolveSigner. */
@@ -3712,6 +3746,8 @@ export async function deploy(content: DeployContent, domainName: string | null =
     throw new NonRetryableError("Pass either a mnemonic or an external signer, not both — they identify the signing account and only one can win.");
   }
   bulletinNetwork = undefined; // bulletin #1362/#1095: reset per-deploy; set from the resolved env below
+  assertTxCreator(options.signer, "DeployOptions.signer");
+  assertTxCreator(options.storageSigner, "DeployOptions.storageSigner");
   // Product-name deploys resolve to an injected signer up front: the product
   // account derived from the mnemonic per RFC-0022 signs storage and DotNS
   // alike, so the deployed name is owned by the very account a host hands the
@@ -3734,6 +3770,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   let envContracts: Record<string, string> = {};
   let envNativeToEthRatio: bigint | undefined;
   let envRegisterStorageDeposit: bigint | undefined;
+  let envRecordStorageDeposit: bigint | undefined;
   let envPopSelfServe: PopSelfServeConfig | null = null;
   let envTld: string = DEFAULT_TLD;
   // Undefined-preserving twin of envTld: unlike envTld (defaulted to "dot"
@@ -3774,6 +3811,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       envContracts = resolved.contracts;
       envNativeToEthRatio = resolved.nativeToEthRatio;
       envRegisterStorageDeposit = resolved.registerStorageDeposit;
+      envRecordStorageDeposit = resolved.recordStorageDeposit;
       envTld = resolved.tld ?? DEFAULT_TLD;
       envConfiguredTld = resolved.tld;
       envPopSelfServe = getPopSelfServeConfig(doc, envId);
@@ -3923,7 +3961,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   }
 
   // Resolve user-owned slot-account signer for Bulletin storage (#19).
-  // Precedence: storageSigner (explicit, pre-built) > signer (external PolkadotSigner) >
+  // Precedence: storageSigner (explicit, pre-built) > signer (external SignerTxCreator) >
   //   mnemonic (direct) > session-derived slot (new, this block) > pool.
   //
   // resolveStorageSigner handles steps 3–4:
@@ -4051,6 +4089,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       const preflight = new DotNS();
       await preflight.connect({
         ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
+        recordStorageDeposit: envRecordStorageDeposit,
         // bulletin #1221: plannedAction isn't known until preflight() runs below, so
         // assume "register" (see AUTO_MAP_RENT_HEADROOM's doc comment in dotns.ts for the cost).
         autoMapTopUpTarget: topUpTargetFor("register", envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),
@@ -4368,6 +4407,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
           };
           await ownerDotns.connect({
             ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
+            recordStorageDeposit: envRecordStorageDeposit,
             // bulletin #1221: see autoMapPlannedActionFor's doc comment for why this uses the
             // real plannedAction rather than a hardcoded "register".
             autoMapTopUpTarget: topUpTargetFor(autoMapPlannedActionFor(dotnsPreflight), envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),
@@ -4386,6 +4426,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
         const dotns = new DotNS();
         await dotns.connect({
           ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
+          recordStorageDeposit: envRecordStorageDeposit,
           // bulletin #1221: see autoMapPlannedActionFor's doc comment for why this uses the
           // real plannedAction rather than a hardcoded "register".
           autoMapTopUpTarget: topUpTargetFor(autoMapPlannedActionFor(dotnsPreflight), envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),

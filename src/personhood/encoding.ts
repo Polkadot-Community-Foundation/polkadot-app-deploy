@@ -118,14 +118,18 @@ export const toHex = (bytes: Uint8Array): `0x${string}` => {
   return hex as `0x${string}`;
 };
 
-/** Convert a hex string (with or without 0x prefix) to Uint8Array. */
+/**
+ * Convert a hex string (with or without 0x prefix) to Uint8Array. Buffer.from
+ * stops at the first non-hex character and drops an odd trailing nibble, so
+ * validate first: a silently shortened proof context reaches the chain as a bad
+ * proof instead of failing here.
+ */
 export const hexToBytes = (hex: string): Uint8Array => {
-  const h = hex.startsWith("0x") ? hex.slice(2) : hex;
-  const out = new Uint8Array(h.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    out[i] = Number.parseInt(h.slice(i * 2, i * 2 + 2), 16);
+  const body = hex.startsWith("0x") ? hex.slice(2) : hex;
+  if (body.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(body)) {
+    throw new Error(`not a hex string: ${hex.length > 48 ? hex.slice(0, 48) + "..." : hex}`);
   }
-  return out;
+  return new Uint8Array(Buffer.from(body, "hex"));
 };
 
 /** Convert Uint8Array to a lowercase 0x-prefixed hex string. */
@@ -147,9 +151,10 @@ export interface ExtensionPipeline {
  * `required` extension: the highest extension version whose pipeline contains
  * it. Metadata before V16 has one pipeline, version 0.
  *
- * `metadata` is what papi passes to `signer.signTx`. papi itself only builds
- * pipeline 0, so its values can only be reused for extensions that pipeline 0
- * defines the same way; that is checked here.
+ * `metadata` is the runtime metadata papi builds the transaction against. papi
+ * encodes each extension from a single definition per identifier, so its values
+ * can only be reused for extensions that pipeline 0 defines the same way; that
+ * is checked here.
  */
 export const selectExtensionPipeline = async (
   metadata: Uint8Array,
@@ -231,9 +236,9 @@ export const selectExtensionPipeline = async (
 };
 
 /**
- * The values of `pipeline`'s extensions. Each comes from papi's capture, which
- * covers pipeline 0 with the custom entries applied; else from the caller's
- * custom entry; else from the extension's inactive encoding.
+ * The values of `pipeline`'s extensions. Each comes from papi's capture, with
+ * the custom entries applied; else from the caller's custom entry; else from
+ * the extension's inactive encoding.
  */
 export const fillExtensionValues = (
   pipeline: ExtensionPipeline,
@@ -262,4 +267,52 @@ export const encodeMembers = (members: Uint8Array[]): Uint8Array => {
     if (m.length !== 32) throw new Error("member key must be 32 bytes");
   }
   return concatBytes(compactEncode(members.length), ...members);
+};
+
+type PayloadExtension = { id: string; extra: string; additionalSigned: string };
+
+/**
+ * Index a papi v3 payload's extension array by identifier. A duplicate id keeps
+ * the first entry, which is what papi's own reader does (raw-tx-creator's
+ * getExtensionData uses `find`), so the extrinsic body and the signed payload
+ * stay in agreement.
+ */
+export const indexExtensions = (
+  extensions: PayloadExtension[],
+): Record<string, EncodedExtension> => {
+  const byIdentifier: Record<string, EncodedExtension> = {};
+  for (const ext of extensions) {
+    if (ext.id in byIdentifier) continue;
+    byIdentifier[ext.id] = {
+      value: hexToBytes(ext.extra),
+      additionalSigned: hexToBytes(ext.additionalSigned),
+    };
+  }
+  return byIdentifier;
+};
+
+/**
+ * Resolved extension bytes from a papi v3 `TxPayloadV1`, on the pipeline that
+ * contains `required`. The payload's own array order is undefined, so the
+ * pipeline order comes from metadata.
+ */
+let pipelineCache: { key: string; pipeline: ExtensionPipeline } | null = null;
+
+export const extensionValuesFromPayload = async (
+  payload: {
+    context: { metadata: string };
+    extensions: PayloadExtension[];
+  },
+  required: string,
+  customs: Record<string, { value: unknown; additionalSigned?: unknown }>,
+): Promise<ExtensionValues> => {
+  // Decoding the runtime metadata is the expensive part and each flow captures
+  // twice against the same chain, so keep the last decode.
+  // Key on a digest, not the hex itself: the metadata runs to megabytes and the
+  // cache would otherwise hold it for the life of the process.
+  const key = `${required}:${toHex(blake2b(new TextEncoder().encode(payload.context.metadata), { dkLen: 16 }))}`;
+  if (pipelineCache?.key !== key) {
+    pipelineCache = { key, pipeline: await selectExtensionPipeline(hexToBytes(payload.context.metadata), required) };
+  }
+  return fillExtensionValues(pipelineCache.pipeline, indexExtensions(payload.extensions), customs);
 };

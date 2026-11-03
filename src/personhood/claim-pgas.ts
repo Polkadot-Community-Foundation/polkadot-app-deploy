@@ -5,18 +5,16 @@
 // @ts-ignore — verifiablejs/nodejs DTS path differs from the types field
 import * as verifiable from "verifiablejs/nodejs";
 import { Enum } from "polkadot-api";
-import type { PolkadotClient, PolkadotSigner, SS58String } from "polkadot-api";
+import type { PolkadotClient, SS58String } from "polkadot-api";
 import {
   buildImplicationMessage,
   buildV5GeneralExtrinsic,
   bytesToHex,
   encodeMembers,
-  fillExtensionValues,
   hexToBytes,
-  selectExtensionPipeline,
   toHex,
-  type ExtensionValues,
 } from "./encoding.js";
+import { captureExtensions, type CapturedExtensions } from "./capture.js";
 import {
   AS_PGAS_IDENTIFIER,
   PEOPLE_MEMBER_IDENTIFIER_HEX,
@@ -68,7 +66,7 @@ type AhApi = {
 
 interface ClaimPgasTx {
   getEncodedData: () => Promise<Uint8Array>;
-  sign: (signer: PolkadotSigner, options: unknown) => Promise<string>;
+  create: (creator: unknown, options: unknown) => Promise<Uint8Array>;
 }
 
 type PeopleApi = {
@@ -467,39 +465,25 @@ const defaultValidateWithCommitment: ValidateWithCommitment = (
   return fn(ringExponent, proof, commitment, context, message);
 };
 
-interface CapturePass {
-  callData: Uint8Array;
-  extensions: ExtensionValues;
-}
-
 const capturePass = async (
   innerTx: ClaimPgasTx,
   asPgasValue: unknown,
-): Promise<CapturePass> => {
-  let captured: CapturePass | null = null;
-  const sentinel = new Error("__pgas_capture_sentinel__");
-  const customs = {
-    [AS_PGAS_IDENTIFIER]: {
-      value: asPgasValue,
-      additionalSigned: new Uint8Array(),
-    },
-  };
-  const signer: PolkadotSigner = {
-    publicKey: new Uint8Array(32),
-    signTx: async (callData, signedExtensions, metadata) => {
-      const pipeline = await selectExtensionPipeline(metadata, AS_PGAS_IDENTIFIER);
-      captured = { callData, extensions: fillExtensionValues(pipeline, signedExtensions, customs) };
-      throw sentinel;
-    },
-    signBytes: async () => new Uint8Array(64),
-  };
+): Promise<CapturedExtensions> => {
+  // Anything papi's enhancers throw (an extension this cannot fill, malformed
+  // metadata) arrives here untyped, so callers would lose `kind`.
+  let captured: CapturedExtensions | null;
   try {
-    await innerTx.sign(signer, {
+    captured = await captureExtensions(innerTx, {
       mortality: { mortal: false },
-      customSignedExtensions: customs,
-    });
-  } catch (err) {
-    if (err !== sentinel) throw err;
+      customSignedExtensions: {
+        AsPgas: {
+          value: asPgasValue,
+          additionalSigned: new Uint8Array(),
+        },
+      },
+    }, AS_PGAS_IDENTIFIER);
+  } catch (err: any) {
+    throw new PgasClaimError(`extension capture failed: ${err?.message ?? String(err)}`, { kind: "ClientError" });
   }
   if (captured === null) {
     throw new PgasClaimError("extension capture failed", { kind: "ClientError" });
@@ -554,7 +538,7 @@ const submitExtrinsic = (
           progress?.onBroadcasted?.();
           return;
         }
-        if (event.type === "txBestBlocksState" && event.found) {
+        if (event.type === "inBestBlock") {
           if (event.ok === false) {
             fail(
               new PgasClaimError("claim_pgas dispatched but failed in-block", {
