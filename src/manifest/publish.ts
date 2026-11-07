@@ -12,7 +12,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { PolkadotSigner } from "polkadot-api";
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
 import {
   BLAKE2B_256_MULTIHASH_CODE,
   encodeContenthash,
@@ -26,7 +26,7 @@ import {
   selectStorageReconnect,
   type DeployOptions,
 } from "../deploy.js";
-import { DotNS, DEFAULT_TLD, stripTldSuffix, parseDomainName, type OwnershipResult } from "../dotns.js";
+import { DotNS, assertTxCreator, DEFAULT_TLD, stripTldSuffix, parseDomainName, type OwnershipResult } from "../dotns.js";
 import { NonRetryableError } from "../errors.js";
 import {
   loadEnvironments,
@@ -37,7 +37,7 @@ import {
   type PopSelfServeConfig,
 } from "../environments.js";
 import { pessimisticSizePreflight } from "./byte-budget.js";
-import { composeExecutable, composeRoot } from "./compose.js";
+import { composeExecutable, composeRoot, selfListedKeys } from "./compose.js";
 import type { LoadedProductConfig } from "./config-load.js";
 import { verifyEmbeddedAppManifests } from "./product-preflight.js";
 
@@ -73,7 +73,7 @@ export interface PublishManifestOptions {
    * while the content it belongs to went to the user's slot, and on a chain whose pool holds
    * no quota the manifest would be the only part that fails.
    */
-  storageSigner?: PolkadotSigner;
+  storageSigner?: SignerTxCreator;
   /** SS58 address of the slot account. Required when storageSigner is set. */
   storageSignerAddress?: string;
 }
@@ -93,6 +93,7 @@ export interface PublishManifestResult {
  * content resolver before any `setText`.
  */
 export async function publishManifest(opts: PublishManifestOptions): Promise<PublishManifestResult> {
+  assertTxCreator(opts.storageSigner, "PublishManifestOptions.storageSigner");
   const { config, sourcePath } = opts.loaded;
   // #1156/#1572: domain reconciliation happens below, once envTld is known —
   // see reconcileManifestDomain. The check that used to live here compared
@@ -210,6 +211,12 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
 
     const rootManifest = composeRoot(config, iconCid);
     const rootJson = JSON.stringify(rootManifest);
+    for (const key of selfListedKeys(config)) {
+      console.log(`  ⚠ trustedProducts: dropped '${key}', the product's own label. The host ignores a product listing itself.`);
+    }
+    if (rootManifest.trustedProducts) {
+      console.log(`  trustedProducts: ${JSON.stringify(rootManifest.trustedProducts)}`);
+    }
     console.log(
       `  Ensuring resolver + writing root manifest text record on ${config.domain} (${Buffer.byteLength(rootJson, "utf8")} B)…`,
     );
@@ -336,7 +343,7 @@ async function connectDotNS(
   );
 
   const dotns = new DotNS();
-  await dotns.connect(connectOpts);
+  await dotns.connect({ ...connectOpts, recordStorageDeposit: resolved.recordStorageDeposit });
   return dotns;
 }
 

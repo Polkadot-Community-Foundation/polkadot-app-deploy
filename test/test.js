@@ -5,8 +5,8 @@ import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
 import { setupIsolatedHome } from "./helpers/isolated-home.js";
 // Personhood bootstrap imports (loaded after build)
 import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow, shortNamesClosedReason, soulboundTransferReason } from "../dist/dotns.js";
-import { getAdapter } from "../dist/dotns-protocol.js";
-import { concatBytes, compactEncode, blake2_256, encodeMembers, bytesToHex, hexToBytes } from "../dist/personhood/encoding.js";
+import { getAdapter, HIGHEST_VERIFIED_DOTNS_RELEASE } from "../dist/dotns-protocol.js";
+import { concatBytes, compactEncode, blake2_256, encodeMembers, bytesToHex, hexToBytes, indexExtensions, fillExtensionValues } from "../dist/personhood/encoding.js";
 import { deriveMemberEntropy } from "../dist/personhood/member-key.js";
 import { probeBootstrapState, nextBootstrapAction, runBootstrap } from "../dist/personhood/bootstrap.js";
 import { reproveAliasToAccount } from "../dist/personhood/reprove.js";
@@ -26,11 +26,11 @@ import { createRequire } from "node:module";
 // `node`), so it's loaded here via createRequire rather than converted to
 // ESM just for this test file.
 const require = createRequire(import.meta.url);
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, readBoundedChunkNonce, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, InsufficientFundsError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, readBoundedChunkNonce, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
 import { subnameNestingLevels } from "../dist/subname-depth.js";
 import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError, DEFAULT_TLD } from "../dist/dotns.js";
-import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
+import { captureWarning, noteWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
   isTelemetryDisabled, scrubPaths, truncateAddress, sanitizeBranch,
@@ -60,7 +60,9 @@ import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLoca
 import { computeStats, telemetryAttributes, renderSummary } from "../dist/incremental-stats.js";
 import { buildFilesMap, detectFramework, applyManifestFetchAttributes, usesIncrementalCache, computePhaseACounts, formatUploadInclusionLine } from "../dist/deploy.js";
 import { buildFixture, fixtureFiles } from "./helpers/e2e-incremental-fixture.js";
-import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag, registerOrConverge, registerOrConvergeChecked, buildBase8TwoDigitLabel, buildOneTrailingDigitLabel } from "./e2e.test.js";
+import { directSignerArgsFor, probeDerivationPathFor, pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag, registerOrConverge, registerOrConvergeChecked, buildBase8TwoDigitLabel, buildOneTrailingDigitLabel } from "./e2e.test.js";
+import { SIGNERS as BALANCE_SIGNERS } from "../tools/check-balances.mjs";
+import { NON_GATING_LABELS } from "../tools/check-env-readiness.mjs";
 import * as nodeCrypto from "node:crypto";
 import { CarReader } from "@ipld/car/reader";
 import * as dagPb from "@ipld/dag-pb";
@@ -1326,7 +1328,7 @@ describe("signAndSubmitWithRetry non-TTY safety (issue 3)", () => {
   function makeStubWrapper({ throwOnce, resolveAfterThrow = false } = {}) {
     let calls = 0;
     return {
-      client: { tx: { Revive: { map_account: () => ({ signSubmitAndWatch: () => ({ subscribe: () => {} }) }) } } },
+      client: { tx: { Revive: { map_account: () => ({ createSubmitAndWatch: () => ({ subscribe: () => {} }) }) } } },
       checkIfAccountMapped: async () => true,
       ensureAccountMapped: async () => {},
       signAndSubmitExtrinsic: async function(_extrinsic, _signer, statusCallback, _opts) {
@@ -1792,7 +1794,26 @@ describe("classifyErrorKind", () => {
   });
 
   test("nonce-stale: tx rejected by pool", () => {
-    assert.strictEqual(classifyErrorKind("commit tx rejected by pool (isValid:false)"), "nonce-stale");
+    assert.strictEqual(classifyErrorKind('commit tx rejected by pool: {"type":"Invalid","value":{"type":"Stale"}}'), "nonce-stale",
+      ">> FAIL: classifyErrorKind: a pool rejection carrying the Stale variant was not filed as nonce-stale, so the retry loop reissues at the same nonce instead of a fresh one");
+  });
+
+  // papi v3 delivers every invalid-transaction reason as InvalidTxError on the
+  // subscription's error channel, where v2 only sent nonce rejections that way.
+  // The "tx rejected by pool" phrase above is matched ahead of the BadProof and
+  // AncientBirth rules, so deploy.ts only uses it for the nonce-class variants.
+  test("chain.bad_proof: a BadProof rejection is not filed as nonce-stale", () => {
+    assert.strictEqual(
+      classifyErrorKind('store subscription error: {"type":"Invalid","value":{"type":"BadProof"}}'),
+      "chain.bad_proof",
+      '>> FAIL: telemetry: a BadProof rejection classified as something else, so signature failures would be counted as nonce collisions');
+  });
+
+  test("chain.extrinsic_expired: an AncientBirthBlock rejection is not filed as nonce-stale", () => {
+    assert.strictEqual(
+      classifyErrorKind('store subscription error: {"type":"Invalid","value":{"type":"AncientBirthBlock"}}'),
+      "chain.extrinsic_expired",
+      '>> FAIL: telemetry: an expired-extrinsic rejection classified as something else, so mortality expiry would be counted as a nonce collision');
   });
 
   test("connection: WebSocket closed", () => {
@@ -2388,21 +2409,57 @@ describe("createSessionSigner (vendored)", () => {
     };
   }
 
-  test("signTx never routes through signPayload (anti-regression: message-too-big)", async () => {
+  /** Smallest papi v3 TxPayloadV1 that reaches the signer's metadata decode. */
+  const fakeTxPayload = () => ({
+    version: 1,
+    signer: null,
+    callData: "0x" + "01".repeat(300),
+    extensions: [],
+    txExtVersion: null,
+    context: {
+      metadata: "0x",
+      token: null,
+      bestBlockHeight: 0,
+      bestBlockHash: "0x" + "00".repeat(32),
+      genesisHash: "0x" + "00".repeat(32),
+    },
+  });
+
+  test("creating a tx never routes through signPayload (anti-regression: message-too-big)", async () => {
     // Core regression guard: the old PJS-based path called session.signPayload,
     // sending the full 2 MB chunk calldata as the 'method' field. Android rejects
-    // that with "message too big". signTx goes through session.createTransaction
-    // and must never call signPayload. Empty metadata makes signTx throw before
-    // it sends anything, which is enough to check signPayload stays unused.
+    // that with "message too big". Tx creation goes through
+    // session.createTransaction and must never call signPayload. Empty metadata
+    // makes it throw before it sends anything, which is enough to check
+    // signPayload stays unused.
     const { createSessionSigner } = await import("../dist/auth/vendor/index.js");
     const session = await makeStubSession();
     const signer = await createSessionSigner(session, { productId: "test", derivationIndex: 0 }, subtreeOptions);
 
+    let threw = false;
     try {
-      await signer.signTx(new Uint8Array(300), {}, new Uint8Array(0), 0);
-    } catch { /* expected — decAnyMetadata throws on empty metadata bytes */ }
+      await signer(fakeTxPayload(), {}, {}, false);
+    } catch { threw = true; /* expected — decAnyMetadata throws on empty metadata */ }
 
-    assert.strictEqual(session.captured.signPayload.length, 0, "signPayload must never be called");
+    assert.ok(threw,
+      ">> FAIL: session signer: creating a tx with empty metadata resolved instead of throwing, so the metadata decode no longer rejects a payload it cannot read");
+    assert.strictEqual(session.captured.signPayload.length, 0,
+      ">> FAIL: session signer: signPayload was called while building a tx, which sends the whole chunk calldata as the method field and Android rejects it as message-too-big");
+  });
+
+  test("tx creation is wired to createTransaction, never signPayload", () => {
+    // The assertion above stops at the metadata decode, which throws before the
+    // signer picks a call, so it cannot see a regression past that point. The
+    // choice belongs to the SDK and a payload this suite can build without real
+    // chain metadata never reaches it, so check the wiring directly.
+    const sdk = fs.readFileSync("node_modules/@parity/product-sdk-terminal/dist/index.js", "utf-8");
+    assert.match(sdk, /session\.createTransaction\(/,
+      ">> FAIL: session signer: the SDK no longer calls session.createTransaction, so tx creation moved to a path this guard does not cover");
+    assert.ok(!/session\.signPayload\b/.test(sdk),
+      ">> FAIL: session signer: the SDK calls session.signPayload again, which sends the whole chunk calldata as the method field and Android rejects it as message-too-big");
+    const vendored = fs.readFileSync("src/auth/vendor/sessionSigner.ts", "utf-8");
+    assert.ok(!/signPayload/.test(vendored),
+      ">> FAIL: session signer: the vendored wrapper references signPayload, which is the message-too-big path the SDK migration removed");
   });
 
   test("signBytes routes through signRaw with Bytes tag", async () => {
@@ -2472,9 +2529,12 @@ describe("storage-signer", async () => {
     const dir = mkdtempSync(pathJoin(tmpdir(), "bd-slot-test-"));
     writeCache(dir, "dot-cli", FAKE_KEY_HEX);
     const result = await readBulletinSlotSigner("dot-cli", dir);
-    assert.ok(result !== null, "should find the key");
-    assert.ok(typeof result.ss58 === "string" && result.ss58.length > 0);
-    assert.ok(result.signer && typeof result.signer.signTx === "function");
+    assert.ok(result !== null,
+      ">> FAIL: readBulletinSlotSigner: a cached slot key was not found, so the deploy falls back to the shared pool instead of the login session's own slot");
+    assert.ok(typeof result.ss58 === "string" && result.ss58.length > 0,
+      ">> FAIL: readBulletinSlotSigner: the slot signer carries no ss58 address, so the caller cannot read its nonce or allowance");
+    assert.ok(result.signer && typeof result.signer === "function" && typeof result.signer.signBytes === "function",
+      ">> FAIL: readBulletinSlotSigner: the slot signer is not a callable papi v3 TxCreator with signBytes, so every submission through it throws inside papi");
   });
 
   test("readBulletinSlotSigner returns null for corrupt JSON", async () => {
@@ -2557,6 +2617,29 @@ describe("sanitizeErrorMessage", () => {
 // 8d. deploy.error_kind / deploy.error_message propagation via withSpan
 // ---------------------------------------------------------------------------
 describe("withSpan error attribute propagation", () => {
+  test("typed InsufficientFundsError sets funding.insufficient_balance without prose matching", async () => {
+    const span = {
+      attrs: new Map(),
+      setAttribute(key, value) { this.attrs.set(key, value); },
+      setStatus() {},
+    };
+    const stub = {
+      startSpan: async (_options, fn) => fn(span),
+    };
+    const previous = __setSentryForTest(stub);
+    try {
+      await assert.rejects(
+        () => withSpan("test", "typed funding", {}, async () => {
+          throw new InsufficientFundsError("opaque gate refusal");
+        }),
+        InsufficientFundsError,
+      );
+      assert.strictEqual(span.attrs.get("deploy.error_kind"), "funding.insufficient_balance");
+    } finally {
+      __setSentryForTest(previous);
+    }
+  });
+
   test("source: withSpan catch sets deploy.error_kind on the span", () => {
     const src = fs.readFileSync("src/telemetry.ts", "utf-8");
     assert.ok(
@@ -3419,9 +3502,12 @@ describe("getDeployAttributes seed completeness (issue #497)", () => {
     "deploy.expected": "false",
     // rpc
     "deploy.rpc.failed_over": "false",
+    "deploy.chunk.retried": "false",
+    "deploy.reconnected": "false",
     // dotns
     "deploy.dotns.signer_below_floor": "false",
     "deploy.dotns.toppedup": "false",
+    "deploy.dotns.commitment_resumed": "false",
     "deploy.dotns.tx_resolution_kind": "hash",
     "deploy.dotns_backend": "contract",
     "deploy.dotns_pop_source": "personhood-precompile",
@@ -4094,6 +4180,181 @@ describe("DotNS initial state", () => {
     );
 
     assert.strictEqual(submitOptions.contracts, d["_contracts"]);
+  });
+
+  // #1518: ReviveClientWrapper (not DotNS) is the object that actually declares
+  // storage_deposit_limit on every Revive.call it dry-runs (dryRunReviveCall, called
+  // from submitTransaction/submitBatchedTransactions — the path finalizeRegistration/
+  // commit/setContenthash submit through). Before this fix it had NO way to learn the
+  // per-env/measured floor at all: it always used the module's hardcoded default, so a
+  // per-env registerStorageDeposit override moved the PREFLIGHT gate but left the REAL
+  // submitted extrinsic's declared limit unchanged — the exact failure mode #1518 warns
+  // against (preflight clears a lower balance, the real call still demands the old,
+  // higher amount mid-deploy). setStorageDepositFloors is DotNS.recreateReviveClient's
+  // one wiring point (the only place a wrapper is ever constructed) — these tests go
+  // straight at the wrapper, the actual owner of the value, rather than at a threaded
+  // parameter that a future call site could add without remembering to pass it.
+  describe("ReviveClientWrapper storage-deposit floor (#1518)", () => {
+    test("setStorageDepositFloors changes the limit dryRunReviveCall declares", async () => {
+      const { ReviveClientWrapper } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      w.estimateGasForCall = async () => ({ success: true, gasRequired: { referenceTime: 1n, proofSize: 1n }, storageDeposit: 0n });
+      w.setStorageDepositFloors({ register: 12_345_000_000n, record: 1n }); // a distinctive, obviously-not-the-default value
+      const prep = await w["dryRunReviveCall"]("0xContract", 0n, "0x", "5Signer", {});
+      assert.strictEqual(prep.storage_deposit_limit, 12_345_000_000n,
+        ">> FAIL: ReviveClientWrapper.setStorageDepositFloors: dryRunReviveCall must declare the floor set via setStorageDepositFloors, not a hardcoded default");
+    });
+
+    test("a wrapper nobody configured still declares the measured module default (fail closed)", async () => {
+      const { ReviveClientWrapper, MINIMUM_REGISTER_STORAGE_DEPOSIT } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({}); // setStorageDepositFloors never called
+      w.estimateGasForCall = async () => ({ success: true, gasRequired: { referenceTime: 1n, proofSize: 1n }, storageDeposit: 0n });
+      const prep = await w["dryRunReviveCall"]("0xContract", 0n, "0x", "5Signer", {});
+      assert.strictEqual(prep.storage_deposit_limit, MINIMUM_REGISTER_STORAGE_DEPOSIT,
+        ">> FAIL: ReviveClientWrapper unconfigured floor: must fall back to the measured module constant, never undefined/0");
+    });
+
+    test("submitBatchedTransactions gives known record writes the measured record floor", async () => {
+      const { ReviveClientWrapper, MINIMUM_RECORD_STORAGE_DEPOSIT } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      w.ensureAccountMapped = async () => {};
+      w.estimateGasForCall = async () => ({ success: true, gasRequired: { referenceTime: 1n, proofSize: 1n }, storageDeposit: 0n });
+      const captured = [];
+      w.client = {
+        tx: {
+          Revive: { call: (args) => { captured.push(args); return { decodedCall: {} }; } },
+          Utility: { batch_all: () => ({}) },
+        },
+      };
+      let fundingGate;
+      w.signAndSubmitWithRetry = async (buildExtrinsic, _signer, _cb, _label, opts) => {
+        buildExtrinsic();
+        fundingGate = opts?.fundingGate;
+        return { kind: "hash", hash: "0xbatch" };
+      };
+
+      await w.submitBatchedTransactions([
+        { contractAddress: "0xText", value: 0n, encodedData: "0x", functionName: "setText", depositPolicy: "record", args: [] },
+        { contractAddress: "0xContent", value: 0n, encodedData: "0x", functionName: "setContenthash", depositPolicy: "record", args: [] },
+      ], "5Signer", {}, () => {});
+
+      assert.deepStrictEqual(fundingGate, {
+        operation: "Utility.batch_all",
+        storageDepositLimit: MINIMUM_RECORD_STORAGE_DEPOSIT,
+        value: 0n,
+      }, ">> FAIL: submitBatchedTransactions must gate one shared floor plus other calls' buffered estimates, not multiply the floor by batch length");
+      assert.strictEqual(captured.length, 2);
+      for (const call of captured) {
+        assert.strictEqual(call.storage_deposit_limit, MINIMUM_RECORD_STORAGE_DEPOSIT,
+          ">> FAIL: every Revive.call inside submitBatchedTransactions must receive the per-call record floor");
+      }
+    });
+
+    const GATE_ARGS = { operation: "Revive.call", storageDepositLimit: 1n, value: 0n };
+
+    test("signAndSubmitWithRetry runs the funding gate on every attempt", async () => {
+      const { ReviveClientWrapper } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      const order = [];
+      let attempts = 0;
+      w.signAndSubmitExtrinsic = async () => {
+        order.push(`sign${++attempts}`);
+        if (attempts === 1) throw new Error("socket closed");
+        return { kind: "hash", hash: "0xok" };
+      };
+      w.setSubmissionFundingGate(async () => { order.push("gate"); });
+      const res = await w.signAndSubmitWithRetry(() => ({}), {}, () => {}, "Revive.call", { fundingGate: GATE_ARGS });
+      assert.strictEqual(res.hash, "0xok");
+      assert.deepStrictEqual(order, ["gate", "sign1", "gate", "sign2"],
+        ">> FAIL: #1706: a re-sign submitted without re-reading the balance, so a signer drained by a concurrent deploy stays underfunded for every remaining attempt");
+    });
+
+    test("signAndSubmitWithRetry gates once when the first attempt lands", async () => {
+      const { ReviveClientWrapper } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      let gateCalls = 0;
+      w.signAndSubmitExtrinsic = async () => ({ kind: "hash", hash: "0xok" });
+      w.setSubmissionFundingGate(async () => { gateCalls++; });
+      await w.signAndSubmitWithRetry(() => ({}), {}, () => {}, "Revive.call", { fundingGate: GATE_ARGS });
+      assert.strictEqual(gateCalls, 1,
+        ">> FAIL: #1706: the gate must run once per attempt, and a landed first attempt is exactly one");
+    });
+
+    test("a signer drained mid-flight is topped up and retried, not aborted", async () => {
+      const { ReviveClientWrapper } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      let attempts = 0;
+      let toppedUp = false;
+      w.signAndSubmitExtrinsic = async () => {
+        if (++attempts === 1) throw new Error('dispatch error {"type":"TransferFailed"}');
+        return { kind: "hash", hash: "0xok" };
+      };
+      w.setSubmissionFundingGate(async () => { toppedUp = true; });
+      const res = await w.signAndSubmitWithRetry(() => ({}), {}, () => {}, "Revive.call", { fundingGate: GATE_ARGS });
+      assert.strictEqual(res.hash, "0xok",
+        ">> FAIL: #1706: TransferFailed aborted instead of retrying, so a deploy that lost a funding race fails where a top-up and one more attempt would have landed it");
+      assert.ok(toppedUp, ">> FAIL: #1706: the drained signer was retried without topping it back up, so the second attempt is short by the same amount");
+    });
+
+    test("a drain that outlives every attempt names concurrency in the error", async () => {
+      const { ReviveClientWrapper, DOTNS_TX_MAX_ATTEMPTS } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      let attempts = 0;
+      w.setSubmissionFundingGate(async () => {});
+      w.signAndSubmitExtrinsic = async () => {
+        attempts++;
+        throw new Error('dispatch error {"type":"TransferFailed"}');
+      };
+      await assert.rejects(
+        () => w.signAndSubmitWithRetry(() => ({}), {}, () => {}, "Revive.call", { fundingGate: GATE_ARGS }),
+        (e) => {
+          assert.match(e.message, /sharing this signer/,
+            ">> FAIL: #1706: a bare TransferFailed gives the reader nothing to act on, and a shared signer is its most common cause");
+          return true;
+        },
+      );
+      assert.strictEqual(attempts, DOTNS_TX_MAX_ATTEMPTS,
+        `>> FAIL: #1706: a drained signer must use every attempt before giving up, got ${attempts}`);
+    });
+
+    test("every submission path hands its funding-gate args to the retry loop", () => {
+      const src = fs.readFileSync("src/dotns.ts", "utf-8");
+      const submits = src.split("\n").filter((line) => /signAndSubmitWithRetry\(/.test(line) && !/async signAndSubmitWithRetry/.test(line));
+      // map_account and the auto-map trigger carry no storage deposit, so they
+      // have no gate to re-run.
+      const funded = submits.filter((line) => !/map_account|^\s*await this\.clientWrapper\.signAndSubmitWithRetry\($/.test(line));
+      for (const line of funded) {
+        assert.match(line, /fundingGate/,
+          `>> FAIL: #1706: a submission retries without re-reading the balance, so a signer drained by a concurrent deploy stays underfunded: ${line.trim()}`);
+      }
+      assert.ok(funded.length >= 2, `>> FAIL: #1706: expected the Revive.call and batch submission sites, found ${funded.length}`);
+    });
+
+    // recreateReviveClient constructs the only ReviveClientWrapper a DotNS instance
+    // ever holds — asserting it applies this._registerStorageDeposit right after
+    // construction is what closes the "future call site forgets to thread it" gap:
+    // every dry-run path through this.clientWrapper picks the floor up automatically.
+    for (const { label, field, wrapperField, value, expected } of [
+      { label: "register", field: "_registerStorageDeposit", wrapperField: "_storageDepositFloor", value: 98_765_000_000n, expected: 98_765_000_000n },
+      { label: "record", field: "_recordStorageDeposit", wrapperField: "_recordStorageDepositFloor", value: 12_345_000_000n, expected: 12_345_000_000n },
+      // The record floor is resolved against the registration floor once, in DotNS.
+      { label: "record (capped at a lower registration floor)", field: "_recordStorageDeposit", wrapperField: "_recordStorageDepositFloor", value: 2n ** 62n, expected: "register" },
+    ]) {
+      test(`DotNS.recreateReviveClient applies the ${label} floor to the new wrapper`, () => {
+        const d = new DotNS();
+        d[field] = value;
+        d["recreateReviveClient"]("wss://invalid.invalid.test"); // never awaited/connected — only the synchronous wiring is under test
+        assert.strictEqual(d.clientWrapper[wrapperField], expected === "register" ? d["_registerStorageDeposit"] : expected,
+          `>> FAIL: recreateReviveClient wiring (${label}): the freshly constructed wrapper must receive the configured floor immediately, not stay on the class default`);
+        d.client?.destroy?.();
+      });
+    }
+
+    test("a DotNS nobody configured defaults the record floor to MINIMUM_RECORD_STORAGE_DEPOSIT", async () => {
+      const { MINIMUM_RECORD_STORAGE_DEPOSIT } = await import("../dist/dotns.js");
+      assert.strictEqual(new DotNS()["_recordStorageDeposit"], MINIMUM_RECORD_STORAGE_DEPOSIT,
+        ">> FAIL: an unconfigured DotNS must default to the measured record floor");
+    });
   });
 
   test("getUserPopStatus surfaces Personhood precompile read failures", async () => {
@@ -5578,10 +5839,10 @@ describe("detectProtocolVersion reads the declared DotNS release", () => {
   }
 
   test("a declared release is reported alongside the profile, without warning at the verified ceiling", async () => {
-    const d = makeDotNS({ declared: "0.8.0" });
+    const d = makeDotNS({ declared: HIGHEST_VERIFIED_DOTNS_RELEASE });
     const logs = await captureLogs(() => d["detectProtocolVersion"]());
     assert.equal(d["_protocolVersion"], "v0.6.0");
-    assert.match(logs, /declares DotNS 0\.8\.0/, ">> FAIL: the declared release is the only signal that a generation rollout happened — the profile alone cannot show it");
+    assert.match(logs, new RegExp(`declares DotNS ${HIGHEST_VERIFIED_DOTNS_RELEASE.replaceAll(".", "\\.")}`), ">> FAIL: the declared release is the only signal that a generation rollout happened — the profile alone cannot show it");
     assert.doesNotMatch(logs, /WARNING/, ">> FAIL: warning on the newest verified release would train everyone to ignore it");
   });
 
@@ -5593,7 +5854,8 @@ describe("detectProtocolVersion reads the declared DotNS release", () => {
   });
 
   test("a release newer than anything diffed against this client warns", async () => {
-    const d = makeDotNS({ declared: "0.9.0" });
+    const [major, minor, patch] = HIGHEST_VERIFIED_DOTNS_RELEASE.split(".").map(Number);
+    const d = makeDotNS({ declared: `${major}.${minor}.${patch + 1}` });
     const logs = await captureLogs(() => d["detectProtocolVersion"]());
     assert.equal(d["_protocolVersion"], "v0.6.0", ">> FAIL: still deploy — refusing an unknown generation would strand every user the day dotns tags one");
     assert.match(logs, /WARNING/, ">> FAIL: an undiffed generation must be loud; this warning is what v0.7.0 and v0.8.0 were missing");
@@ -6364,19 +6626,58 @@ describe("DotNS.preflight", () => {
     assert.match(r.reason ?? "", /Top up the signer/);
   });
 
-  test("already-owned-by-us uses the lower setContenthash floor (0.01 PAS)", async () => {
-    // 0.05 PAS — above the OWNED floor (0.01) but below the REGISTER floor (0.10).
-    // For an owned label, this should clear without top-up.
+  test("already-owned-by-us keeps the lightweight preflight floor; actual submissions apply their dry-run storage limit", async () => {
     const d = stubDotns({
       checkOwnership: ownedByUs,
       isTestnet: true,
       signerFreeBalance: 500_000_000n,
-      attemptTestnetTopUp: async () => { throw new Error("must not be called"); },
+      attemptTestnetTopUp: async () => { throw new Error("must not be called before an actual submission"); },
     });
     const r = await d.preflight("e2epool00");
     assert.strictEqual(r.canProceed, true);
     assert.strictEqual(r.plannedAction, "already-owned-by-us");
-    assert.strictEqual(r.feeFloor, 100_000_000n); // 0.01 PAS
+    assert.strictEqual(r.feeFloor, 100_000_000n);
+  });
+
+  test("per-submission funding gate uses the dry-run storage limit, tops up on testnet, and fails closed on mainnet", async () => {
+    const testnet = new DotNS();
+    testnet.connected = true;
+    testnet.substrateAddress = "5Signer";
+    testnet.readFreeBalance = async () => 130_000_000n;
+    testnet.isTestnet = async () => true;
+    let toppedUpTo = 0n;
+    testnet.attemptTestnetTopUp = async (_recipient, targetAmount) => {
+      toppedUpTo = targetAmount;
+      return { source: "Bob", transferred: targetAmount };
+    };
+    await testnet["ensureSubmissionFunding"]("setText", 50_000_000_000n);
+    assert.strictEqual(toppedUpTo, 55_000_000_000n,
+      ">> FAIL: submission gate target must include that transaction's declared storage limit plus refill headroom");
+
+    const mainnet = new DotNS();
+    mainnet.connected = true;
+    mainnet.substrateAddress = "5MainnetSigner";
+    mainnet.readFreeBalance = async () => 130_000_000n;
+    mainnet.isTestnet = async () => false;
+    mainnet.attemptTestnetTopUp = async () => assert.fail("mainnet must never auto-top-up");
+    const error = await mainnet["ensureSubmissionFunding"]("setContenthash", 50_000_000_000n)
+      .then(() => null, (cause) => cause);
+    assert.ok(error instanceof InsufficientFundsError,
+      ">> FAIL: an actual underfunded submission must throw the typed funding error");
+    assert.match(error.message, /needs ≥5\.0100 PAS for setContenthash.*Top up the signer's balance/i);
+  });
+
+  test("unrelated Payment and bare-0x errors retain their original mechanism", () => {
+    assert.strictEqual(
+      classifyErrorKind('{"type":"Invalid","value":{"type":"Payment"}}'),
+      "chain.tx_invalid",
+      ">> FAIL: DotNS must not globally relabel Payment as signer funding",
+    );
+    assert.strictEqual(
+      classifyErrorKind("Contract execution would revert during setText\nrevert: flags=1 data=0x"),
+      "contract-revert",
+      ">> FAIL: a resolver/permission bare revert must retain contract-revert classification",
+    );
   });
 
   // -----------------------------------------------------------------
@@ -6514,7 +6815,7 @@ describe("DotNS.preflight", () => {
   function makeSubmitTransferHarness() {
     let observerCb = null;
     const tx = {
-      signSubmitAndWatch: () => ({
+      createSubmitAndWatch: () => ({
         subscribe: (cb) => {
           observerCb = cb;
           return { unsubscribe: () => {} };
@@ -6537,7 +6838,7 @@ describe("DotNS.preflight", () => {
     let resolved = false;
     promise.then(() => { resolved = true; }, () => { resolved = true; });
 
-    emit({ type: "txBestBlocksState", found: true, ok: true });
+    emit({ type: "inBestBlock", ok: true });
     // Yield twice to let any erroneous resolution flush.
     await Promise.resolve(); await Promise.resolve();
     assert.strictEqual(resolved, false, "must keep waiting for finalization");
@@ -6549,14 +6850,14 @@ describe("DotNS.preflight", () => {
   test("submitTransfer: rejects on best-block ok=false (dispatch error)", async () => {
     const { d, emit } = makeSubmitTransferHarness();
     const promise = d.submitTransfer({}, "5".padEnd(48, "y"), 1n);
-    emit({ type: "txBestBlocksState", found: true, ok: false });
+    emit({ type: "inBestBlock", ok: false });
     await assert.rejects(promise, /dispatch error/);
   });
 
   test("submitTransfer: rejects on finalized ok=false (finalization error)", async () => {
     const { d, emit } = makeSubmitTransferHarness();
     const promise = d.submitTransfer({}, "5".padEnd(48, "y"), 1n);
-    emit({ type: "txBestBlocksState", found: true, ok: true });
+    emit({ type: "inBestBlock", ok: true });
     emit({ type: "finalized", ok: false });
     await assert.rejects(promise, /finalization error/);
   });
@@ -6564,7 +6865,7 @@ describe("DotNS.preflight", () => {
   test("submitTransfer: rejects when subscription completes without finalization", async () => {
     const { d, emit, complete } = makeSubmitTransferHarness();
     const promise = d.submitTransfer({}, "5".padEnd(48, "y"), 1n);
-    emit({ type: "txBestBlocksState", found: true, ok: true });
+    emit({ type: "inBestBlock", ok: true });
     complete();
     await assert.rejects(promise, /closed without finalization/);
   });
@@ -6869,7 +7170,17 @@ describe("DotNS.setContenthashAndTextRecord", () => {
     );
     assert.deepStrictEqual(submitted.calls[0].args.slice(1), ["executable", "new manifest"]);
     assert.strictEqual(submitted.calls[1].args[1], "0x1234");
-    assert.strictEqual(submitted.label, "Utility.batch_all(setContenthash+setText)");
+    assert.deepStrictEqual(
+      submitted.calls.map(({ depositPolicy }) => depositPolicy),
+      ["record", "record"],
+      ">> FAIL: setContenthash+setText batch: both inner writes must declare the record deposit policy",
+    );
+    assert.strictEqual(
+      submitted.label,
+      "Utility.batch_all(setContenthash+setText)",
+    );
+    assert.strictEqual(submitted.options.independentCalls, true,
+      ">> FAIL: contenthash+text are independent writes and both must be dry-run instead of leaving an unmeasured tail");
     assert.strictEqual(await submitted.options.verifyEffect(), true);
     assert.deepStrictEqual(result, {
       node: result.node,
@@ -6879,11 +7190,15 @@ describe("DotNS.setContenthashAndTextRecord", () => {
     });
   });
 
-  test("skips the batch only when both resolver records already match", async () => {
+  test("skips the batch without a funding gate when both resolver records already match, even for a low-balance signer", async () => {
     const d = new DotNS();
     d.connected = true;
+    d.substrateAddress = "5LowBalanceSigner";
     d.getContenthash = async () => "0x1234";
     d.getTextRecord = async () => "manifest";
+    d.ensureSubmissionFunding = async () => {
+      assert.fail("unchanged resolver state must not run the per-submission funding gate");
+    };
     d.submitBatchedContractCalls = async () => {
       assert.fail("unchanged resolver state must not submit a batch");
     };
@@ -6997,6 +7312,8 @@ describe("DotNS.ensureResolverAndSetTextRecord", () => {
       ">> FAIL: ensureResolverAndSetTextRecord both-stale: setText's value arg must be the new value");
     assert.strictEqual(submitted.label, "Utility.batch_all(setResolver+setText[manifest])",
       ">> FAIL: ensureResolverAndSetTextRecord both-stale: unexpected batch label");
+    assert.deepStrictEqual(submitted.calls.map(({ depositPolicy }) => depositPolicy), ["record", "record"],
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: resolver+text writes must declare the record deposit policy");
     assert.strictEqual(submitted.options.independentCalls, true,
       ">> FAIL: ensureResolverAndSetTextRecord both-stale: must pass independentCalls: true — setResolver and setText have no on-chain data dependency on each other");
     assert.strictEqual(await submitted.options.verifyEffect(), true,
@@ -7027,6 +7344,7 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
     d.connected = true;
     d.substrateAddress = "5Signer";
     d.signer = {};
+    d.ensureSubmissionFunding = async () => {};
     let estimateCalls = 0;
     d.clientWrapper = {
       ensureAccountMapped: async () => {},
@@ -7037,7 +7355,7 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
       client: {
         tx: {
           Revive: { call: () => ({ decodedCall: {} }) },
-          Utility: { batch_all: (args) => ({ signSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }) },
+          Utility: { batch_all: (args) => ({ createSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }) },
         },
       },
       signAndSubmitWithRetry: async (buildBatch) => { buildBatch(); return { kind: "hash", hash: "0xbatch" }; },
@@ -7078,6 +7396,7 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
     d.connected = true;
     d.substrateAddress = "5Signer";
     d.signer = {};
+    let fundingGate;
     const capturedCalls = [];
     // storageDeposit values deliberately both exceed computeStorageDepositLimit's
     // REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT floor (2e12) so the floor can't mask
@@ -7096,12 +7415,13 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
             call: (args) => { capturedCalls.push(args); return { decodedCall: { marker: capturedCalls.length } }; },
           },
           Utility: {
-            batch_all: (args) => ({ signSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }),
+            batch_all: (args) => ({ createSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }),
           },
         },
       },
-      signAndSubmitWithRetry: async (buildBatch) => {
+      signAndSubmitWithRetry: async (buildBatch, _signer, _cb, _label, opts) => {
         buildBatch();
+        fundingGate = opts?.fundingGate;
         return { kind: "hash", hash: "0xbatch" };
       },
     };
@@ -7124,6 +7444,11 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
       ">> FAIL: submitBatchedContractCalls estimate count: every inner call must be dry-run individually, not just the head call");
     assert.strictEqual(capturedCalls.length, 2,
       ">> FAIL: submitBatchedContractCalls call count: both inner calls must reach client.tx.Revive.call");
+    assert.deepStrictEqual(fundingGate, {
+      operation: "test batch",
+      storageDepositLimit: ((20_000_000_000_000n * 120n) / 100n) + ((2_000_000_000_000n * 120n) / 100n),
+      value: 0n,
+    }, ">> FAIL: independent batches must gate the largest shared limit once plus the other call's buffered estimate");
     for (const call of capturedCalls) {
       assert.deepStrictEqual(call.weight_limit, { ref_time: (9_000_000_000n * 120n) / 100n, proof_size: (900_000n * 120n) / 100n },
         ">> FAIL: submitBatchedContractCalls max-estimate weight_limit: must declare the LARGER (tail-call) buffered estimate, not the head call's smaller one — a head-only estimate would under-provision the tail call");
@@ -7314,6 +7639,8 @@ describe("DotNS.setTextRecord", () => {
     assert.strictEqual(capturedOpts.length, 1, "contractTransaction should be called once");
     assert.strictEqual(typeof capturedOpts[0].verifyEffect, "function",
       "setTextRecord must pass verifyEffect to contractTransaction");
+    assert.strictEqual(capturedOpts[0].depositPolicy, "record",
+      ">> FAIL: setTextRecord must declare the record deposit policy at its call site");
   });
 
   test("verifyEffect reads text(node, key) and returns true when value matches", async () => {
@@ -10066,7 +10393,7 @@ describe("bootstrapPool authorizer resolution (#1213 port) — no self-authorize
     const ensureBody = poolSrc.slice(ensureStart, nextExportAfterEnsure);
     assert.doesNotMatch(
       ensureBody,
-      /authorize_account|signAndSubmit|addFromUri/,
+      /authorize_account|createAndSubmit|addFromUri/,
       ">> FAIL: #1213 no-self-authorize: ensureAuthorized must never sign or submit authorize_account — this repo's deploy path only ever throws, it never grants",
     );
 
@@ -10914,12 +11241,12 @@ describe("CHUNK_MORTALITY_PERIOD", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 31. watchTransaction "found:false" handling — isValid distinction
+// 31. watchTransaction "not in best block" handling
 // ---------------------------------------------------------------------------
-// polkadot-api's TxInBestBlocksNotFound carries an `isValid` flag:
-//   isValid:true  → tx is in the pool, just not yet in a block. Normal pre-
+// papi v3 splits the old txBestBlocksState event in two:
+//   notInBestBlock → tx is in the pool, just not yet in a block. Normal pre-
 //                   inclusion state. Must keep waiting.
-//   isValid:false → pool rejected the tx (will never include). Must reject
+//   InvalidTxError → pool rejected the tx (will never include). Must reject
 //                   (after a nonce-fallback check, in case a peer disagrees).
 // Earlier code counted every found:false as a "drop" and failed after 5,
 // producing spurious "tx dropped from best chain 5 times" failures whenever
@@ -10928,7 +11255,7 @@ describe("CHUNK_MORTALITY_PERIOD", () => {
 // Helpers build the minimal stub required by storeChunkedContent:
 // - unsafeApi.apis.BulletinTransactionStorageApi.account_authorization() → ample quota
 // - unsafeApi.tx.TransactionStorage.store_with_cid_config() → a tx with
-//   .signSubmitAndWatch() that returns a controllable Subscribable
+//   .createSubmitAndWatch() that returns a controllable Subscribable
 // - fetchNonce DI (avoids hitting live RPC)
 // - reconnect spy
 function makeStubApi(makeSubscribable) {
@@ -10944,7 +11271,7 @@ function makeStubApi(makeSubscribable) {
     tx: {
       TransactionStorage: {
         store_with_cid_config: () => ({
-          signSubmitAndWatch: (_signer, _opts) => makeSubscribable(),
+          createSubmitAndWatch: (_signer, _opts) => makeSubscribable(),
         }),
       },
     },
@@ -10960,17 +11287,17 @@ function makeSequencedStubApi(...makers) {
   });
 }
 
-// Subscribable that immediately emits txBestBlocksState { found: true, ok: true }.
+// Subscribable that immediately emits inBestBlock { ok: true }.
 function normalSubscribable() {
   return {
     subscribe({ next }) {
-      setImmediate(() => next({ type: "txBestBlocksState", found: true, ok: true }));
+      setImmediate(() => next({ type: "inBestBlock", ok: true }));
       return { unsubscribe() {} };
     },
   };
 }
 
-// Subscribable that emits N waiting events ({found:false, isValid:true}) and
+// Subscribable that emits N waiting events (notInBestBlock) and
 // then a final success event. Models a slow-block chain that eventually
 // includes the tx.
 function waitingThenSuccessSubscribable(waits) {
@@ -10979,11 +11306,11 @@ function waitingThenSuccessSubscribable(waits) {
       let emitted = 0;
       const id = setInterval(() => {
         if (emitted < waits) {
-          next({ type: "txBestBlocksState", found: false, isValid: true });
+          next({ type: "notInBestBlock" });
           emitted++;
         } else {
           clearInterval(id);
-          next({ type: "txBestBlocksState", found: true, ok: true });
+          next({ type: "inBestBlock", ok: true });
         }
       }, 1);
       return { unsubscribe() { clearInterval(id); } };
@@ -10991,24 +11318,32 @@ function waitingThenSuccessSubscribable(waits) {
   };
 }
 
-// Subscribable that emits a single rejection event ({found:false,isValid:false}).
+// Subscribable for a pool rejection. papi v3 raises InvalidTxError on the error
+// channel where v2 emitted txBestBlocksState {found:false, isValid:false}.
 function poolRejectSubscribable() {
   return {
-    subscribe({ next }) {
-      setImmediate(() => next({ type: "txBestBlocksState", found: false, isValid: false }));
+    subscribe({ error }) {
+      setImmediate(() => error(invalidTxError("Stale")));
       return { unsubscribe() {} };
     },
   };
 }
 
-// Subscribable that emits a single dispatch-error event (found:true, ok:false).
-// Not a connection error and not isValid:false — models a tx-level failure
+/** The shape papi throws for a tx the pool rejected: name plus the JSON body. */
+function invalidTxError(variant) {
+  const err = new Error(JSON.stringify({ type: "Invalid", value: { type: variant } }, null, 2));
+  err.name = "InvalidTxError";
+  return err;
+}
+
+// Subscribable that emits a single dispatch-error event (inBestBlock, ok:false).
+// Not a connection error and not a pool rejection — models a tx-level failure
 // (e.g. the #1051 timeout path standing in for a real 180s watchTransaction
 // timeout) that must fall through to the per-chunk MAX_CHUNK_RETRIES loop.
 function dispatchErrorSubscribable() {
   return {
     subscribe({ next }) {
-      setImmediate(() => next({ type: "txBestBlocksState", found: true, ok: false }));
+      setImmediate(() => next({ type: "inBestBlock", ok: false }));
       return { unsubscribe() {} };
     },
   };
@@ -11023,8 +11358,9 @@ function connectionErrorSubscribable() {
   };
 }
 
-// Minimal signer stub (watchTransaction only passes it to signSubmitAndWatch).
-const stubSigner = {};
+// Minimal signer stub (watchTransaction only passes it to createSubmitAndWatch).
+// papi v3 creators are callable; an object is the v2 shape assertTxCreator rejects.
+const stubSigner = () => {};
 const STUB_SS58 = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
 const ONE_BYTE_CHUNK = new Uint8Array([0x42]);
 
@@ -11042,7 +11378,7 @@ describe("storeChunkedContent: quota-exhausted warning (bulletin #1547, check/wa
       tx: {
         TransactionStorage: {
           store_with_cid_config: () => ({
-            signSubmitAndWatch: (_signer, _opts) => normalSubscribable(),
+            createSubmitAndWatch: (_signer, _opts) => normalSubscribable(),
           }),
         },
       },
@@ -11065,7 +11401,7 @@ describe("storeChunkedContent: quota-exhausted warning (bulletin #1547, check/wa
       });
       assert.ok(warnings.some(w => /exhausted/i.test(w)),
         ">> FAIL: bulletin #1547: a one-line warning naming the exhausted allowance must be printed");
-      assert.ok(!warnings.some(w => /granting|granted|signAndSubmit/i.test(w)),
+      assert.ok(!warnings.some(w => /granting|granted|createAndSubmit/i.test(w)),
         ">> FAIL: bulletin #1547 (check/warn half only): the warning must not claim or perform any re-authorization");
     } finally {
       console.warn = savedWarn;
@@ -11132,10 +11468,10 @@ describe("watchTransaction found:false handling", () => {
     assert.strictEqual(reconnectCalled, false, "reconnect must NOT be called on normal success");
   });
 
-  // Regression: 100 found:false isValid:true events used to trip the old
+  // Regression: 100 notInBestBlock events used to trip the old
   // MAX_BEST_CHAIN_DROPS=5 counter and reject the chunk with
   // "tx dropped from best chain 5 times" before the chain had a chance to
-  // include it. New semantics: isValid:true is still-pending, keep waiting.
+  // include it. New semantics: notInBestBlock is still-pending, keep waiting.
   test("100 waiting events then success: chunk completes without spurious failure", async () => {
     let reconnectCalled = false;
     const reconnect = async () => {
@@ -11155,12 +11491,12 @@ describe("watchTransaction found:false handling", () => {
     assert.strictEqual(reconnectCalled, false, "reconnect must NOT be called when waiting events are followed by success");
   });
 
-  // isValid:false + CID present at best: tx was actually included even though
+  // Pool rejection + CID present at best: tx was actually included even though
   // the pool said invalid (peer disagreement). The best-block probe resolves
   // the chunk; reconnect is NOT called because the WS subscription itself was
   // healthy — only the tx was a problem. Pre-#1656 this was decided by the
   // nonce advancing, which counts the pool's own pending tx: a false positive.
-  test("isValid:false + CID present at best: chunk resolves via the chain fallback, no reconnect", async () => {
+  test("pool rejection + CID present at best: chunk resolves via the chain fallback, no reconnect", async () => {
     _resetProbeSession(); _bypassMetadataCheckForTest();
     let reconnectCalled = false;
     const reconnect = async () => {
@@ -11262,17 +11598,15 @@ const BIN_PATH = path.resolve(fileURLToPath(import.meta.url), "../../bin/polkado
 // Helper: run polkadot-app-deploy with HOME/XDG_STATE_HOME pointed at a tmpdir
 // so the on-disk state file is isolated per-test. Also returns the tmpdir
 // so the caller can inspect/preseed the state file.
+// Must match resolveStateDir() exactly: tests pre-seed and inspect this path.
+function isolatedStateDir(tmpdir) {
+  if (process.platform === "darwin") return path.join(tmpdir, "Library", "Application Support", "polkadot-app-deploy");
+  if (process.platform === "win32") return path.join(tmpdir, "AppData", "Local", "polkadot-app-deploy");
+  return path.join(tmpdir, ".local", "state", "polkadot-app-deploy");
+}
+
 function runBinIsolated(tmpdir, argv, { preseedState, extraEnv } = {}) {
-  // Platform-appropriate base + polkadot-app-deploy subdir — must match
-  // resolveStateDir() exactly, because tests pre-seed the file path.
-  let stateDir;
-  if (process.platform === "darwin") {
-    stateDir = path.join(tmpdir, "Library", "Application Support", "polkadot-app-deploy");
-  } else if (process.platform === "win32") {
-    stateDir = path.join(tmpdir, "AppData", "Local", "polkadot-app-deploy");
-  } else {
-    stateDir = path.join(tmpdir, ".local", "state", "polkadot-app-deploy");
-  }
+  const stateDir = isolatedStateDir(tmpdir);
   fs.mkdirSync(stateDir, { recursive: true });
   if (preseedState) {
     fs.writeFileSync(path.join(stateDir, "last-run.json"), typeof preseedState === "string" ? preseedState : JSON.stringify(preseedState));
@@ -11392,6 +11726,168 @@ describe("withDeploySpan no-telemetry run-state RSS", () => {
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+});
+
+describe("commitment state hardening (#1570)", () => {
+  const RECORD = {
+    savedAt: Date.now(), environmentId: "e", tld: "dot", protocol: "v0.6.0", label: "verysecretlabel",
+    owner: "0xabc", reserved: false, secret: "0xdeadbeefsecret", commitment: "0xbeef",
+  };
+  const DIST = pathToFileUrl(path.resolve("dist/run-state.js"));
+  const run = (env, body, cwd) => spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { writeCommitmentRecord, loadCommitmentRecord, commitmentStateFilePath, resolveStateDir, usesTmpdirFallback } from "${DIST}";
+    import * as fs from "node:fs";
+    import * as path from "node:path";
+    const RECORD = ${JSON.stringify(RECORD)};
+    ${body}
+  `], { encoding: "utf-8", env, ...(cwd ? { cwd } : {}) });
+  const isolated = (tmp) => ({ ...process.env, HOME: tmp, USERPROFILE: tmp, XDG_STATE_HOME: path.join(tmp, ".local", "state"), LOCALAPPDATA: path.join(tmp, "AppData", "Local") });
+  const withTmp = (tag, fn) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `bd-1570-${tag}-`));
+    try { fn(tmp); } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  };
+  const ok = (res) => assert.equal(res.status, 0, `>> FAIL: #1570: the probe process exited ${res.status}, so the assertion below never ran: ${String(res.stderr).split("\n")[0]}`);
+
+  test("the filename carries no label", () => {
+    withTmp("name", (tmp) => {
+      const res = run(isolated(tmp), `process.stdout.write(commitmentStateFilePath("e", "dot", "0xabc", "verysecretlabel"));`);
+      ok(res);
+      assert.ok(!res.stdout.includes("verysecretlabel"),
+        ">> FAIL: #1570: the label of an in-flight commit-reveal is in the filename, so anyone who can list the directory reads it");
+      assert.match(path.basename(res.stdout), /^commitment-[0-9a-f]{32}\.json$/,
+        ">> FAIL: #1570: the commitment filename must be a digest");
+    });
+  });
+
+  test("HOME set to empty writes nothing, least of all into the working directory", () => {
+    withTmp("relpath", (tmp) => {
+      const res = run({ ...process.env, HOME: "", USERPROFILE: "", XDG_STATE_HOME: "", LOCALAPPDATA: "" },
+        `process.stdout.write(JSON.stringify({ fellBack: usesTmpdirFallback(), ok: writeCommitmentRecord(RECORD), loaded: loadCommitmentRecord("e", "dot", "0xabc", "verysecretlabel") }));`, tmp);
+      ok(res);
+      assert.deepEqual(JSON.parse(res.stdout), { fellBack: true, ok: false, loaded: null },
+        ">> FAIL: #1570: os.homedir() returns \"\" for HOME=\"\", which makes resolveStateDir relative and drops the commit-reveal secret into the caller's working directory");
+      assert.deepEqual(fs.readdirSync(tmp), [],
+        ">> FAIL: #1570: a commitment record was written into the working directory");
+    });
+  });
+
+  test("does not follow a symlink planted at the tmp path", { skip: process.platform === "win32" }, () => {
+    withTmp("symlink", (tmp) => {
+      const canary = path.join(tmp, "canary");
+      fs.writeFileSync(canary, "untouched");
+      const res = run(isolated(tmp), `
+        const file = commitmentStateFilePath("e", "dot", "0xabc", "verysecretlabel");
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.symlinkSync(${JSON.stringify(canary)}, file + "." + process.pid + ".tmp");
+        process.stdout.write(JSON.stringify({ ok: writeCommitmentRecord(RECORD) }));
+      `);
+      ok(res);
+      assert.equal(fs.readFileSync(canary, "utf-8"), "untouched",
+        ">> FAIL: #1570: the tmp write followed a planted symlink, so the commit-reveal secret landed in a file someone else chose");
+    });
+  });
+
+  test("tightens an existing 0755 state dir to 0700", { skip: process.platform === "win32" }, () => {
+    withTmp("mode", (tmp) => {
+      const dir = isolatedStateDir(tmp);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.chmodSync(dir, 0o755);
+      const res = run(isolated(tmp), `process.stdout.write(JSON.stringify({ ok: writeCommitmentRecord(RECORD) }));`);
+      ok(res);
+      assert.equal(JSON.parse(res.stdout).ok, true, ">> FAIL: #1570: the record must still be written");
+      assert.equal(fs.statSync(dir).mode & 0o777, 0o700,
+        ">> FAIL: #1570: a state dir created by an older version stays 0755, so its listing leaks every pending commitment");
+    });
+  });
+
+  test("removes a tmp file left by a failed rename", () => {
+    withTmp("tmpclean", (tmp) => {
+      const res = run(isolated(tmp), `
+        const dest = commitmentStateFilePath("e", "dot", "0xabc", "verysecretlabel");
+        fs.mkdirSync(dest, { recursive: true });
+        fs.writeFileSync(path.join(dest, "blocker"), "x");
+        const ok = writeCommitmentRecord(RECORD);
+        process.stdout.write(JSON.stringify({ ok, leftovers: fs.readdirSync(resolveStateDir()).filter(f => f.endsWith(".tmp")) }));
+      `);
+      ok(res);
+      const out = JSON.parse(res.stdout);
+      assert.equal(out.ok, false, ">> FAIL: #1570: a failed write must report false, never throw");
+      assert.deepEqual(out.leftovers, [],
+        ">> FAIL: #1570: a tmp file holding the commit-reveal secret was left behind under a predictable name");
+    });
+  });
+
+  test("prunes a malformed record and a legacy label-named one, keeps a fresh one", () => {
+    withTmp("prune", (tmp) => {
+      const dir = isolatedStateDir(tmp);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "commitment-00000000000000000000000000000000.json"), "{not json");
+      fs.writeFileSync(path.join(dir, "commitment-e_dot_0xabc_oldlabel.json"), JSON.stringify({ ...RECORD, savedAt: Date.now() }));
+      const res = run(isolated(tmp), `
+        writeCommitmentRecord(RECORD);
+        loadCommitmentRecord("e", "dot", "0xabc", "verysecretlabel");
+        process.stdout.write(JSON.stringify({ left: fs.readdirSync(resolveStateDir()).sort() }));
+      `);
+      ok(res);
+      const { left } = JSON.parse(res.stdout);
+      assert.ok(!left.includes("commitment-00000000000000000000000000000000.json"),
+        ">> FAIL: #1570: a record that can never parse must be pruned");
+      assert.ok(!left.some((f) => f.includes("oldlabel")),
+        ">> FAIL: #1570: a record named before the digest still leaks its label, so it must be removed on sight");
+      assert.equal(left.filter((f) => /^commitment-[0-9a-f]{32}\.json$/.test(f)).length, 1,
+        ">> FAIL: #1570: the prune sweep deleted the fresh record it should have kept");
+    });
+  });
+
+  test("keeps a fresh tmp file and stale lock, which carry the pid after the extension", () => {
+    withTmp("suffix", (tmp) => {
+      const dir = isolatedStateDir(tmp);
+      fs.mkdirSync(dir, { recursive: true });
+      const hex = "0".repeat(32);
+      const fresh = [`commitment-${hex}.json.4242.tmp`, `commitment-${hex}.lock.4242.abcd.stale`];
+      for (const f of fresh) fs.writeFileSync(path.join(dir, f), "x");
+      const res = run(isolated(tmp), `
+        writeCommitmentRecord(RECORD);
+        loadCommitmentRecord("e", "dot", "0xabc", "verysecretlabel");
+        process.stdout.write(JSON.stringify({ left: fs.readdirSync(resolveStateDir()) }));
+      `);
+      ok(res);
+      const { left } = JSON.parse(res.stdout);
+      for (const f of fresh) {
+        assert.ok(left.includes(f),
+          `>> FAIL: #1570: the sweep deleted ${f}, a live tmp or stale lock, because the digest pattern did not allow the .<pid> suffix the writer appends`);
+      }
+    });
+  });
+
+  test("a FIFO at the state file does not hang the deploy", { skip: process.platform === "win32" }, () => {
+    withTmp("fifo", (tmp) => {
+      const dir = isolatedStateDir(tmp);
+      fs.mkdirSync(dir, { recursive: true });
+      const mk = spawnSync("mkfifo", [path.join(dir, "last-run.json")], { encoding: "utf-8" });
+      if (mk.status !== 0) return; // no mkfifo on this box; nothing to assert
+      const res = spawnSync(process.execPath, ["--input-type=module", "-e", `
+        import { loadRunState } from "${DIST}";
+        process.stdout.write(JSON.stringify({ v: loadRunState() }));
+      `], { encoding: "utf-8", env: isolated(tmp), timeout: 10_000 });
+      assert.equal(res.signal, null,
+        ">> FAIL: #1570: reading the state file blocked on a planted FIFO, so a deploy hangs instead of degrading to no resume");
+      assert.deepEqual(JSON.parse(res.stdout), { v: null },
+        ">> FAIL: #1570: a path that is not a regular file must read as no state");
+    });
+  });
+
+  test("reports false instead of throwing when the state dir cannot be made", () => {
+    withTmp("enotdir", (tmp) => {
+      const blocker = path.join(tmp, "blocker");
+      fs.writeFileSync(blocker, "x");
+      const res = run({ ...process.env, HOME: blocker, USERPROFILE: blocker, XDG_STATE_HOME: path.join(blocker, "state"), LOCALAPPDATA: path.join(blocker, "state") },
+        `process.stdout.write(JSON.stringify({ ok: writeCommitmentRecord(RECORD), loaded: loadCommitmentRecord("e", "dot", "0xabc", "verysecretlabel") }));`);
+      ok(res);
+      assert.deepEqual(JSON.parse(res.stdout), { ok: false, loaded: null },
+        ">> FAIL: #1570: losing commitment persistence must degrade to a fresh commit, never throw");
+    });
   });
 });
 
@@ -12819,7 +13315,8 @@ describe("e2e.yml: nightly-report per-environment status (issue #1055)", () => {
   // Fixtures live at the literal /tmp paths the real workflow step hardcodes
   // (it isn't parametrized — that's the thing under test), so this suite
   // owns cleanup before AND after to avoid leaking fixture state.
-  const FIXTURE_PATHS = ["/tmp/s1-legs.tsv", "/tmp/s2-legs.tsv", "/tmp/all-nightly-legs.tsv", "/tmp/fail-signatures.tsv", "/tmp/report-body.md", "/tmp/readiness-section.md"];
+  const FIXTURE_PATHS = ["/tmp/s1-legs.tsv", "/tmp/s2-legs.tsv", "/tmp/all-nightly-legs.tsv", "/tmp/fail-signatures.tsv", "/tmp/report-body.md", "/tmp/readiness-section.md",
+    "/tmp/issue-body.md", "/tmp/fail-signatures.md", "/tmp/dominant-cause.md", "/tmp/dominant-cause.label", "/tmp/signature-sources.txt"];
   function cleanFixtures() {
     for (const p of FIXTURE_PATHS) fs.rmSync(p, { force: true });
   }
@@ -13000,6 +13497,95 @@ describe("e2e.yml: nightly-report per-environment status (issue #1055)", () => {
     } finally {
       cleanFixtures();
       if (summaryPath) fs.rmSync(summaryPath, { force: true });
+    }
+  });
+
+  // #1701: a leg first red on a re-run reaches the issue only through this comment.
+  test("the re-run comment names each failing leg with its env and signature", () => {
+    cleanFixtures();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-rerun-"));
+    try {
+      assert.equal(spawnSync("jq", ["--version"]).status, 0,
+        ">> FAIL: #1701: jq is not installed, so the workflow steps under test cannot run");
+
+      const e2e = fs.readFileSync(E2E_YAML_PATH, "utf-8");
+      const report = jobBlock(e2e, "nightly-report");
+      const tail = (s) => (s || "").trim().split("\n").slice(-3).join(" / ");
+
+      fs.writeFileSync("/tmp/s1-legs.tsv", "");
+      fs.writeFileSync("/tmp/s2-legs.tsv", "");
+      fs.writeFileSync("/tmp/all-nightly-legs.tsv", [
+        "Nightly S9 parallel nonce-collision resilience (paseo-next-v2)\tfailure\tpaseo-next-v2",
+        "Nightly S-INC s-inc-roundtrip / js\tfailure\tpreview",
+      ].join("\n") + "\n");
+      const s9Sig = ">> FAIL: S9: both deploys must seed the same chunk nonce, got 41 and 42";
+      fs.writeFileSync("/tmp/fail-signatures.tsv", [
+        `Nightly S9 parallel nonce-collision resilience (paseo-next-v2)\t${s9Sig}`,
+        "Nightly S-INC s-inc-roundtrip / js\t" + "x".repeat(400),
+      ].join("\n") + "\n");
+
+      const summaryPath = path.join(dir, "summary.md");
+      fs.writeFileSync(summaryPath, "");
+      const baseEnv = {
+        ...process.env,
+        TAG: "e2e-ci-nightly-stable", VERSION: "0.22.0",
+        RUN_URL: "https://github.com/paritytech/bulletin-deploy/actions/runs/1",
+        SELECTED_ENV: "paseo-next-v2", HEALTHY_ENVS: '["paseo-next-v2"]',
+        GITHUB_STEP_SUMMARY: summaryPath,
+      };
+      // The flags Actions runs a step with: `shell: bash` adds pipefail.
+      const runStep = (name, extraEnv, flags = ["-e"]) => {
+        const f = path.join(dir, `${name.replace(/\W+/g, "-")}.sh`);
+        fs.writeFileSync(f, stepRunScript(report, name));
+        return spawnSync("bash", [...flags, f], { encoding: "utf-8", env: { ...baseEnv, ...extraEnv } });
+      };
+
+      const r1 = runStep("Render report body", {});
+      assert.equal(r1.status, 0,
+        `>> FAIL: #1701: Render report body exited ${r1.status} under bash -e: ${tail(r1.stderr)}`);
+      // One renderer: whatever the comment shows, the body shows too.
+      const section = fs.readFileSync("/tmp/fail-signatures.md", "utf-8");
+      assert.ok(fs.readFileSync("/tmp/report-body.md", "utf-8").includes(section.trim()),
+        ">> FAIL: #1701: the issue body and the re-run comment must render the same signature lines");
+
+      // curl stub: the lookup finds an issue, the POST is recorded.
+      const posted = path.join(dir, "posted.json");
+      const bin = path.join(dir, "bin");
+      fs.mkdirSync(bin);
+      fs.writeFileSync(path.join(bin, "curl"), [
+        "#!/bin/bash",
+        `for a in "$@"; do [ "$a" = "-G" ] && { echo '[{"number":1691}]'; exit 0; }; done`,
+        `while [ $# -gt 0 ]; do [ "$1" = "-d" ] && printf "%s" "$2" > ${JSON.stringify(posted)}; shift; done`,
+        "exit 0",
+      ].join("\n"));
+      fs.chmodSync(path.join(bin, "curl"), 0o755);
+
+      const r2 = runStep("Open failure issue", {
+        PATH: `${bin}:${process.env.PATH}`,
+        GITHUB_TOKEN: "x", API_URL: "https://api.github.com",
+        REPO: "paritytech/bulletin-deploy",
+        ISSUE_TITLE: "Nightly E2E failure (@latest): 2026-10-12",
+        DEDUP_LABEL: "nightly-dedup:stable:2026-10-12",
+        TIER: "stable", VERSION_LABEL: "0.22.0", TODAY: "2026-10-12",
+      }, ["-e", "-o", "pipefail"]);
+      assert.equal(r2.status, 0,
+        `>> FAIL: #1701: Open failure issue exited ${r2.status} under bash -e: ${tail(r2.stderr)}`);
+      assert.ok(fs.existsSync(posted), ">> FAIL: #1701: the dedup branch posted no comment");
+
+      const comment = JSON.parse(fs.readFileSync(posted, "utf-8")).body;
+      assert.match(comment, /Re-run also failed/,
+        ">> FAIL: #1701: the re-run comment lost its run link");
+      assert.match(comment, /### Failure signatures/,
+        ">> FAIL: #1701: the re-run comment must head its legs the same way the issue body does");
+      assert.ok(comment.includes(`- **Nightly S9 parallel nonce-collision resilience (paseo-next-v2)**: ${s9Sig}`),
+        ">> FAIL: #1701: the re-run comment does not name the leg that failed on this attempt");
+      assert.ok(comment.includes("Nightly S-INC s-inc-roundtrip / js (on preview)"),
+        ">> FAIL: #1701: an S-INC leg must carry its env, which its job name does not");
+      assert.ok(!comment.includes("x".repeat(301)),
+        ">> FAIL: #1701: a signature is posted uncapped, so enough red legs push the comment past GitHub's 65536 limit");
+    } finally {
+      cleanFixtures();
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 });
@@ -14664,7 +15250,7 @@ describe("waitForChainLiveness (#1051)", () => {
 // ---------------------------------------------------------------------------
 // storeChunkedContent reconcile-before-resubmit regression (#1051): a chunk
 // whose tx fails at the WS layer (dispatch error — not a connection error,
-// not isValid:false) must be reconciled via a best-block CID probe before
+// not a pool rejection) must be reconciled via a best-block CID probe before
 // the per-chunk retry loop spends a resubmit on it. If the probe finds the
 // CID already present, storeChunk must NOT be called a second time — a
 // resubmit here would be a duplicate content write and, on a real chain, the
@@ -15510,8 +16096,8 @@ describe("incremental-stats v3 summary", () => {
       ">> FAIL: chunk-numbering: the batch upload line must display the 1-based chunk index `chunk ${i + 1}`");
     assert.match(src, /Chunk \$\{idx \+ 1\}: nonce/,
       ">> FAIL: chunk-numbering: the nonce-consumed heuristic line must use 1-based `${idx + 1}`");
-    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: isValid:false but CID was probe-failed/,
-      ">> FAIL: chunk-numbering: the isValid:false backstop line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: pool-rejected but CID was probe-failed/,
+      ">> FAIL: chunk-numbering: the pool-rejection backstop line must use 1-based `${fail.index + 1}`");
     assert.match(src, /Chunk \$\{fail\.index \+ 1\}: tx rejected/,
       ">> FAIL: chunk-numbering: the mortal-expiry note must use 1-based `${fail.index + 1}`");
     assert.match(src, /Retrying chunk \$\{fail\.index \+ 1\} \(attempt/,
@@ -15520,8 +16106,8 @@ describe("incremental-stats v3 summary", () => {
       ">> FAIL: chunk-numbering: the reconcile-found line must use 1-based `${fail.index + 1}`");
     assert.match(src, /Chunk \$\{fail\.index \+ 1\}: chain still frozen/,
       ">> FAIL: chunk-numbering: the frozen-chain-wait line must use 1-based `${fail.index + 1}`");
-    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: retry isValid:false/,
-      ">> FAIL: chunk-numbering: the retry isValid:false backstop line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: retry pool-rejected/,
+      ">> FAIL: chunk-numbering: the retry pool-rejection backstop line must use 1-based `${fail.index + 1}`");
     assert.match(src, /Chunk \$\{fail\.index \+ 1\} failed after \$\{MAX_CHUNK_RETRIES\} retries/,
       ">> FAIL: chunk-numbering: the final chunk-failure throw must use 1-based `${fail.index + 1}`");
     assert.match(src, /Nonce-collision re-upload: chunk \$\{idx \+ 1\} \(attempt/,
@@ -16350,7 +16936,63 @@ describe("portability: Phase A upload set is a subset of Phase B's final CAR (#1
   });
 });
 
-describe("storeChunkedContent isValid:false backstop", () => {
+// papi v3 made a signer callable. A v2 PolkadotSigner object still satisfies the
+// types for a JS library caller (playground-cli, #811/S7), so the break has to be
+// named at the boundary rather than surfacing from inside papi.
+describe("assertTxCreator (papi v2 signer at the API boundary)", () => {
+  test("a v2 PolkadotSigner object is rejected by name, with the migration hint", async () => {
+    const { assertTxCreator } = await import("../dist/dotns.js");
+    const v2Signer = { publicKey: new Uint8Array(32), signTx: async () => new Uint8Array(), signBytes: async () => new Uint8Array() };
+    assert.throws(
+      () => assertTxCreator(v2Signer, "DeployOptions.signer"),
+      (err) => err.name === "NonRetryableError" && /getTxCreator/.test(err.message),
+      ">> FAIL: assertTxCreator: a papi v2 signer was accepted, so a library caller would fail somewhere inside papi with no hint about the migration",
+    );
+  });
+
+  test("a callable creator and an absent signer both pass", async () => {
+    const { assertTxCreator } = await import("../dist/dotns.js");
+    const creator = Object.assign(async () => "0x", { publicKey: new Uint8Array(32), signBytes: async () => new Uint8Array() });
+    assert.doesNotThrow(() => assertTxCreator(creator, "DeployOptions.signer"),
+      ">> FAIL: assertTxCreator: a valid v3 TxCreator was rejected");
+    assert.doesNotThrow(() => assertTxCreator(undefined, "DeployOptions.signer"),
+      ">> FAIL: assertTxCreator: an absent signer must be allowed, the mnemonic path supplies one later");
+  });
+});
+
+// papi reads the first entry for a repeated extension id (raw-tx-creator's
+// getExtensionData uses Array.prototype.find), so the capture must agree.
+describe("indexExtensions (papi v3 payload shape)", () => {
+  const ext = (id, extra) => ({ id, extra, additionalSigned: "0x" });
+  const pipeline = (order) => ({
+    version: 0,
+    order,
+    encode: (id) => { throw new Error(`no custom entry for ${id}`); },
+    inactive: (id) => { throw new Error(`transaction extension ${id} has an implicit, so it has no inactive encoding`); },
+  });
+
+  test("a duplicate extension id keeps the first entry, matching papi's own reader", () => {
+    const got = indexExtensions([ext("CheckGenesis", "0xaa"), ext("CheckGenesis", "0xbb")]);
+    assert.equal(bytesToHex(got.CheckGenesis.value), "0xaa",
+      ">> FAIL: indexExtensions: a duplicate id kept the last entry, but papi reads the first, so the extrinsic body would not match the bytes that were signed");
+  });
+
+  test("an ordered extension missing from the payload throws instead of building a short extrinsic", () => {
+    assert.throws(
+      () => fillExtensionValues(pipeline(["CheckGenesis", "CheckNonce"]), indexExtensions([ext("CheckGenesis", "0xaa")]), {}),
+      /CheckNonce/,
+      ">> FAIL: indexExtensions: a missing extension was dropped silently, which assembles an extrinsic the chain will reject with no local diagnostic",
+    );
+  });
+
+  test("the pipeline order is preserved, not the payload's array order", () => {
+    const got = fillExtensionValues(pipeline(["CheckNonce", "CheckGenesis"]), indexExtensions([ext("CheckGenesis", "0xaa"), ext("CheckNonce", "0xbb")]), {});
+    assert.deepEqual(got.order, ["CheckNonce", "CheckGenesis"],
+      ">> FAIL: indexExtensions: the payload's array order leaked into the pipeline order, which decides the byte order of the extrinsic body");
+  });
+});
+
+describe("storeChunkedContent pool-rejection backstop", () => {
   test("ExistingProvider accepts probeFailedCids without TypeError", async () => {
     // Smoke-test: verify that storeChunkedContent destructures probeFailedCids
     // without throwing a TypeError. The function will throw later (no real chain),
@@ -16713,7 +17355,7 @@ describe("storeChunkedContent account rotation on reconnect (#951)", () => {
   const ACCOUNT_A = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
   const ACCOUNT_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty";
 
-  // Capture-enabled stub api: records the nonce from each signSubmitAndWatch call.
+  // Capture-enabled stub api: records the nonce from each createSubmitAndWatch call.
   function makeCapturingStubApi(makeSubscribable, capturedNonces) {
     return {
       query: {
@@ -16723,7 +17365,7 @@ describe("storeChunkedContent account rotation on reconnect (#951)", () => {
       tx: {
         TransactionStorage: {
           store_with_cid_config: () => ({
-            signSubmitAndWatch: (_signer, opts) => {
+            createSubmitAndWatch: (_signer, opts) => {
               capturedNonces.push(opts?.nonce);
               return makeSubscribable();
             },
@@ -16857,7 +17499,7 @@ describe("storeChunkedContent account rotation on reconnect (#951)", () => {
   // loop) must ALSO rebase on rotation. Before the fix it called doReconnect()
   // directly (not doReconnectAndRebase), so a rotation there left assignedNonces
   // keyed to the OLD account → the next batch submitted stale old-account nonces
-  // (isValid:false). Since that's NOT a connection error, the per-failure retry
+  // (pool rejection). Since that's NOT a connection error, the per-failure retry
   // never reconnects and the consumed-heuristic false-positives. Unlike #951's
   // tests (connection-error path), this drives the halt via the real Bulletin
   // status handler firing a WS ERROR between batches with no chunk error.
@@ -16875,7 +17517,7 @@ describe("storeChunkedContent account rotation on reconnect (#951)", () => {
       tx: {
         TransactionStorage: {
           store_with_cid_config: () => ({
-            signSubmitAndWatch: (_signer, opts) => {
+            createSubmitAndWatch: (_signer, opts) => {
               target.push(opts?.nonce);
               if (!halted) {
                 halted = true;
@@ -17375,8 +18017,11 @@ describe("setDeployAttribute → root span (regression guard)", () => {
 
   test("source: captureWarning uses deployRootSpan for deploy.sad, not getRootSpan/getActiveSpan", () => {
     const src = fs.readFileSync("src/telemetry.ts", "utf-8");
-    const match = src.match(/export function captureWarning[\s\S]*?\n\}/);
-    assert.ok(match, "captureWarning must be present in src/telemetry.ts");
+    // The sad-tracking logic lives once, in noteWarning (captureWarning delegates to it).
+    const match = src.match(/export function noteWarning[\s\S]*?\n\}/);
+    assert.ok(match, "noteWarning must be present in src/telemetry.ts");
+    assert.match(src.match(/export function captureWarning[\s\S]*?\n\}/)[0], /noteWarning\(/,
+      "captureWarning must delegate its sad tracking to noteWarning");
     const body = match[0];
     assert.ok(
       !body.includes("getRootSpan"),
@@ -17665,6 +18310,55 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     assert.ok(
       helperCalls.length >= 2,
       "test/e2e.test.js must use the shared env-connect helper in both the preflight status probe and the S7 DotNS.connect path",
+    );
+  });
+
+  test("#1695: the PoP probe path comes from the same map as the direct signer args", () => {
+    assert.strictEqual(probeDerivationPathFor("s1", "direct"), null,
+      ">> FAIL: #1695: a non-isolated direct scenario deploys as bare Alice ROOT, so it must probe ROOT (null), not //e2e-direct");
+    assert.strictEqual(probeDerivationPathFor("s9", "direct"), "//e2e-s9",
+      ">> FAIL: #1695: s9 must probe its isolated signer");
+    assert.strictEqual(probeDerivationPathFor("s1", "pool"), null,
+      ">> FAIL: #1695: pool probes stay on the bare mnemonic");
+    assert.strictEqual(probeDerivationPathFor("s9", "pool"), null,
+      ">> FAIL: #1695: the isolated direct signer must not leak into a pool probe");
+    for (const sc of ["s1", "s2", "s9", "s-grandpa-reupload"]) {
+      const args = directSignerArgsFor(sc, "SEED");
+      const i = args.indexOf("--derivation-path");
+      assert.strictEqual(i === -1 ? null : args[i + 1], probeDerivationPathFor(sc, "direct"),
+        `>> FAIL: #1695: ${sc}: probe path and deploy signer path diverged`);
+    }
+  });
+
+  test("S9 signs as its own derivation path, and the funding check watches it", () => {
+    const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
+    assert.deepEqual(
+      directSignerArgsFor("s9", "SEED"),
+      ["--mnemonic", "SEED", "--derivation-path", "//e2e-s9"],
+      ">> FAIL: S9: s9 must sign as //e2e-s9; as bare Alice ROOT another leg advances the Bulletin chunk nonce between the two seed reads and the equal-seed precondition breaks",
+    );
+    assert.deepEqual(
+      directSignerArgsFor("s1", "SEED"),
+      ["--mnemonic", "SEED"],
+      ">> FAIL: S9: a scenario with no isolated signer must get no --derivation-path, not a null one",
+    );
+    assert.match(
+      e2e,
+      /function s9Args\([\s\S]{0,400}?\.\.\.directSignerArgs\(\),/,
+      ">> FAIL: S9: s9Args must spread directSignerArgs() so the signer comes from ISOLATED_DIRECT_SIGNERS",
+    );
+    assert.match(
+      e2e,
+      /probeSignerPopStatus\(\{[\s\S]{0,600}?derivationPath: probeDerivationPathFor\(SCENARIO, SIGNER\)/,
+      ">> FAIL: S9: the PoP probe must use the scenario's own derivation path, or S9 picks its label from //e2e-direct's tier (probe-pop-status.js COUPLING NOTE)",
+    );
+    assert.ok(
+      BALANCE_SIGNERS.some((s) => s.path === "//e2e-s9"),
+      ">> FAIL: S9: tools/check-balances.mjs SIGNERS must include //e2e-s9, or the daily funding check cannot see its Asset Hub balance run dry",
+    );
+    assert.ok(
+      NON_GATING_LABELS.has("//e2e-s9"),
+      ">> FAIL: S9: //e2e-s9 must be non-gating, or a low balance on one scenario's signer drops the whole env from healthy_envs",
     );
   });
 
@@ -19148,12 +19842,12 @@ function buildReproveApis({
     tx: {
       AliasAccounts: {
         reprove_alias_account: (args) => ({
-          signSubmitAndWatch: (signer) => ({
+          createSubmitAndWatch: (signer) => ({
             subscribe: ({ next }) => {
-              // Return events: broadcasted → txBestBlocksState → finalized
+              // Return events: broadcasted → inBestBlock → finalized
               Promise.resolve().then(() => {
                 next({ type: "broadcasted" });
-                next({ type: "txBestBlocksState", found: true, ok: true, block: { hash: txResult } });
+                next({ type: "inBestBlock", ok: true, block: { hash: txResult } });
                 next({ type: "finalized", ok: true, block: { hash: txResult } });
               });
               return { unsubscribe: () => {} };
@@ -19340,11 +20034,11 @@ describe("reproveAliasToAccount (mock APIs)", () => {
       tx: {
         AliasAccounts: {
           reprove_alias_account: () => ({
-            signSubmitAndWatch: () => ({
+            createSubmitAndWatch: () => ({
               subscribe: ({ next }) => {
                 Promise.resolve().then(() => {
                   next({ type: "broadcasted" });
-                  next({ type: "txBestBlocksState", found: true, ok: false, dispatchError });
+                  next({ type: "inBestBlock", ok: false, dispatchError });
                 });
                 return { unsubscribe: () => {} };
               },
@@ -19398,31 +20092,11 @@ function buildClaimPgasApis({
   ringRoots = [{ revision: 5, root: new Uint8Array(32) }],
   nowMs = 1_716_000_000_000n,
 } = {}) {
-  // Minimal mock tx that supports getEncodedData() and sign()
+  // Minimal mock tx. No claimPgas unit test reaches the extension capture, which
+  // needs the real enhancer chain and SCALE metadata; the E2E on Alice covers it.
   const mockTx = {
     getEncodedData: async () => new Uint8Array([0x01, 0x02, 0x03]),
-    sign: async (signer, opts) => {
-      // Simulate papi invoking signTx with extension bytes
-      const fakeExtensions = {
-        AsPgas: { value: opts?.customSignedExtensions?.AsPgas?.value, additionalSigned: new Uint8Array() },
-        CheckNonce: { value: new Uint8Array([0x00]), additionalSigned: new Uint8Array() },
-        CheckMortality: { value: new Uint8Array([0x00]), additionalSigned: new Uint8Array(8) },
-        AuthorizeCall: { value: new Uint8Array(), additionalSigned: new Uint8Array() },
-        StorageWeightReclaim: { value: new Uint8Array(), additionalSigned: new Uint8Array() },
-      };
-      // Invoke signTx to trigger the sentinel
-      try {
-        await signer.signTx(
-          new Uint8Array([0x01, 0x02, 0x03]),
-          fakeExtensions,
-          // Not metadata: these tests stop before the capture is used.
-          new Uint8Array(0),
-        );
-      } catch (e) {
-        if (e?.message !== "__pgas_capture_sentinel__") throw e;
-      }
-      return "0xsignedtx";
-    },
+    create: async () => new Uint8Array([0x01, 0x02, 0x03]),
   };
 
   const ahUnsafeApi = {
@@ -19477,7 +20151,7 @@ function buildClaimPgasApis({
       subscribe: ({ next }) => {
         Promise.resolve().then(() => {
           next({ type: "broadcasted" });
-          next({ type: "txBestBlocksState", found: true, ok: true, block: { hash: "0xcafebabe" } });
+          next({ type: "inBestBlock", ok: true, block: { hash: "0xcafebabe" } });
           next({ type: "finalized", ok: true, block: { hash: "0xcafebabe" } });
         });
         return { unsubscribe: () => {} };
@@ -19603,7 +20277,7 @@ describe("bindPersonalIdToAccount (mock APIs)", () => {
       subscribe: ({ next }) => {
         Promise.resolve().then(() => {
           next({ type: "broadcasted" });
-          next({ type: "txBestBlocksState", found: true, ok: true, block: { hash: "0xfeed" } });
+          next({ type: "inBestBlock", ok: true, block: { hash: "0xfeed" } });
           next({ type: "finalized", ok: true, block: { hash: "0xfeed" } });
         });
         return { unsubscribe: () => {} };
@@ -19631,12 +20305,57 @@ describe("bindPersonalIdToAccount (mock APIs)", () => {
     );
   });
 
-  test("throws client_error when extension capture fails (sign never calls signTx)", async () => {
-    // Simulate papi's sign() returning without calling signTx — captured stays null
+  test("the capture is immortal, so both passes sign the same CheckMortality bytes", async () => {
+    // CheckMortality sits after AsPerson in the People pipeline, so its bytes are
+    // inside the implication. A mortal era moves with the finalized head.
+    const seen = [];
     const mockTx = {
       getEncodedData: async () => new Uint8Array([0x01, 0x02]),
-      // sign() returns without invoking signer.signTx → captured = null → "extension capture failed"
-      sign: async (_signer, _opts) => "0xdead",
+      create: async (_creator, opts) => { seen.push(opts); return new Uint8Array([0xde, 0xad]); },
+    };
+    const typedApi = {
+      tx: { People: { set_personal_id_account: () => mockTx } },
+      query: { System: { Number: { getValue: async () => 1 } } },
+    };
+    await assert.rejects(
+      bindPersonalIdToAccount({ typedApi, client: baseClient, personalId: 0n, account: MOCK_ALICE, signMember }),
+      () => true,
+    );
+    assert.ok(seen.length > 0, ">> FAIL: bind-personal-id: the capture never called create, so the test asserts nothing");
+    for (const opts of seen) {
+      assert.deepEqual(opts.mortality, { mortal: false },
+        ">> FAIL: bind-personal-id: the capture pass is mortal, so a block finalising between pass 1 and pass 2 changes the CheckMortality bytes the proof signed and the chain rejects the extrinsic");
+    }
+  });
+
+  test("the first capture pass offers AsPerson as None, not empty bytes", async () => {
+    // Pass 1 has no proof yet. The AsPerson value is an Option, so it must be
+    // undefined: an empty Uint8Array is not a valid encoding of None and the
+    // codec throws before papi reaches the creator.
+    const seen = [];
+    const mockTx = {
+      getEncodedData: async () => new Uint8Array([0x01, 0x02]),
+      create: async (_creator, opts) => { seen.push(opts); return new Uint8Array([0xde, 0xad]); },
+    };
+    const typedApi = {
+      tx: { People: { set_personal_id_account: () => mockTx } },
+      query: { System: { Number: { getValue: async () => 1 } } },
+    };
+    await assert.rejects(
+      bindPersonalIdToAccount({ typedApi, client: baseClient, personalId: 0n, account: MOCK_ALICE, signMember }),
+      () => true,
+    );
+    assert.ok(seen.length > 0, ">> FAIL: bind-personal-id: the capture never called create, so the test asserts nothing");
+    assert.strictEqual(seen[0].customSignedExtensions.AsPerson.value, undefined,
+      ">> FAIL: bind-personal-id: the first capture pass sends an AsPerson value instead of None, so the codec rejects it and the binding never reaches the proof pass");
+  });
+
+  test("throws client_error when extension capture fails (create never calls the creator)", async () => {
+    // Simulate papi's create() returning without invoking the creator — captured stays null
+    const mockTx = {
+      getEncodedData: async () => new Uint8Array([0x01, 0x02]),
+      // create() returns without invoking the creator → captured = null → "extension capture failed"
+      create: async (_creator, _opts) => new Uint8Array([0xde, 0xad]),
     };
     const typedApi = {
       tx: { People: { set_personal_id_account: () => mockTx } },
@@ -19712,11 +20431,11 @@ function buildPaidAliasApis({
         set_alias_account: (args) => {
           capturedTxArgs.push(args);
           return {
-            signSubmitAndWatch: (signer, opts) => ({
+            createSubmitAndWatch: (signer, opts) => ({
               subscribe: ({ next }) => {
                 Promise.resolve().then(() => {
                   next({ type: "broadcasted" });
-                  next({ type: "txBestBlocksState", found: true, ok: true, block: { hash: "0xbaadf00d" } });
+                  next({ type: "inBestBlock", ok: true, block: { hash: "0xbaadf00d" } });
                   next({ type: "finalized", ok: true, block: { hash: "0xbaadf00d" } });
                 });
                 return { unsubscribe: () => {} };
@@ -20395,7 +21114,7 @@ describe("readPreviousContenthashSafe (subdomain contenthash read — double-TLD
 // so an operator's configured floor never reached the DECLARED
 // storage_deposit_limit on a submitted Revive.call. Fixed by giving
 // ReviveClientWrapper a settable `_storageDepositFloor` (defaulted to the
-// module constant, overridden via setStorageDepositFloor from
+// module constant, overridden via setStorageDepositFloors from
 // DotNS.recreateReviveClient with this._registerStorageDeposit) and by
 // threading this._registerStorageDeposit directly at the
 // submitBatchedContractCalls call site, which builds its own Revive.call
@@ -20461,12 +21180,14 @@ describe("storageDepositLimitFor (storage_deposit_limit buffer helper)", () => {
   // (bulletin #1522, same 20% factor applied to ref_time and proof_size
   // separately) legitimately contributes 2 more — both inside the one
   // canonical function, so this is still a single source of truth per helper.
+  // bulletin #1712 adds bufferedStorageDepositEstimate (the shared buffered
+  // estimate the batch-funding arithmetic reuses) as the 4th.
   test("dotns.ts: the 20% buffer formula appears only inside storageDepositLimitFor and weightLimitFor", () => {
     const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
     const matches = dotnsSrc.match(/\*\s*120n\)\s*\/\s*100n/g) || [];
-    assert.equal(matches.length, 3,
+    assert.equal(matches.length, 4,
       `>> FAIL: 20%-buffer drift-guard: found the "* 120n) / 100n" formula ${matches.length} time(s) in dotns.ts, ` +
-      `expected exactly 3 (1 inside storageDepositLimitFor + 2 inside weightLimitFor for ref_time/proof_size) — ` +
+      `expected exactly 4 (1 inside storageDepositLimitFor + 1 inside bufferedStorageDepositEstimate + 2 inside weightLimitFor for ref_time/proof_size) — ` +
       `any other count means a call site grew its own inline copy again`);
   });
 
@@ -20486,7 +21207,10 @@ describe("storageDepositLimitFor (storage_deposit_limit buffer helper)", () => {
     // call's own estimate (headEstimate.storageDeposit, the pre-#1164 shape) — see
     // the independentCalls/multi-dry-run block above this call site. The floor
     // argument itself is unaffected by that change.
-    assert.match(dotnsSrc, /storageDepositLimitFor\(maxStorageDeposit,\s*this\._registerStorageDeposit\)/,
+    // bulletin #1712/#1716: the limit is chosen per inner call from its declared
+    // depositPolicy (record writes get the record floor, everything else the per-env
+    // registration floor).
+    assert.match(dotnsSrc, /storageDepositLimitForCall\(\s*calls\[index\]\.functionName,\s*estimate\.storageDeposit,\s*calls\[index\]\.depositPolicy,\s*this\._registerStorageDeposit,/,
       ">> FAIL: submitBatchedContractCalls must pass this._registerStorageDeposit as the floor — the per-env config, " +
       "otherwise it silently falls back to the generic 200 PAS default regardless of environments.json");
   });
@@ -20528,7 +21252,7 @@ describe("weightLimitFor (weight_limit buffer helper, #1522)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// ReviveClientWrapper.setStorageDepositFloor — verifies the per-env floor
+// ReviveClientWrapper.setStorageDepositFloors — verifies the per-env floor
 // actually reaches the SUBMITTED extrinsic's storage_deposit_limit (and that
 // the buffered weight_limit rides along), not just dryRunReviveCall's return
 // value. Drives submitTransaction end to end with a fake client capturing the
@@ -20556,7 +21280,7 @@ describe("ReviveClientWrapper: per-env storage-deposit floor reaches the submitt
 
     // Env floor: 5 PAS (bulletin's measured paseo-next-v2 value), well below
     // the 200 PAS generic default this wrapper would otherwise fall back to.
-    w.setStorageDepositFloor(50_000_000_000n);
+    w.setStorageDepositFloors({ register: 50_000_000_000n, record: 1n });
     await w.submitTransaction("0xContract", 0n, "0x", "5Signer", {}, () => {}, { rpcs: [] });
 
     assert.ok(captured, ">> FAIL: submitTransaction setup: fake signAndSubmitWithRetry must trigger buildExtrinsic — check the fake client wiring above");
@@ -20592,12 +21316,12 @@ describe("ReviveClientWrapper: per-env storage-deposit floor reaches the submitt
 });
 
 describe("DotNS: recreateReviveClient wires the connected instance's registerStorageDeposit into the wrapper (#1518)", () => {
-  test("dotns.ts: recreateReviveClient calls setStorageDepositFloor(this._registerStorageDeposit) right after construction", () => {
+  test("dotns.ts: recreateReviveClient calls setStorageDepositFloors with this._registerStorageDeposit right after construction", () => {
     const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
     const recreateFnMatch = dotnsSrc.match(/private recreateReviveClient\(endpoint: string\): void \{[\s\S]*?\n  \}/);
     assert.ok(recreateFnMatch, ">> FAIL: recreateReviveClient not found — did the method get renamed/restructured?");
-    assert.match(recreateFnMatch[0], /this\.clientWrapper\.setStorageDepositFloor\(this\._registerStorageDeposit\)/,
-      ">> FAIL: recreateReviveClient must call setStorageDepositFloor(this._registerStorageDeposit) — this is the ONLY place a " +
+    assert.match(recreateFnMatch[0], /this\.clientWrapper\.setStorageDepositFloors\(\{\s*register: this\._registerStorageDeposit,/,
+      ">> FAIL: recreateReviveClient must call setStorageDepositFloors({ register: this._registerStorageDeposit, ... }) — this is the ONLY place a " +
       "ReviveClientWrapper is constructed, so missing this call here means the per-env floor never reaches a fresh wrapper");
   });
 });
@@ -20614,6 +21338,7 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
     d.connected = true;
     d.substrateAddress = "5Signer";
     d.signer = {};
+    let fundingGate;
     d["_registerStorageDeposit"] = 50_000_000_000n; // 5 PAS — the measured paseo-next-v2 floor
     const capturedCalls = [];
     d.clientWrapper = {
@@ -20621,7 +21346,7 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
       estimateGasForCall: async () => ({
         success: true,
         gasRequired: { referenceTime: 2_000_000_000n, proofSize: 200_000n },
-        storageDeposit: 0n, // overwrite-shaped call — zero estimate must still floor at the env value, not 200 PAS
+        storageDeposit: 1_000_000_000n,
       }),
       client: {
         tx: {
@@ -20629,12 +21354,13 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
             call: (args) => { capturedCalls.push(args); return { decodedCall: { marker: capturedCalls.length } }; },
           },
           Utility: {
-            batch_all: (args) => ({ signSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }),
+            batch_all: (args) => ({ createSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }),
           },
         },
       },
-      signAndSubmitWithRetry: async (buildBatch) => {
+      signAndSubmitWithRetry: async (buildBatch, _signer, _cb, _label, opts) => {
         buildBatch();
+        fundingGate = opts?.fundingGate;
         return { kind: "hash", hash: "0xbatch" };
       },
     };
@@ -20651,6 +21377,11 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
     );
 
     assert.strictEqual(result.kind, "hash", ">> FAIL: submitBatchedContractCalls setup: fake signAndSubmitWithRetry must resolve — check the fake clientWrapper wiring above");
+    assert.deepStrictEqual(fundingGate, {
+      operation: "test batch",
+      storageDepositLimit: 50_000_000_000n + ((1_000_000_000n * 120n) / 100n),
+      value: 0n,
+    }, ">> FAIL: a dependent two-call batch must gate one 5 PAS registration-floor limit plus the measured head's 20%-buffered estimate, not double the floor");
     assert.strictEqual(capturedCalls.length, 2, ">> FAIL: submitBatchedContractCalls call count: both inner calls must reach client.tx.Revive.call");
     for (const call of capturedCalls) {
       assert.deepStrictEqual(call.weight_limit, { ref_time: 2_400_000_000n, proof_size: 240_000n },
@@ -21812,6 +22543,19 @@ describe("environments.ts: ipfs propagation through resolveEndpoints", () => {
   });
 });
 
+describe("recordStorageDeposit propagation (bulletin #1716)", () => {
+  test("deploy.ts, publish.ts and transfer.ts pass the env's recordStorageDeposit into DotNS.connect()", () => {
+    const deploySrc = fs.readFileSync("src/deploy.ts", "utf8");
+    assert.strictEqual((deploySrc.match(/recordStorageDeposit: envRecordStorageDeposit,/g) ?? []).length, 3,
+      ">> FAIL: deploy.ts: all three DotNS.connect() sites (preflight, owner, deploy) must pass recordStorageDeposit: envRecordStorageDeposit");
+    assert.match(fs.readFileSync("src/manifest/publish.ts", "utf8"),
+      /dotns\.connect\(\{\s*\.\.\.connectOpts,\s*recordStorageDeposit: resolved\.recordStorageDeposit\s*\}\)/,
+      ">> FAIL: manifest/publish.ts connectDotNS(): must pass resolved.recordStorageDeposit into connect, or an env's record floor is ignored on manifest publishes");
+    assert.match(fs.readFileSync("src/commands/transfer.ts", "utf8"), /recordStorageDeposit: resolved\.recordStorageDeposit,/,
+      ">> FAIL: commands/transfer.ts: must pass resolved.recordStorageDeposit into DotNS.connect()");
+  });
+});
+
 describe("INVARIANT: env-specific URLs never leak into src/ as hardcoded literals", () => {
   // For every URL-shaped string value declared in assets/environments.json,
   // assert that it does NOT also appear as a hardcoded string literal anywhere
@@ -21989,13 +22733,12 @@ describe("INVARIANT: no orphan chunks per deploy", () => {
 // 35. Block + tx hash capture for Bulletin uploads and DotNS writes (#537)
 // ---------------------------------------------------------------------------
 
-// Subscribable that emits a txBestBlocksState event carrying block receipt info.
+// Subscribable that emits an inBestBlock event carrying block receipt info.
 function receiptSubscribable(txHash = "0xabcd1234", blockHash = "0xdeadbeef", blockNumber = 42) {
   return {
     subscribe({ next }) {
       setImmediate(() => next({
-        type: "txBestBlocksState",
-        found: true,
+        type: "inBestBlock",
         ok: true,
         txHash,
         block: { hash: blockHash, number: blockNumber, index: 0 },
@@ -22353,12 +23096,11 @@ describe("signAndSubmitExtrinsic silent-watcher branch wiring (#990)", () => {
     const src = fs.readFileSync("src/dotns.ts", "utf-8");
     const idx = src.indexOf("async signAndSubmitWithRetry(");
     assert.ok(idx >= 0, ">> FAIL: #990 wiring: could not locate signAndSubmitWithRetry in src/dotns.ts");
-    // Window sized to cover the method's catch region (both calls live well
-    // before the next method decl). Widened from 2000→4000 for #1158: the
-    // nonce-contention branch now sits between the two calls — still BEFORE
-    // the general retry classification, which is the invariant this test
-    // guards; the old fixed window just no longer reached it.
-    const body = src.slice(idx, idx + 4000);
+    // Bounded by the next method, not a fixed offset: a fixed window had to be
+    // widened twice as branches landed between the two calls.
+    const after = src.slice(idx + 1);
+    const end = after.search(/\n  (?:async |private )/);
+    const body = after.slice(0, end === -1 ? undefined : end);
     const fastFailIdx = body.indexOf("classifyWatcherSilentFastFail(");
     const retryDecisionIdx = body.indexOf("classifyTxRetryDecision(");
     assert.ok(fastFailIdx >= 0, ">> FAIL: #990 wiring: signAndSubmitWithRetry must call classifyWatcherSilentFastFail");
@@ -22892,7 +23634,6 @@ describe("probeSignerPopStatus", () => {
   }
 
   const defaultArgs = {
-    signer: "pool",
     bulletinDeployEnv: null,
     resolveEnvConnectOptions: async () => ({}),
     defaultMnemonic: "//Alice",
@@ -22946,38 +23687,35 @@ describe("probeSignerPopStatus", () => {
     assert.strictEqual(result, 0, ">> FAIL: case 5: expected 0 when popStatus is null");
   });
 
-  test("case 6: signer=direct + no bulletinDeployEnv -> connect called with derivationPath //e2e-direct", async () => {
+  test("case 6: derivationPath omitted -> probes the bare mnemonic (ROOT), not //e2e-direct (#1695)", async () => {
     const mock = makeMock({ popStatus: 2n });
     await probeSignerPopStatus({
       ...defaultArgs,
-      signer: "direct",
       bulletinDeployEnv: null,
       dotnsFactory: () => mock,
     });
     assert.strictEqual(mock.connectCalls.length, 1, ">> FAIL: case 6: connect must be called exactly once");
-    assert.strictEqual(mock.connectCalls[0].derivationPath, "//e2e-direct",
-      ">> FAIL: case 6: connect must be called with derivationPath '//e2e-direct' when signer=direct; if buildArgs changes this path, probe-pop-status must change too");
+    assert.ok(!("derivationPath" in mock.connectCalls[0]),
+      ">> FAIL: case 6: omitting derivationPath must probe bare ROOT (what directSignerArgsFor deploys as), not silently //e2e-direct (#1695)");
   });
 
-  test("case 7: explicit derivationPath overrides the signer=direct default -> connect called with caller's path", async () => {
+  test("case 7: an explicit derivationPath is probed as given", async () => {
     const mock = makeMock({ popStatus: 0 });
     await probeSignerPopStatus({
       ...defaultArgs,
-      signer: "direct",
       bulletinDeployEnv: null,
       derivationPath: "//e2e-s9",
       dotnsFactory: () => mock,
     });
     assert.strictEqual(mock.connectCalls.length, 1, ">> FAIL: case 7: connect must be called exactly once");
     assert.strictEqual(mock.connectCalls[0].derivationPath, "//e2e-s9",
-      ">> FAIL: case 7: an explicitly-passed derivationPath must win over the signer=direct default, so isolated per-scenario signers (e.g. //e2e-s9) get probed instead of //e2e-direct");
+      ">> FAIL: case 7: an explicitly-passed derivationPath must be probed as given, so isolated per-scenario signers (e.g. //e2e-s9) get probed instead of //e2e-direct");
   });
 
   test("case 8: explicit derivationPath=null -> connect called with NO derivationPath key (bare mnemonic)", async () => {
     const mock = makeMock({ popStatus: 2n });
     await probeSignerPopStatus({
       ...defaultArgs,
-      signer: "direct",
       bulletinDeployEnv: null,
       derivationPath: null,
       dotnsFactory: () => mock,
@@ -22991,7 +23729,6 @@ describe("probeSignerPopStatus", () => {
     const mock = makeMock({ popStatus: 0 });
     await probeSignerPopStatus({
       ...defaultArgs,
-      signer: "direct",
       bulletinDeployEnv: "paseo-next-v2",
       resolveEnvConnectOptions: async () => ({ rpc: "wss://example" }),
       derivationPath: "//e2e-sgrandpa",
@@ -23140,7 +23877,8 @@ describe("fetchVersionInfo", () => {
 //   neither                            → "pool"   (getProvider)
 // ---------------------------------------------------------------------------
 describe("storage provider selection precedence (#673)", () => {
-  const stubSigner = {};
+  // papi v3 creators are callable; an object is the v2 shape assertTxCreator rejects.
+  const stubSigner = () => {};
 
   // signer+signerAddress activates "signer" storage mode since #811 (phone signing uses same signer for storage).
   test("signer+signerAddress (no storageSigner, no mnemonic) → signer mode (#811: phone signing uses signer for storage)", () => {
@@ -23513,7 +24251,7 @@ describe("bind-paid-alias tx-shape: set_alias_account with proof_valid_at (indiv
           set_alias_account: (args) => {
             capturedTxArgs.push(args);
             return {
-              signSubmitAndWatch: () => ({
+              createSubmitAndWatch: () => ({
                 subscribe: ({ next }) => {
                   Promise.resolve().then(() => {
                     next({ type: "broadcasted" });
@@ -23605,7 +24343,7 @@ describe("bind-paid-alias tx-shape: set_alias_account with proof_valid_at (indiv
       tx: {
         AliasAccounts: {
           set_alias_account: () => ({
-            signSubmitAndWatch: () => ({
+            createSubmitAndWatch: () => ({
               subscribe: ({ next }) => {
                 Promise.resolve().then(() => {
                   next({ type: "finalized", ok: true, block: { hash: "0x1234" } });
@@ -23727,7 +24465,7 @@ describe("reprove tx-shape: proof_valid_at in reprove_alias_account (individuali
           reprove_alias_account: (args) => {
             capturedTxArgs.push(args);
             return {
-              signSubmitAndWatch: () => ({
+              createSubmitAndWatch: () => ({
                 subscribe: ({ next }) => {
                   Promise.resolve().then(() => {
                     next({ type: "broadcasted" });
@@ -25397,16 +26135,16 @@ describe("makeRetryStatusFilter", () => {
     );
   });
 
-  test("deduplicates 'included': repeated txBestBlocksState found=true events emit 'included' only once (#891)", () => {
-    // papi's txBestBlocksState subscription can emit found=true multiple times as
+  test("deduplicates 'included': repeated inBestBlock events emit 'included' only once (#891)", () => {
+    // papi's inBestBlock subscription can emit multiple times as
     // the tx appears/reappears across best-block updates. Without dedup the status
     // line would print twice (one per emit).
     const received = [];
     const filter = makeRetryStatusFilter((s) => received.push(s));
     filter.callback("signing");
     filter.callback("broadcasting");
-    filter.callback("included"); // first txBestBlocksState found=true
-    filter.callback("included"); // second txBestBlocksState found=true (reorg/reappear)
+    filter.callback("included"); // first inBestBlock
+    filter.callback("included"); // second inBestBlock (reorg/reappear)
     filter.callback("finalized");
     assert.deepStrictEqual(
       received,
@@ -27090,13 +27828,13 @@ describe("#1108 best-block resolution (transient finality hardening)", () => {
   process.env.BULLETIN_DOTNS_BESTBLOCK_GRACE_MS = "0";
   // The poll loop reads only Timestamp.Now; a constant keeps chain-time budget at 0.
   const fakeClient = () => ({ query: { Timestamp: { Now: { getValue: async () => 1000n } } } });
-  // A fake extrinsic whose signSubmitAndWatch replays `events` to the observer.
+  // A fake extrinsic whose createSubmitAndWatch replays `events` to the observer.
   const fakeExtrinsic = (events) => ({
-    signSubmitAndWatch() {
+    createSubmitAndWatch() {
       return { subscribe(observer) { for (const ev of events) queueMicrotask(() => observer.next(ev)); return { unsubscribe() {} }; } };
     },
   });
-  const bestBlock = { type: "txBestBlocksState", found: true, txHash: { toString: () => "0xabc" } };
+  const bestBlock = { type: "inBestBlock", txHash: { toString: () => "0xabc" } };
   const finalized = { type: "finalized", ok: true, block: { hash: "0xdef", number: 42 }, txHash: { toString: () => "0xabc" } };
 
   test("resolves best-block on inclusion + verifyEffect=true, without any finalized event", async () => {
@@ -27895,10 +28633,164 @@ describe("e2e.yml: per-leg e2e-result files (#1625)", () => {
       const open = steps.find((st) => /- name: Open failure issue$/m.test(st));
       assert.ok(open.includes('"Dominant cause') || open.includes("CAUSE_LINE"), ">> FAIL: e2e-result: the issue body must carry the dominant-cause line");
       const lookup = open.slice(open.indexOf("EXISTING=$("), open.indexOf('if [ -n "$EXISTING" ]'));
-      assert.match(lookup, /labels=\$DEDUP_LABEL/);
+      assert.match(lookup, /labels=\$DEDUP_LABEL/, ">> FAIL: e2e-result: the dedup lookup must query the dedup label");
       assert.ok(!/CAUSE_LABEL/.test(lookup), ">> FAIL: e2e-result: the cause label must not be part of the dedup query (#1536)");
       assert.match(open, /labels: \(\[\$label\] \+ \(if \$cause == "" then \[\] else \[\$cause\] end\)\)/);
       assert.match(open, /"\$API_URL\/repos\/\$REPO\/labels"[\s\S]*?CAUSE_LABEL|CAUSE_LABEL[\s\S]*?"\$API_URL\/repos\/\$REPO\/labels"/, ">> FAIL: e2e-result: the cause label must be created on demand");
     });
+  });
+});
+
+describe("Sentry error diet: events only for failures", () => {
+  const fakeRoot = () => ({ attrs: new Map(), atEnd: null, setAttribute(k, v) { this.attrs.set(k, v); }, setStatus() {}, end() { this.atEnd ??= new Map(this.attrs); } });
+  const stub = (root, counts) => ({
+    startSpan: async (_o, fn) => fn(root), setTags() {}, setTag() {}, getActiveSpan: () => null,
+    captureMessage() { counts.messages++; }, addBreadcrumb() { counts.crumbs++; }, captureException() {}, withScope() {}, flush: async () => true, close: async () => true,
+  });
+  const run = async (fn) => {
+    const root = fakeRoot();
+    const counts = { messages: 0, crumbs: 0 };
+    const prev = __setSentryForTest(stub(root, counts));
+    try {
+      await withDeploySpan("diet.dot", async () => { fn(); });
+    } finally {
+      __setSentryForTest(prev);
+    }
+    return { root, counts };
+  };
+
+  test("noteWarning tracks sad + reason like captureWarning but sends no event", async () => {
+    const note = await run(() => noteWarning("deploy process terminated: SIGINT"));
+    const cap = await run(() => captureWarning("deploy process terminated: SIGINT"));
+    assert.equal(note.counts.messages, 0, ">> FAIL: noteWarning: must not call captureMessage");
+    assert.equal(note.counts.crumbs, 1, ">> FAIL: noteWarning: must still leave a breadcrumb");
+    assert.equal(cap.counts.messages, 1, ">> FAIL: captureWarning: must still send one event");
+    assert.equal(note.root.attrs.get("deploy.sad"), "true", ">> FAIL: noteWarning: must set deploy.sad");
+    assert.equal(note.root.attrs.get("deploy.outcome"), cap.root.attrs.get("deploy.outcome"),
+      ">> FAIL: noteWarning: sad reason/outcome must match captureWarning");
+    assert.equal(classifySadReason("deploy process terminated: SIGINT"), "killed");
+  });
+
+  const deploySrc = fs.readFileSync("src/deploy.ts", "utf-8");
+  const count = (src, needle) => src.split(needle).length - 1;
+  for (const title of [
+    "Bulletin RPC failover",
+    "WebSocket connection lost, reconnecting",
+    "Chunk upload failed, retrying",
+    "nonce-advance collision: re-uploading missing chunks",
+    "root-node nonce collision: resubmitting",
+  ]) {
+    test(`source: "${title}" is a note, not an event`, () => {
+      assert.ok(count(deploySrc, `noteWarning("${title}"`) >= 1, `>> FAIL: deploy.ts: "${title}" must use noteWarning`);
+      assert.equal(count(deploySrc, `captureWarning("${title}"`), 0, `>> FAIL: deploy.ts: "${title}" must not use captureWarning`);
+    });
+  }
+
+  test('source: "Chunk retry failed" is a note per attempt and ONE event when retries are exhausted', () => {
+    assert.equal(count(deploySrc, 'noteWarning("Chunk retry failed"'), 1, ">> FAIL: per-attempt retry failure must be noteWarning");
+    assert.equal(count(deploySrc, 'captureWarning("Chunk retry failed"'), 1, ">> FAIL: exactly one captureWarning(\"Chunk retry failed\")");
+    const event = deploySrc.indexOf('captureWarning("Chunk retry failed"');
+    const exhausted = deploySrc.lastIndexOf("if (!retried)", event);
+    const nextThrow = deploySrc.indexOf("throw ", exhausted);
+    assert.ok(exhausted >= 0 && event < nextThrow,
+      ">> FAIL: the event must sit inside the `if (!retried)` exhausted block, before its throw");
+  });
+
+  test("source: memory threshold event has a fixed title and the peak in a tag", () => {
+    const src = fs.readFileSync("src/telemetry.ts", "utf-8");
+    assert.ok(src.includes('captureMessage("deploy memory threshold crossed"'), ">> FAIL: memory event title must be a fixed string");
+    assert.ok(!/captureMessage\(`deploy memory threshold/.test(src), ">> FAIL: memory event title must not interpolate");
+    assert.match(src, /"deploy\.mem\.peak_rss_mb":\s*String\(r\.threshold\.peakRssMb\)/);
+    assert.equal(src.split("onSentryAttach:").length - 1, 1, ">> FAIL: memory report is attached from exactly one site (inside withDeploySpan finally)");
+  });
+
+  test("recovered-path flags default to \"false\" on a clean deploy span", () => {
+    const attrs = getDeployAttributes("diet.dot");
+    assert.equal(attrs["deploy.chunk.retried"], "false");
+    assert.equal(attrs["deploy.reconnected"], "false");
+  });
+
+  test("source: retry/reconnect flags are set at exactly one site each", () => {
+    for (const site of ['setDeployAttribute("deploy.chunk.retried", "true")', 'setDeployAttribute("deploy.reconnected", "true")', 'setDeployAttribute("deploy.chunk.retry_count",']) {
+      assert.equal(count(deploySrc, site), 1, `>> FAIL: deploy.ts: ${site} must appear exactly once`);
+    }
+  });
+
+  test("source: every chain submission names its mortality era", () => {
+    // papi's default era is 20 blocks plus the best-to-finalized gap, shorter
+    // than the 64 this repo's retry timing was built around. Parse the argument
+    // list rather than regex the call: a signer can be any expression, options
+    // can be built elsewhere, and a trailing comma breaks a shape match.
+    const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+      e.isDirectory() ? walk(path.join(dir, e.name))
+        : /\.(ts|mjs)$/.test(e.name) ? [path.join(dir, e.name)] : []);
+    const offenders = [];
+    for (const file of [...walk("src"), ...walk("tools")]) {
+      const src = fs.readFileSync(file, "utf-8");
+      const call = /\.(createSubmitAndWatch|createAndSubmit)\s*\(/g;
+      let m;
+      while ((m = call.exec(src)) !== null) {
+        // Walk to the matching close paren so nested calls and object literals
+        // in the argument list do not end the scan early.
+        let depth = 0, open = m.index + m[0].length - 1, end = open;
+        for (; end < src.length; end++) {
+          if (src[end] === "(") depth++;
+          else if (src[end] === ")" && --depth === 0) break;
+        }
+        const args = src.slice(open + 1, end);
+        // Split on the top-level comma: one argument means signer only.
+        let d = 0, split = -1;
+        for (let i = 0; i < args.length; i++) {
+          if ("([{".includes(args[i])) d++;
+          else if (")]}".includes(args[i])) d--;
+          else if (args[i] === "," && d === 0) { split = i; break; }
+        }
+        const opts = split === -1 ? "" : args.slice(split + 1).trim();
+        // An options argument that is an identifier or a spread is built
+        // elsewhere, so only inspect a literal for the era.
+        const literal = opts.startsWith("{") && !opts.includes("...");
+        if (opts === "" || opts === "undefined" || (literal && !opts.includes("mortality"))) {
+          offenders.push(`${file}:${src.slice(0, m.index).split("\n").length}`);
+        }
+      }
+    }
+    assert.deepEqual(offenders, [],
+      `>> FAIL: ${offenders.join(", ")}: a submission names no mortality era, so it silently takes papi's short default instead of the repo's 64`);
+  });
+
+  test("pool rejections that a resubmission cannot fix are not treated as reissuable", async () => {
+    // papi reports every invalid-transaction reason as InvalidTxError, where v2
+    // only sent nonce rejections that way. The chunk backstops read this to
+    // decide "may already be on chain, reissue at a fresh nonce".
+    const { REISSUABLE_REJECTIONS } = await import("../dist/deploy.js");
+    for (const v of ["Stale", "Future", "AncientBirthBlock"]) {
+      assert.ok(REISSUABLE_REJECTIONS.has(v),
+        `>> FAIL: REISSUABLE_REJECTIONS: ${v} is no longer reissuable, so a chunk the chain may already hold is retried as a hard failure instead of being deferred to verification`);
+    }
+    for (const v of ["Payment", "BadProof", "BadSigner", "ExhaustsResources", "Call"]) {
+      assert.ok(!REISSUABLE_REJECTIONS.has(v),
+        `>> FAIL: REISSUABLE_REJECTIONS: ${v} is treated as reissuable, so a chunk that fails identically on every attempt is deferred to the verify loop and ends as "Nonce-collision re-upload failed"`);
+    }
+  });
+
+  test("PGAS fees are elected through papi's own asset option", async () => {
+    const { PGAS_FEE_OPTIONS, PGAS_ASSET_LOCATION } = await import("../dist/personhood/constants.js");
+    // A customSignedExtensions entry lands behind the standard enhancer's native
+    // one and papi reads the first entry for an id, so the fee silently falls
+    // back to native and a zero-native PGAS account cannot pay.
+    assert.deepEqual(PGAS_FEE_OPTIONS.asset, PGAS_ASSET_LOCATION,
+      ">> FAIL: PGAS_FEE_OPTIONS: the fee asset is not papi's own `asset` option, so Asset-Hub fees are charged in native and a zero-native PGAS account fails to pay");
+    assert.ok(!("customSignedExtensions" in PGAS_FEE_OPTIONS),
+      ">> FAIL: PGAS_FEE_OPTIONS: fees are elected through customSignedExtensions again, which papi orders behind its own native entry");
+    const dotns = fs.readFileSync("src/dotns.ts", "utf-8");
+    assert.match(dotns, /feeAsset === "pgas" \? PGAS_FEE_OPTIONS/,
+      ">> FAIL: dotns: the pgas fee election no longer forwards PGAS_FEE_OPTIONS, so a contract call requested with feeAsset \"pgas\" pays in native");
+  });
+
+  test("source: bin finalize notes signals and captures crashes", () => {
+    const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf-8");
+    assert.match(bin, /isSignal \? noteWarning : captureWarning/);
+    assert.match(bin, /finalize\(sig, exitCode, true\)/);
+    assert.match(bin, /finalize\(kind, 2\)/);
   });
 });

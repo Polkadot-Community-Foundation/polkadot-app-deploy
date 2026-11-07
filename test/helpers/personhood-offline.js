@@ -26,7 +26,7 @@ const offlineTx = async (metadata, pallet, call, args) => {
   return {
     getEncodedData: async () => tx.encodedData,
     // The online API fills nonce and mortality from the chain.
-    sign: (signer, options) => tx.sign(signer, { nonce: 0, mortality: { mortal: false }, ...options }),
+    create: (creator, options) => tx.create(creator, { nonce: 0, mortality: { mortal: false }, ...options }),
   };
 };
 
